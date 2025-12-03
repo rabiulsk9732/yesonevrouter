@@ -1,0 +1,119 @@
+cmake_minimum_required(VERSION 3.16)
+project(yesrouter VERSION 1.0.0 LANGUAGES C CXX)
+
+# Set C/C++ standards
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Compiler flags
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+
+# Options
+option(ENABLE_DPDK "Enable DPDK support" ON)
+option(ENABLE_TESTS "Build unit tests" ON)
+option(ENABLE_BENCHMARKS "Build performance benchmarks" OFF)
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+# AddressSanitizer support
+if(ENABLE_ASAN)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+endif()
+
+# Include directories
+include_directories(
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+# Find required packages
+find_package(PkgConfig REQUIRED)
+
+# DPDK support
+if(ENABLE_DPDK)
+    pkg_check_modules(DPDK libdpdk)
+    if(DPDK_FOUND)
+        include_directories(${DPDK_INCLUDE_DIRS})
+        link_directories(${DPDK_LIBRARY_DIRS})
+        add_definitions(-DHAVE_DPDK)
+        message(STATUS "DPDK found: ${DPDK_VERSION}")
+    else()
+        message(WARNING "DPDK not found, building without DPDK support")
+        set(ENABLE_DPDK OFF)
+    endif()
+endif()
+
+# libyang for configuration
+pkg_check_modules(LIBYANG libyang)
+if(LIBYANG_FOUND)
+    include_directories(${LIBYANG_INCLUDE_DIRS})
+    link_directories(${LIBYANG_LIBRARY_DIRS})
+    add_definitions(-DHAVE_LIBYANG)
+endif()
+
+# Threading
+find_package(Threads REQUIRED)
+
+# Source files - will be populated as modules are implemented
+set(YESROUTER_SOURCES
+    # Core
+    # src/core/main.c
+    # src/core/packet.c
+    
+    # DPDK
+    # src/dpdk/dpdk_init.c
+    
+    # Configuration
+    # src/config/config.c
+    
+    # Logging
+    # src/logging/log.c
+    
+    # Add more source files as implemented
+)
+
+# Main executable
+# add_executable(yesrouter ${YESROUTER_SOURCES})
+# target_link_libraries(yesrouter 
+#     ${CMAKE_THREAD_LIBS_INIT}
+#     ${DPDK_LIBRARIES}
+#     ${LIBYANG_LIBRARIES}
+# )
+
+# Subdirectories
+add_subdirectory(src)
+
+# Testing
+if(ENABLE_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# Installation
+# install(TARGETS yesrouter DESTINATION bin)
+# install(DIRECTORY ${CMAKE_SOURCE_DIR}/docs/ DESTINATION share/doc/yesrouter)
+
+# Print configuration summary
+message(STATUS "")
+message(STATUS "YESRouter vBNG Configuration Summary:")
+message(STATUS "  Build Type:         ${CMAKE_BUILD_TYPE}")
+message(STATUS "  C Compiler:         ${CMAKE_C_COMPILER}")
+message(STATUS "  C++ Compiler:       ${CMAKE_CXX_COMPILER}")
+message(STATUS "  DPDK Support:       ${ENABLE_DPDK}")
+message(STATUS "  Tests:              ${ENABLE_TESTS}")
+message(STATUS "  Benchmarks:         ${ENABLE_BENCHMARKS}")
+message(STATUS "  AddressSanitizer:   ${ENABLE_ASAN}")
+message(STATUS "")
