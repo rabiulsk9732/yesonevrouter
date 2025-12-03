@@ -1,10 +1,10 @@
 # Source directory CMakeLists.txt
 
-# Core module
-# add_subdirectory(core)
+# DPDK module (must be before core)
+add_subdirectory(dpdk)
 
-# DPDK module
-# add_subdirectory(dpdk)
+# Core module
+add_subdirectory(core)
 
 # Configuration module
 # add_subdirectory(config)
