@@ -3,20 +3,23 @@
 # DPDK module (must be before core)
 add_subdirectory(dpdk)
 
+# Configuration module
+add_subdirectory(config)
+
+# Logging module
+add_subdirectory(logging)
+
+# Monitoring module
+add_subdirectory(monitoring)
+
 # Core module
 add_subdirectory(core)
 
-# Configuration module
-# add_subdirectory(config)
-
-# Logging module
-# add_subdirectory(logging)
-
 # Interfaces module
-# add_subdirectory(interfaces)
+add_subdirectory(interfaces)
 
 # Routing module
-# add_subdirectory(routing)
+add_subdirectory(routing)
 
 # BGP module
 # add_subdirectory(bgp)

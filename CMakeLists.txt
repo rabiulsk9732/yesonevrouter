@@ -57,11 +57,21 @@ if(ENABLE_DPDK)
 endif()
 
 # libyang for configuration
-pkg_check_modules(LIBYANG libyang)
-if(LIBYANG_FOUND)
-    include_directories(${LIBYANG_INCLUDE_DIRS})
-    link_directories(${LIBYANG_LIBRARY_DIRS})
-    add_definitions(-DHAVE_LIBYANG)
+option(ENABLE_LIBYANG "Enable libyang support for YANG configuration" ON)
+if(ENABLE_LIBYANG)
+    pkg_check_modules(LIBYANG libyang)
+    if(LIBYANG_FOUND)
+        include_directories(${LIBYANG_INCLUDE_DIRS})
+        link_directories(${LIBYANG_LIBRARY_DIRS})
+        add_definitions(-DHAVE_LIBYANG)
+        message(STATUS "libyang found: ${LIBYANG_VERSION}")
+    else()
+        message(WARNING "libyang not found, YANG configuration support disabled")
+        message(WARNING "  Configuration will use simple key-value parser")
+        set(ENABLE_LIBYANG OFF)
+    endif()
+else()
+    message(STATUS "libyang support disabled by user")
 endif()
 
 # Threading
@@ -72,22 +82,22 @@ set(YESROUTER_SOURCES
     # Core
     # src/core/main.c
     # src/core/packet.c
-    
+
     # DPDK
     # src/dpdk/dpdk_init.c
-    
+
     # Configuration
     # src/config/config.c
-    
+
     # Logging
     # src/logging/log.c
-    
+
     # Add more source files as implemented
 )
 
 # Main executable
 # add_executable(yesrouter ${YESROUTER_SOURCES})
-# target_link_libraries(yesrouter 
+# target_link_libraries(yesrouter
 #     ${CMAKE_THREAD_LIBS_INIT}
 #     ${DPDK_LIBRARIES}
 #     ${LIBYANG_LIBRARIES}

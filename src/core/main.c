@@ -11,6 +11,7 @@
 #include "dpdk_init.h"
 #include "cpu_scheduler.h"
 #include "packet.h"
+#include "interface.h"
 
 static volatile bool g_running = true;
 
@@ -81,6 +82,24 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  Failed to allocate packet buffer\n");
     }
 
+    /* Initialize interface subsystem */
+    ret = interface_init();
+    if (ret < 0) {
+        fprintf(stderr, "Failed to initialize interface subsystem\n");
+        pkt_buf_cleanup();
+        dpdk_cleanup();
+        cpu_scheduler_cleanup();
+        return EXIT_FAILURE;
+    }
+
+    /* Create loopback interface for testing */
+    struct interface *lo = interface_create("lo", IF_TYPE_LOOPBACK);
+    if (lo) {
+        printf("\nCreated loopback interface\n");
+        interface_up(lo);
+        interface_print(lo);
+    }
+
     printf("\n========================================\n");
     printf("YESRouter vBNG - Initialization Complete\n");
     printf("========================================\n");
@@ -96,6 +115,7 @@ int main(int argc, char *argv[])
     printf("YESRouter vBNG - Shutting Down\n");
     printf("========================================\n\n");
 
+    interface_cleanup();
     pkt_buf_cleanup();
     dpdk_cleanup();
     cpu_scheduler_cleanup();

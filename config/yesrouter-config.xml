@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<yesrouter-config xmlns="http://yesrouter.com/ns/yesrouter">
+    <system>
+        <hostname>yesrouter-01</hostname>
+        <log-level>3</log-level>
+        <daemonize>false</daemonize>
+        <pid-file>/var/run/yesrouter.pid</pid-file>
+    </system>
+
+    <routing>
+        <local-as>65000</local-as>
+        <router-id>10.0.0.1</router-id>
+        <bgp-peer>
+            <peer-ip>192.168.1.1</peer-ip>
+            <remote-as>65001</remote-as>
+            <hold-time>180</hold-time>
+            <keepalive-interval>60</keepalive-interval>
+            <enabled>true</enabled>
+            <description>Upstream Provider</description>
+        </bgp-peer>
+    </routing>
+
+    <bng>
+        <pppoe-enabled>true</pppoe-enabled>
+        <ipoe-enabled>true</ipoe-enabled>
+        <ac-name>YESRouter-AC</ac-name>
+        <pppoe-mtu>1492</pppoe-mtu>
+        <session-timeout>86400</session-timeout>
+        <max-sessions>100000</max-sessions>
+        <ip-pool>
+            <name>default-pool</name>
+            <start-ip>10.0.0.1</start-ip>
+            <end-ip>10.0.255.254</end-ip>
+            <netmask>255.255.0.0</netmask>
+            <gateway>10.0.0.1</gateway>
+            <dns-primary>8.8.8.8</dns-primary>
+            <dns-secondary>8.8.4.4</dns-secondary>
+            <lease-time>86400</lease-time>
+        </ip-pool>
+    </bng>
+
+    <cgnat>
+        <enabled>false</enabled>
+        <public-ip-start>100.64.0.1</public-ip-start>
+        <public-ip-end>100.64.0.254</public-ip-end>
+        <port-range-start>1024</port-range-start>
+        <port-range-end>65535</port-range-end>
+        <session-timeout>300</session-timeout>
+        <logging-enabled>true</logging-enabled>
+    </cgnat>
+
+    <qos>
+        <enabled>true</enabled>
+        <default-rate-limit-down>100000</default-rate-limit-down>
+        <default-rate-limit-up>50000</default-rate-limit-up>
+        <burst-size>1500000</burst-size>
+    </qos>
+
+    <firewall>
+        <enabled>true</enabled>
+        <stateful-enabled>true</stateful-enabled>
+        <connection-timeout>300</connection-timeout>
+        <max-connections>1000000</max-connections>
+    </firewall>
+
+    <management>
+        <rest-api>
+            <enabled>true</enabled>
+            <port>8080</port>
+            <bind>0.0.0.0</bind>
+        </rest-api>
+        <cli>
+            <enabled>true</enabled>
+            <port>22</port>
+        </cli>
+    </management>
+</yesrouter-config>

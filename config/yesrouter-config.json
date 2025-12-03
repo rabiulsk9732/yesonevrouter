@@ -1,0 +1,76 @@
+{
+  "yesrouter:yesrouter-config": {
+    "system": {
+      "hostname": "yesrouter-01",
+      "log-level": 3,
+      "daemonize": false,
+      "pid-file": "/var/run/yesrouter.pid"
+    },
+    "routing": {
+      "local-as": 65000,
+      "router-id": "10.0.0.1",
+      "bgp-peer": [
+        {
+          "peer-ip": "192.168.1.1",
+          "remote-as": 65001,
+          "hold-time": 180,
+          "keepalive-interval": 60,
+          "enabled": true,
+          "description": "Upstream Provider"
+        }
+      ]
+    },
+    "bng": {
+      "pppoe-enabled": true,
+      "ipoe-enabled": true,
+      "ac-name": "YESRouter-AC",
+      "pppoe-mtu": 1492,
+      "session-timeout": 86400,
+      "max-sessions": 100000,
+      "ip-pool": [
+        {
+          "name": "default-pool",
+          "start-ip": "10.0.0.1",
+          "end-ip": "10.0.255.254",
+          "netmask": "255.255.0.0",
+          "gateway": "10.0.0.1",
+          "dns-primary": "8.8.8.8",
+          "dns-secondary": "8.8.4.4",
+          "lease-time": 86400
+        }
+      ]
+    },
+    "cgnat": {
+      "enabled": false,
+      "public-ip-start": "100.64.0.1",
+      "public-ip-end": "100.64.0.254",
+      "port-range-start": 1024,
+      "port-range-end": 65535,
+      "session-timeout": 300,
+      "logging-enabled": true
+    },
+    "qos": {
+      "enabled": true,
+      "default-rate-limit-down": 100000,
+      "default-rate-limit-up": 50000,
+      "burst-size": 1500000
+    },
+    "firewall": {
+      "enabled": true,
+      "stateful-enabled": true,
+      "connection-timeout": 300,
+      "max-connections": 1000000
+    },
+    "management": {
+      "rest-api": {
+        "enabled": true,
+        "port": 8080,
+        "bind": "0.0.0.0"
+      },
+      "cli": {
+        "enabled": true,
+        "port": 22
+      }
+    }
+  }
+}

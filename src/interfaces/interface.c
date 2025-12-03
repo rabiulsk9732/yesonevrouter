@@ -1,0 +1,469 @@
+/**
+ * @file interface.c
+ * @brief Interface Abstraction Layer Implementation
+ */
+
+#define _GNU_SOURCE
+#include "interface.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
+#include <errno.h>
+
+/* Global interface manager */
+struct interface_manager g_if_mgr = {
+    .interfaces = {0},
+    .num_interfaces = 0,
+    .next_ifindex = 1,
+    .initialized = false
+};
+
+/* Forward declarations for driver implementations */
+extern const struct interface_ops physical_interface_ops;
+extern const struct interface_ops vlan_interface_ops;
+extern const struct interface_ops lag_interface_ops;
+extern const struct interface_ops loopback_interface_ops;
+
+static const struct interface_ops *get_ops_for_type(enum interface_type type)
+{
+    switch (type) {
+    case IF_TYPE_PHYSICAL:
+        return &physical_interface_ops;
+    case IF_TYPE_VLAN:
+        return &vlan_interface_ops;
+    case IF_TYPE_LAG:
+        return &lag_interface_ops;
+    case IF_TYPE_LOOPBACK:
+        return &loopback_interface_ops;
+    default:
+        return NULL;
+    }
+}
+
+int interface_init(void)
+{
+    if (g_if_mgr.initialized) {
+        return 0;
+    }
+
+    memset(&g_if_mgr, 0, sizeof(g_if_mgr));
+    g_if_mgr.next_ifindex = 1;
+    g_if_mgr.initialized = true;
+
+    printf("Interface subsystem initialized\n");
+    return 0;
+}
+
+struct interface *interface_create(const char *name, enum interface_type type)
+{
+    struct interface *iface;
+    const struct interface_ops *ops;
+    uint32_t i;
+
+    if (!g_if_mgr.initialized) {
+        fprintf(stderr, "Interface subsystem not initialized\n");
+        return NULL;
+    }
+
+    if (!name || strlen(name) == 0 || strlen(name) >= IF_NAME_MAX) {
+        fprintf(stderr, "Invalid interface name\n");
+        return NULL;
+    }
+
+    /* Check if interface already exists */
+    if (interface_find_by_name(name)) {
+        fprintf(stderr, "Interface %s already exists\n", name);
+        return NULL;
+    }
+
+    /* Check if we have space */
+    if (g_if_mgr.num_interfaces >= IF_MAX_INTERFACES) {
+        fprintf(stderr, "Maximum number of interfaces reached\n");
+        return NULL;
+    }
+
+    /* Get operations for this interface type */
+    ops = get_ops_for_type(type);
+    if (!ops) {
+        fprintf(stderr, "Unsupported interface type: %d\n", type);
+        return NULL;
+    }
+
+    /* Allocate interface structure */
+    iface = calloc(1, sizeof(*iface));
+    if (!iface) {
+        fprintf(stderr, "Failed to allocate interface structure\n");
+        return NULL;
+    }
+
+    /* Initialize basic fields */
+    iface->ifindex = g_if_mgr.next_ifindex++;
+    strncpy(iface->name, name, IF_NAME_MAX - 1);
+    iface->type = type;
+    iface->state = IF_STATE_DOWN;
+    iface->link = LINK_STATE_UNKNOWN;
+    iface->ops = ops;
+    iface->refcnt = 1;
+    iface->created_time = (uint64_t)time(NULL);
+    iface->last_state_change = iface->created_time;
+
+    /* Set default configuration */
+    iface->config.mtu = 1500;
+    iface->config.speed = 0;  /* Auto */
+    iface->config.promiscuous = false;
+    iface->config.multicast = true;
+    iface->config.auto_negotiate = true;
+    iface->config.duplex = 1;  /* Full duplex */
+
+    /* Initialize interface using driver */
+    if (ops->init && ops->init(iface) < 0) {
+        fprintf(stderr, "Failed to initialize interface %s\n", name);
+        free(iface);
+        return NULL;
+    }
+
+    /* Add to manager */
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i] == NULL) {
+            g_if_mgr.interfaces[i] = iface;
+            g_if_mgr.num_interfaces++;
+            break;
+        }
+    }
+
+    printf("Created interface %s (index %u, type %s)\n",
+           name, iface->ifindex, interface_type_to_str(type));
+
+    return iface;
+}
+
+struct interface *interface_find_by_name(const char *name)
+{
+    uint32_t i;
+
+    if (!name) {
+        return NULL;
+    }
+
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i] &&
+            strcmp(g_if_mgr.interfaces[i]->name, name) == 0) {
+            return g_if_mgr.interfaces[i];
+        }
+    }
+
+    return NULL;
+}
+
+struct interface *interface_find_by_index(uint32_t ifindex)
+{
+    uint32_t i;
+
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i] &&
+            g_if_mgr.interfaces[i]->ifindex == ifindex) {
+            return g_if_mgr.interfaces[i];
+        }
+    }
+
+    return NULL;
+}
+
+int interface_up(struct interface *iface)
+{
+    if (!iface) {
+        return -1;
+    }
+
+    if (iface->state == IF_STATE_UP) {
+        return 0;  /* Already up */
+    }
+
+    if (iface->ops->up && iface->ops->up(iface) < 0) {
+        fprintf(stderr, "Failed to bring interface %s up\n", iface->name);
+        return -1;
+    }
+
+    iface->state = IF_STATE_UP;
+    iface->last_state_change = (uint64_t)time(NULL);
+
+    printf("Interface %s is now UP\n", iface->name);
+    return 0;
+}
+
+int interface_down(struct interface *iface)
+{
+    if (!iface) {
+        return -1;
+    }
+
+    if (iface->state == IF_STATE_DOWN) {
+        return 0;  /* Already down */
+    }
+
+    if (iface->ops->down && iface->ops->down(iface) < 0) {
+        fprintf(stderr, "Failed to bring interface %s down\n", iface->name);
+        return -1;
+    }
+
+    iface->state = IF_STATE_DOWN;
+    iface->last_state_change = (uint64_t)time(NULL);
+
+    printf("Interface %s is now DOWN\n", iface->name);
+    return 0;
+}
+
+int interface_send(struct interface *iface, struct pkt_buf *pkt)
+{
+    if (!iface || !pkt) {
+        return -1;
+    }
+
+    if (iface->state != IF_STATE_UP) {
+        return -1;
+    }
+
+    if (!iface->ops->send) {
+        return -1;
+    }
+
+    int ret = iface->ops->send(iface, pkt);
+
+    if (ret == 0) {
+        /* Update statistics */
+        __atomic_add_fetch(&iface->stats.tx_packets, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&iface->stats.tx_bytes, pkt->len, __ATOMIC_RELAXED);
+        iface->stats.last_tx_time = (uint64_t)time(NULL);
+    } else {
+        __atomic_add_fetch(&iface->stats.tx_errors, 1, __ATOMIC_RELAXED);
+    }
+
+    return ret;
+}
+
+int interface_recv(struct interface *iface, struct pkt_buf **pkt)
+{
+    if (!iface || !pkt) {
+        return -1;
+    }
+
+    if (iface->state != IF_STATE_UP) {
+        return -1;
+    }
+
+    if (!iface->ops->recv) {
+        return -1;
+    }
+
+    int ret = iface->ops->recv(iface, pkt);
+
+    if (ret > 0 && *pkt) {
+        /* Update statistics */
+        __atomic_add_fetch(&iface->stats.rx_packets, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&iface->stats.rx_bytes, (*pkt)->len, __ATOMIC_RELAXED);
+        iface->stats.last_rx_time = (uint64_t)time(NULL);
+    } else if (ret < 0) {
+        __atomic_add_fetch(&iface->stats.rx_errors, 1, __ATOMIC_RELAXED);
+    }
+
+    return ret;
+}
+
+enum link_state interface_get_link_state(struct interface *iface)
+{
+    if (!iface || !iface->ops->get_link_state) {
+        return LINK_STATE_UNKNOWN;
+    }
+
+    enum link_state link = iface->ops->get_link_state(iface);
+
+    /* Update cached link state */
+    if (link != iface->link) {
+        iface->link = link;
+        iface->stats.last_link_change = (uint64_t)time(NULL);
+    }
+
+    return link;
+}
+
+int interface_get_stats(struct interface *iface, struct interface_stats *stats)
+{
+    if (!iface || !stats) {
+        return -1;
+    }
+
+    /* Update link state */
+    interface_get_link_state(iface);
+
+    /* Get driver-specific statistics if available */
+    if (iface->ops->get_stats) {
+        iface->ops->get_stats(iface, &iface->stats);
+    }
+
+    /* Copy statistics */
+    memcpy(stats, &iface->stats, sizeof(*stats));
+
+    return 0;
+}
+
+int interface_configure(struct interface *iface, const struct interface_config_data *config)
+{
+    if (!iface || !config) {
+        return -1;
+    }
+
+    if (iface->ops->configure) {
+        int ret = iface->ops->configure(iface, config);
+        if (ret == 0) {
+            /* Update cached configuration */
+            memcpy(&iface->config, config, sizeof(*config));
+        }
+        return ret;
+    }
+
+    /* Fallback: just update cached configuration */
+    memcpy(&iface->config, config, sizeof(*config));
+    return 0;
+}
+
+int interface_delete(struct interface *iface)
+{
+    uint32_t i;
+
+    if (!iface) {
+        return -1;
+    }
+
+    /* Bring interface down first */
+    if (iface->state == IF_STATE_UP) {
+        interface_down(iface);
+    }
+
+    /* Cleanup driver-specific data */
+    if (iface->ops->cleanup) {
+        iface->ops->cleanup(iface);
+    }
+
+    /* Free private data */
+    if (iface->priv_data) {
+        free(iface->priv_data);
+    }
+
+    /* Remove from manager */
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i] == iface) {
+            g_if_mgr.interfaces[i] = NULL;
+            g_if_mgr.num_interfaces--;
+            break;
+        }
+    }
+
+    printf("Deleted interface %s\n", iface->name);
+    free(iface);
+
+    return 0;
+}
+
+void interface_print(const struct interface *iface)
+{
+    if (!iface) {
+        return;
+    }
+
+    printf("\nInterface: %s\n", iface->name);
+    printf("  Index: %u\n", iface->ifindex);
+    printf("  Type: %s\n", interface_type_to_str(iface->type));
+    printf("  State: %s\n", interface_state_to_str(iface->state));
+    printf("  Link: %s\n", link_state_to_str(iface->link));
+    printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
+           iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5]);
+    printf("  MTU: %u\n", iface->config.mtu);
+    printf("  Speed: %s\n", iface->config.speed > 0 ?
+           (char[32]){0} : "Auto");
+    if (iface->config.speed > 0) {
+        printf("    %u Mbps\n", iface->config.speed);
+    }
+    printf("  Statistics:\n");
+    printf("    RX: %lu packets, %lu bytes, %lu errors, %lu dropped\n",
+           iface->stats.rx_packets, iface->stats.rx_bytes,
+           iface->stats.rx_errors, iface->stats.rx_dropped);
+    printf("    TX: %lu packets, %lu bytes, %lu errors, %lu dropped\n",
+           iface->stats.tx_packets, iface->stats.tx_bytes,
+           iface->stats.tx_errors, iface->stats.tx_dropped);
+}
+
+void interface_print_all(void)
+{
+    uint32_t i;
+
+    printf("\n========================================\n");
+    printf("Interface List (%u interfaces)\n", g_if_mgr.num_interfaces);
+    printf("========================================\n");
+
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i]) {
+            interface_print(g_if_mgr.interfaces[i]);
+        }
+    }
+
+    printf("\n");
+}
+
+uint32_t interface_count(void)
+{
+    return g_if_mgr.num_interfaces;
+}
+
+void interface_cleanup(void)
+{
+    uint32_t i;
+
+    printf("Cleaning up interface subsystem...\n");
+
+    /* Delete all interfaces */
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        if (g_if_mgr.interfaces[i]) {
+            interface_delete(g_if_mgr.interfaces[i]);
+        }
+    }
+
+    memset(&g_if_mgr, 0, sizeof(g_if_mgr));
+    printf("Interface subsystem cleanup complete\n");
+}
+
+const char *interface_type_to_str(enum interface_type type)
+{
+    switch (type) {
+    case IF_TYPE_PHYSICAL: return "Physical";
+    case IF_TYPE_VLAN: return "VLAN";
+    case IF_TYPE_LAG: return "LAG";
+    case IF_TYPE_LOOPBACK: return "Loopback";
+    default: return "Unknown";
+    }
+}
+
+const char *interface_state_to_str(enum interface_state state)
+{
+    switch (state) {
+    case IF_STATE_DOWN: return "DOWN";
+    case IF_STATE_UP: return "UP";
+    case IF_STATE_ADMIN_DOWN: return "ADMIN_DOWN";
+    case IF_STATE_ERROR: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+const char *link_state_to_str(enum link_state state)
+{
+    switch (state) {
+    case LINK_STATE_UP: return "UP";
+    case LINK_STATE_DOWN: return "DOWN";
+    default: return "UNKNOWN";
+    }
+}
