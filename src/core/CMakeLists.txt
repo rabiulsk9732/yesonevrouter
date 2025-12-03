@@ -3,6 +3,7 @@
 set(CORE_SOURCES
     main.c
     cpu_scheduler.c
+    packet.c
 )
 
 add_executable(yesrouter ${CORE_SOURCES})

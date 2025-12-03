@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "dpdk_init.h"
 #include "cpu_scheduler.h"
+#include "packet.h"
 
 static volatile bool g_running = true;
 
@@ -57,6 +58,29 @@ int main(int argc, char *argv[])
         printf("\nDPDK Status: Disabled (running in software mode)\n");
     }
 
+    /* Initialize packet buffer subsystem */
+    ret = pkt_buf_init();
+    if (ret < 0) {
+        fprintf(stderr, "Failed to initialize packet buffer subsystem\n");
+        dpdk_cleanup();
+        cpu_scheduler_cleanup();
+        return EXIT_FAILURE;
+    }
+
+    /* Test packet buffer allocation */
+    printf("\nTesting packet buffer allocation...\n");
+    struct pkt_buf *test_pkt = pkt_alloc();
+    if (test_pkt) {
+        printf("  Successfully allocated packet buffer\n");
+        printf("  Buffer address: %p\n", (void *)test_pkt);
+        printf("  Data address: %p\n", (void *)pkt_data(test_pkt));
+        printf("  Headroom: %u bytes\n", test_pkt->headroom);
+        pkt_free(test_pkt);
+        printf("  Packet freed successfully\n");
+    } else {
+        fprintf(stderr, "  Failed to allocate packet buffer\n");
+    }
+
     printf("\n========================================\n");
     printf("YESRouter vBNG - Initialization Complete\n");
     printf("========================================\n");
@@ -72,6 +96,7 @@ int main(int argc, char *argv[])
     printf("YESRouter vBNG - Shutting Down\n");
     printf("========================================\n\n");
 
+    pkt_buf_cleanup();
     dpdk_cleanup();
     cpu_scheduler_cleanup();
 
