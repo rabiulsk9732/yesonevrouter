@@ -29,6 +29,13 @@ int dpdk_init(int argc, char *argv[])
 #ifdef HAVE_DPDK
     int ret;
 
+    /* Check for valid arguments - DPDK EAL requires at least program name */
+    if (argc < 1 || argv == NULL || argv[0] == NULL) {
+        printf("DPDK EAL requires valid arguments, running without DPDK\n");
+        g_dpdk_config.enabled = false;
+        return 0;
+    }
+
     printf("Initializing DPDK EAL...\n");
 
     /* Initialize DPDK EAL */
@@ -36,7 +43,9 @@ int dpdk_init(int argc, char *argv[])
     if (ret < 0) {
         fprintf(stderr, "DPDK EAL initialization failed: %s\n",
                 rte_strerror(rte_errno));
-        return -1;
+        /* Don't fail completely - run without DPDK */
+        g_dpdk_config.enabled = false;
+        return 0;
     }
 
     /* Get number of available lcores */
@@ -71,7 +80,7 @@ int dpdk_init(int argc, char *argv[])
 #endif
 }
 
-struct dpdk_mempool *dpdk_mempool_create(const char *name, 
+struct dpdk_mempool *dpdk_mempool_create(const char *name,
                                          uint32_t num_elements,
                                          uint32_t socket_id)
 {
@@ -182,7 +191,7 @@ void dpdk_cleanup(void)
 
         /* Cleanup EAL */
         rte_eal_cleanup();
-        
+
         g_dpdk_config.enabled = false;
         printf("DPDK cleanup complete\n");
     }

@@ -59,7 +59,7 @@ int interface_init(void)
     return 0;
 }
 
-struct interface *interface_create(const char *name, enum interface_type type)
+struct interface *interface_create_with_flags(const char *name, enum interface_type type, uint32_t flags)
 {
     struct interface *iface;
     const struct interface_ops *ops;
@@ -111,6 +111,7 @@ struct interface *interface_create(const char *name, enum interface_type type)
     iface->refcnt = 1;
     iface->created_time = (uint64_t)time(NULL);
     iface->last_state_change = iface->created_time;
+    iface->flags = flags;  /* Set flags BEFORE init - VPP style */
 
     /* Set default configuration */
     iface->config.mtu = 1500;
@@ -140,6 +141,12 @@ struct interface *interface_create(const char *name, enum interface_type type)
            name, iface->ifindex, interface_type_to_str(type));
 
     return iface;
+}
+
+/* Wrapper for backward compatibility */
+struct interface *interface_create(const char *name, enum interface_type type)
+{
+    return interface_create_with_flags(name, type, 0);
 }
 
 struct interface *interface_find_by_name(const char *name)
@@ -413,6 +420,115 @@ void interface_print_all(void)
     }
 
     printf("\n");
+}
+
+#include <ifaddrs.h>
+#include "dpdk_init.h"
+
+#ifdef HAVE_DPDK
+#include <rte_ethdev.h>
+#endif
+
+int interface_discover_dpdk_ports(void)
+{
+#ifdef HAVE_DPDK
+    uint16_t port_id;
+    int count = 0;
+    char name[IF_NAME_MAX];
+
+    if (!dpdk_is_enabled()) {
+        printf("DPDK not enabled, skipping DPDK port discovery\n");
+        return 0;
+    }
+
+    printf("Discovering DPDK ports...\n");
+
+    RTE_ETH_FOREACH_DEV(port_id) {
+        struct rte_eth_dev_info dev_info;
+        struct rte_ether_addr mac_addr;
+        struct interface *iface;
+        (void)0; /* placeholder */
+
+        /* Get device info */
+        if (rte_eth_dev_info_get(port_id, &dev_info) != 0) {
+            fprintf(stderr, "Failed to get device info for port %u\n", port_id);
+            continue;
+        }
+
+        /* Simple Cisco-style naming: Gi0/1, Gi0/2, etc. */
+        snprintf(name, sizeof(name), "Gi0/%u", port_id + 1);
+
+        /* Check if already exists */
+        if (interface_find_by_name(name)) {
+            continue;
+        }
+
+        /* Create interface with DPDK flags set BEFORE init (VPP-style) */
+        /* High bit (0x80000000) indicates DPDK port, lower bits are port_id */
+        uint32_t dpdk_flags = (uint32_t)port_id | 0x80000000;
+        iface = interface_create_with_flags(name, IF_TYPE_PHYSICAL, dpdk_flags);
+        if (!iface) {
+            fprintf(stderr, "Failed to create interface for DPDK port %u\n", port_id);
+            continue;
+        }
+
+        /* Get and set MAC address (already done in physical_init, but update here too) */
+        if (rte_eth_macaddr_get(port_id, &mac_addr) == 0) {
+            memcpy(iface->mac_addr, mac_addr.addr_bytes, 6);
+        }
+
+        printf("  Interface %s: DPDK port %u (MAC: %02x:%02x:%02x:%02x:%02x:%02x, driver: %s)\n",
+               name, port_id,
+               iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
+               iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5],
+               dev_info.driver_name ? dev_info.driver_name : "unknown");
+
+        count++;
+    }
+
+    printf("Discovered %d DPDK ports\n", count);
+    return count;
+#else
+    return 0;
+#endif
+}
+
+int interface_discover_system(void)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    int count = 0;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return -1;
+    }
+
+    /* Walk through linked list, maintaining head pointer so we can free list later */
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        /* Only check AF_PACKET to avoid duplicates (one per interface) */
+        if (ifa->ifa_addr->sa_family != AF_PACKET)
+            continue;
+
+        /* Skip loopback */
+        if (strcmp(ifa->ifa_name, "lo") == 0)
+            continue;
+
+        /* Check if already exists */
+        if (interface_find_by_name(ifa->ifa_name))
+            continue;
+
+        /* Create interface */
+        if (interface_create(ifa->ifa_name, IF_TYPE_PHYSICAL)) {
+            count++;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    printf("Discovered %d system interfaces\n", count);
+    return count;
 }
 
 uint32_t interface_count(void)

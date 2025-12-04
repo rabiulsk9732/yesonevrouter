@@ -42,8 +42,14 @@ add_test(NAME Phase1_Logging COMMAND test_phase1_logging)
 add_executable(test_phase1_interfaces test_phase1_interfaces.c)
 target_link_libraries(test_phase1_interfaces
     yesrouter_interfaces
+    yesrouter_core
     yesrouter_dpdk
     yesrouter_logging
     pthread
 )
 add_test(NAME Phase1_Interfaces COMMAND test_phase1_interfaces)
+
+# Phase 2 Tests - Uncomment when test files are created
+# add_executable(test_phase2_arp test_phase2_arp.c)
+# target_link_libraries(test_phase2_arp ...)
+# add_test(NAME Phase2_ARP COMMAND test_phase2_arp)

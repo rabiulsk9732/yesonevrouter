@@ -1,7 +1,7 @@
 /**
  * @file packet.h
  * @brief Packet Buffer Management
- * 
+ *
  * Provides packet buffer structures and utilities for efficient packet handling.
  */
 
@@ -59,12 +59,12 @@ struct pkt_metadata {
     uint16_t l3_offset;
     uint16_t l4_offset;
     uint16_t payload_offset;
-    
+
     /* Layer types */
     enum pkt_l2_type l2_type;
     enum pkt_l3_type l3_type;
     enum pkt_l4_type l4_type;
-    
+
     /* Parsed fields */
     uint16_t vlan_id;
     uint32_t src_ip;
@@ -72,10 +72,10 @@ struct pkt_metadata {
     uint16_t src_port;
     uint16_t dst_port;
     uint8_t  protocol;
-    
+
     /* Flow information */
     uint32_t flow_hash;
-    
+
     /* Interface information */
     uint32_t ingress_ifindex;
     uint32_t egress_ifindex;
@@ -85,23 +85,25 @@ struct pkt_metadata {
 struct pkt_buf {
 #ifdef HAVE_DPDK
     struct rte_mbuf *mbuf;      /* DPDK mbuf pointer */
-#else
-    uint8_t *buf;               /* Software buffer */
-    size_t buf_size;
 #endif
-    
+    uint8_t *buf;               /* Software buffer */
+    size_t buf_size;            /* Buffer size */
+
     uint8_t *data;              /* Pointer to packet data */
     uint16_t len;               /* Packet length */
     uint16_t headroom;          /* Available headroom */
     uint32_t flags;             /* Packet flags */
-    
+
     struct pkt_metadata meta;   /* Packet metadata */
-    
+
     /* Reference counting */
     uint32_t refcnt;
-    
+
     /* Timestamp */
     uint64_t timestamp;
+
+    /* Private data for driver-specific use */
+    void *priv_data;
 };
 
 /**

@@ -14,18 +14,11 @@
 #include <net/if.h>
 #include "packet.h"
 
-#define IF_NAME_MAX         IFNAMSIZ
+#define IF_NAME_MAX         32  /* Extended for Cisco-style names like GigabitEthernet0/0 */
 #define IF_MAX_INTERFACES   256
 #define IF_MAX_VLAN_MEMBERS 16
 
-/* Interface types */
-enum interface_type {
-    IF_TYPE_PHYSICAL = 0,
-    IF_TYPE_VLAN,
-    IF_TYPE_LAG,
-    IF_TYPE_LOOPBACK,
-    IF_TYPE_UNKNOWN
-};
+#include "interface_types.h"
 
 /* Interface states */
 enum interface_state {
@@ -224,6 +217,15 @@ int interface_init(void);
 struct interface *interface_create(const char *name, enum interface_type type);
 
 /**
+ * Create a new interface with flags (VPP-style for DPDK)
+ * @param name Interface name
+ * @param type Interface type
+ * @param flags Interface flags (high bit = DPDK, lower bits = port_id)
+ * @return Pointer to interface or NULL on failure
+ */
+struct interface *interface_create_with_flags(const char *name, enum interface_type type, uint32_t flags);
+
+/**
  * Find interface by name
  * @param name Interface name
  * @return Pointer to interface or NULL if not found
@@ -313,6 +315,18 @@ void interface_print_all(void);
  * @return Number of interfaces
  */
 uint32_t interface_count(void);
+
+/**
+ * @brief Discover system interfaces (Linux only)
+ * @return Number of interfaces discovered, or -1 on error
+ */
+int interface_discover_system(void);
+
+/**
+ * @brief Discover DPDK ports
+ * @return Number of DPDK ports discovered, or -1 on error
+ */
+int interface_discover_dpdk_ports(void);
 
 /**
  * Cleanup interface subsystem

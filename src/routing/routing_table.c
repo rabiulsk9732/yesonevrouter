@@ -14,7 +14,7 @@
 
 /* Helper macros */
 #define PREFIX_MASK(len) ((len) == 0 ? 0 : htonl(0xFFFFFFFF << (32 - (len))))
-#define IP_BIT(ip, bit_pos) (((ntohl(ip.s_addr)) >> (31 - (bit_pos))) & 1)
+#define IP_BIT(ip_nbo, bit_pos) (((ntohl(ip_nbo)) >> (31 - (bit_pos))) & 1)
 
 /* Internal function declarations */
 static struct radix_node *radix_node_create(const struct in_addr *prefix,
@@ -29,9 +29,9 @@ static int radix_tree_delete_rib(struct routing_table *table,
 static struct route_entry *radix_tree_lookup(struct radix_node *root,
                                               const struct in_addr *ip);
 static void update_fib(struct routing_table *table);
-static struct route_entry *find_best_route_rib(struct routing_table *table,
+/* static struct route_entry *find_best_route_rib(struct routing_table *table,
                                                 const struct in_addr *prefix,
-                                                uint8_t prefix_len);
+                                                uint8_t prefix_len); */
 static void notify_route_update(struct routing_table *table,
                                 struct route_entry *route,
                                 bool added);
@@ -40,10 +40,21 @@ static void notify_route_update(struct routing_table *table,
 static struct route_notification *g_notifications = NULL;
 static pthread_mutex_t g_notification_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static struct routing_table *g_routing_table = NULL;
+
+struct routing_table *routing_table_get_instance(void)
+{
+    return g_routing_table;
+}
+
 struct routing_table *routing_table_init(void)
 {
     struct routing_table *table;
     pthread_rwlock_t *lock;
+
+    if (g_routing_table) {
+        return g_routing_table;
+    }
 
     table = calloc(1, sizeof(*table));
     if (!table) {
@@ -77,6 +88,7 @@ struct routing_table *routing_table_init(void)
     }
 
     table->lock = lock;
+    g_routing_table = table;
 
     return table;
 }
@@ -153,7 +165,7 @@ static void radix_node_free(struct radix_node *node)
 static int radix_tree_insert_rib(struct routing_table *table,
                                   struct route_entry *route)
 {
-    struct radix_node *node, *parent, *new_node, *split_node;
+    struct radix_node *node, *parent, *new_node;
     struct in_addr prefix = route->prefix;
     uint8_t prefix_len = route->prefix_len;
     int bit_pos = 0;
@@ -187,7 +199,7 @@ static int radix_tree_insert_rib(struct routing_table *table,
         }
 
         /* Navigate based on current bit */
-        int bit = IP_BIT(prefix, bit_pos);
+        int bit = IP_BIT(prefix.s_addr, bit_pos);
         parent = node;
         node = (bit == 0) ? node->left : node->right;
         bit_pos++;
@@ -207,7 +219,7 @@ static int radix_tree_insert_rib(struct routing_table *table,
                 return -1;
             }
             new_node->route = route;
-            if (IP_BIT(prefix, bit_pos - 1) == 0) {
+            if (IP_BIT(prefix.s_addr, bit_pos - 1) == 0) {
                 parent->left = new_node;
             } else {
                 parent->right = new_node;
@@ -227,7 +239,7 @@ static int radix_tree_insert_rib(struct routing_table *table,
         new_node->route = route;
 
         /* Link to parent */
-        int bit = IP_BIT(prefix, bit_pos - 1);
+        int bit = IP_BIT(prefix.s_addr, bit_pos - 1);
         if (bit == 0) {
             parent->left = new_node;
         } else {
@@ -246,7 +258,7 @@ static struct route_entry *radix_tree_lookup(struct radix_node *root,
 {
     struct radix_node *node;
     struct route_entry *best_match = NULL;
-    uint8_t best_prefix_len = 0;
+    int best_prefix_len = -1;  /* Use -1 to allow 0-length prefix match */
     int bit_pos;
 
     if (!root) {
@@ -260,11 +272,12 @@ static struct route_entry *radix_tree_lookup(struct radix_node *root,
     while (node && bit_pos < 32) {
         /* Update best match if current node has a route (LPM) */
         if (node->route) {
-            /* Check if this route matches the IP and has longer prefix */
+            /* Check if this route matches the IP */
             struct in_addr mask = {.s_addr = PREFIX_MASK(node->route->prefix_len)};
             if ((ip->s_addr & mask.s_addr) ==
                 (node->route->prefix.s_addr & mask.s_addr)) {
-                if (node->route->prefix_len > best_prefix_len) {
+                /* Accept if better match (longer prefix wins) */
+                if ((int)node->route->prefix_len > best_prefix_len) {
                     best_match = node->route;
                     best_prefix_len = node->route->prefix_len;
                 }
@@ -272,7 +285,7 @@ static struct route_entry *radix_tree_lookup(struct radix_node *root,
         }
 
         /* Navigate to next level */
-        int bit = IP_BIT(*ip, bit_pos);
+        int bit = IP_BIT(ip->s_addr, bit_pos);
         node = (bit == 0) ? node->left : node->right;
         bit_pos++;
     }
@@ -289,12 +302,12 @@ int routing_table_add(struct routing_table *table,
                       enum route_source source,
                       const char *source_name)
 {
-    struct route_entry *route;
-    int ret;
-
     if (!table || !prefix || prefix_len > 32) {
         return -1;
     }
+
+    struct route_entry *route;
+    int ret;
 
     /* Acquire write lock */
     pthread_rwlock_wrlock((pthread_rwlock_t *)table->lock);
@@ -393,7 +406,7 @@ static int radix_tree_delete_rib(struct routing_table *table,
             }
         }
 
-        bit = IP_BIT(*prefix, bit_pos);
+        bit = IP_BIT(prefix->s_addr, bit_pos);
         parent = node;
         node = (bit == 0) ? node->left : node->right;
         bit_pos++;
@@ -456,37 +469,53 @@ struct route_entry *routing_table_lookup(struct routing_table *table,
     return route;
 }
 
-static struct route_entry *find_best_route_rib(struct routing_table *table,
+/* static struct route_entry *find_best_route_rib(struct routing_table *table,
                                                 const struct in_addr *prefix,
                                                 uint8_t prefix_len)
 {
-    /* This is a simplified version - in reality, we'd need to traverse
-     * the RIB tree to find all routes matching the prefix and select
-     * the best one based on admin distance. For now, we'll use a simple
-     * lookup which returns the first matching route.
-     */
+    (void)prefix_len;
+
     return radix_tree_lookup(table->rib_root, prefix);
+} */
+
+/* Helper to copy a radix tree node and its children */
+static struct radix_node *radix_node_copy(struct radix_node *src)
+{
+    if (!src) return NULL;
+
+    struct radix_node *dst = calloc(1, sizeof(*dst));
+    if (!dst) return NULL;
+
+    dst->prefix = src->prefix;
+    dst->prefix_len = src->prefix_len;
+    dst->refcnt = 1;
+
+    /* Copy route entry if present */
+    if (src->route) {
+        dst->route = calloc(1, sizeof(*dst->route));
+        if (dst->route) {
+            memcpy(dst->route, src->route, sizeof(*dst->route));
+            dst->route->in_fib = true;
+        }
+    }
+
+    /* Recursively copy children */
+    dst->left = radix_node_copy(src->left);
+    dst->right = radix_node_copy(src->right);
+
+    return dst;
 }
 
 static void update_fib(struct routing_table *table)
 {
-    /* Simplified FIB update - in a full implementation, we would:
-     * 1. Traverse all routes in RIB
-     * 2. For each unique prefix, find the best route (lowest admin distance)
-     * 3. Update FIB with best routes only
-     *
-     * For now, we'll just copy RIB to FIB (simplified)
-     */
-
     /* Free existing FIB */
     if (table->fib_root) {
         radix_node_free(table->fib_root);
         table->fib_root = NULL;
     }
 
-    /* Rebuild FIB from RIB */
-    /* Note: This is a placeholder - full implementation would need
-     * to properly select best routes based on admin distance */
+    /* Copy RIB to FIB (simplified - full impl would select best routes) */
+    table->fib_root = radix_node_copy(table->rib_root);
     table->fib_count = table->rib_count;
 }
 
@@ -502,6 +531,8 @@ int routing_table_add_ecmp_path(struct routing_table *table,
     if (!table || !prefix || !next_hop) {
         return -1;
     }
+
+    (void)prefix_len; /* Unused for now */
 
     pthread_rwlock_wrlock((pthread_rwlock_t *)table->lock);
 

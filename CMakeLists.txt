@@ -77,6 +77,9 @@ endif()
 # Threading
 find_package(Threads REQUIRED)
 
+# OpenSSL for password hashing
+find_package(OpenSSL REQUIRED)
+
 # Source files - will be populated as modules are implemented
 set(YESROUTER_SOURCES
     # Core
@@ -96,12 +99,20 @@ set(YESROUTER_SOURCES
 )
 
 # Main executable
-# add_executable(yesrouter ${YESROUTER_SOURCES})
-# target_link_libraries(yesrouter
-#     ${CMAKE_THREAD_LIBS_INIT}
-#     ${DPDK_LIBRARIES}
-#     ${LIBYANG_LIBRARIES}
-# )
+add_executable(yesrouter src/core/main.c)
+target_link_libraries(yesrouter
+    yesrouter_interfaces
+    yesrouter_network
+    yesrouter_routing
+    yesrouter_logging
+    yesrouter_config
+    yesrouter_auth
+    yesrouter_cli
+    yesrouter_forwarding
+    yesrouter_dpdk
+    yesrouter_core
+    pthread
+)
 
 # Subdirectories
 add_subdirectory(src)

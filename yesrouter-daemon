@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# YESRouter Daemon (like 'vpp' binary)
+# Runs in background, managed by systemd or manually
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Check if already running
+if pgrep -x "yesrouter" > /dev/null; then
+    echo "Error: yesrouter is already running"
+    echo "Stop it first: yesrouter-stop"
+    exit 1
+fi
+
+# Clean up
+rm -f /var/run/dpdk/rte/config 2>/dev/null || true
+
+# Create log directory
+mkdir -p logs
+
+# Start router in background with nohup
+nohup ./build/yesrouter > logs/yesrouter.log 2>&1 &
+ROUTER_PID=$!
+
+# Wait a moment for initialization
+sleep 3
+
+# Check if still running
+if ! kill -0 $ROUTER_PID 2>/dev/null; then
+    echo "Error: Router failed to start"
+    echo "Check logs: tail -f logs/yesrouter.log"
+    exit 1
+fi
+
+echo "YESRouter daemon started (PID: $ROUTER_PID)"
+echo ""
+
+# Auto-apply startup config if it exists
+if [ -f "config/startup-config.txt" ]; then
+    echo "Applying startup configuration..."
+    sleep 2
+
+    # Send config commands
+    {
+        echo "admin"
+        sleep 0.5
+        echo "admin"
+        sleep 1
+
+        # Parse and send config
+        grep -v "^!" config/startup-config.txt | grep -v "^$" | while IFS= read -r line; do
+            echo "$line"
+            sleep 0.2
+        done
+    } &
+
+    echo "✓ Configuration applied"
+fi
+
+echo ""
+echo "Connect to CLI: yesrouter-cli"
+echo "View logs: tail -f logs/yesrouter.log"
+echo "Stop daemon: yesrouter-stop"

@@ -1,0 +1,23 @@
+[Unit]
+Description=YESRouter vBNG Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vbng
+ExecStartPre=/bin/bash -c 'pkill -9 yesrouter || true'
+ExecStartPre=/bin/bash -c 'rm -f /var/run/dpdk/rte/config || true'
+ExecStartPre=/bin/bash -c 'rm -f /tmp/vbng_cmd || true'
+ExecStart=/root/vbng/yesrouter-daemon.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/root/vbng/logs/yesrouter.log
+StandardError=append:/root/vbng/logs/yesrouter.log
+
+# Resource limits
+LimitNOFILE=65535
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# YESRouter CLI Commands - Executed after startup
+# Similar to VPP's setup.gate or boot.vpp
+# Referenced from startup.conf unix { exec ... }
+
+# Enter privileged mode
+enable
+
+# Configure interface
+configure terminal
+interface Gi0/1
+ip address 103.174.247.67 255.255.255.192
+no shutdown
+exit
+
+# Add default route
+ip route 0.0.0.0 0.0.0.0 103.174.247.65
+
+# Save and exit
+end

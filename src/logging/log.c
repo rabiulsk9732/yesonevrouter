@@ -22,7 +22,7 @@
 static struct log_config g_log_config;
 static FILE *g_log_file = NULL;
 static bool g_log_initialized = false;
-static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_log_mutex;  /* Initialized in log_init() */
 
 /* ANSI color codes for terminal output */
 #define COLOR_RESET   "\033[0m"
@@ -97,6 +97,9 @@ int log_init(struct log_config *config)
         log_set_defaults(&g_log_config);
     }
 
+    /* Explicitly initialize mutex */
+    pthread_mutex_init(&g_log_mutex, NULL);
+
     /* Initialize syslog if enabled */
     if (g_log_config.use_syslog) {
         openlog("yesrouter", LOG_PID | LOG_CONS, g_log_config.syslog_facility);
@@ -118,8 +121,7 @@ int log_init(struct log_config *config)
     }
 
     g_log_initialized = true;
-    YLOG_INFO("Logging subsystem initialized (level: %s)",
-             log_level_names[g_log_config.level]);
+    /* YLOG_INFO removed to prevent hang during init */
 
     return 0;
 }

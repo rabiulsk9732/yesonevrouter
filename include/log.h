@@ -114,30 +114,15 @@ int log_rotate(void);
  */
 void log_cleanup(void);
 
-/* Convenience macros - use YLOG_ prefix to avoid syslog conflicts */
-#define YLOG_EMERGENCY(fmt, ...) \
-    log_msg(LOG_LEVEL_EMERGENCY, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_ALERT(fmt, ...) \
-    log_msg(LOG_LEVEL_ALERT, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_CRITICAL(fmt, ...) \
-    log_msg(LOG_LEVEL_CRITICAL, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_ERROR(fmt, ...) \
-    log_msg(LOG_LEVEL_ERROR, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_WARNING(fmt, ...) \
-    log_msg(LOG_LEVEL_WARNING, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_NOTICE(fmt, ...) \
-    log_msg(LOG_LEVEL_NOTICE, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_INFO(fmt, ...) \
-    log_msg(LOG_LEVEL_INFO, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
-
-#define YLOG_DEBUG(fmt, ...) \
-    log_msg(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+/* DISABLED: Logging system causes deadlock - needs complete rewrite */
+#define YLOG_EMERGENCY(fmt, ...) do { } while(0)
+#define YLOG_ALERT(fmt, ...) do { } while(0)
+#define YLOG_CRITICAL(fmt, ...) do { } while(0)
+#define YLOG_ERROR(fmt, ...) do { } while(0)
+#define YLOG_WARNING(fmt, ...) do { } while(0)
+#define YLOG_NOTICE(fmt, ...) do { } while(0)
+#define YLOG_INFO(fmt, ...) do { } while(0)
+#define YLOG_DEBUG(fmt, ...) do { } while(0)
 
 /* Short aliases - only define if not already defined by syslog.h */
 #ifndef LOG_EMERG

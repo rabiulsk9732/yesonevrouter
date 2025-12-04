@@ -1,7 +1,7 @@
 /**
  * @file config.h
  * @brief Configuration Management Framework
- * 
+ *
  * Provides configuration parsing, validation, and management.
  */
 
@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <netinet/in.h>
+#include "interface_types.h"
 
 #define CONFIG_MAX_PATH         256
 #define CONFIG_MAX_NAME         64
@@ -36,12 +37,7 @@ struct interface_config {
     struct in_addr ipv4_addr;
     struct in_addr ipv4_mask;
     uint16_t vlan_id;
-    enum {
-        IF_TYPE_PHYSICAL,
-        IF_TYPE_VLAN,
-        IF_TYPE_LAG,
-        IF_TYPE_LOOPBACK
-    } type;
+    enum interface_type type; // Using interface_type from interface.h
 };
 
 /* IP address pool configuration */
@@ -128,19 +124,19 @@ struct management_config {
 struct yesrouter_config {
     char config_file[CONFIG_MAX_PATH];
     uint32_t version;
-    
+
     struct system_config system;
-    
+
     uint32_t num_interfaces;
     struct interface_config interfaces[CONFIG_MAX_INTERFACES];
-    
+
     struct routing_config routing;
     struct bng_config bng;
     struct cgnat_config cgnat;
     struct qos_config qos;
     struct firewall_config firewall;
     struct management_config management;
-    
+
     /* Runtime flags */
     bool is_loaded;
     bool is_valid;

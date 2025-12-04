@@ -21,28 +21,3 @@ target_link_libraries(yesrouter_core
 if(ENABLE_DPDK AND DPDK_FOUND)
     target_link_libraries(yesrouter_core ${DPDK_LIBRARIES})
 endif()
-
-# Main executable
-add_executable(yesrouter main.c)
-
-target_include_directories(yesrouter PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-)
-
-target_link_libraries(yesrouter
-    yesrouter_core
-    yesrouter_dpdk
-    yesrouter_config
-    yesrouter_logging
-    yesrouter_monitoring
-    yesrouter_interfaces
-    ${CMAKE_THREAD_LIBS_INIT}
-    pthread
-)
-
-if(ENABLE_DPDK AND DPDK_FOUND)
-    target_link_libraries(yesrouter ${DPDK_LIBRARIES})
-endif()
-
-# Installation
-install(TARGETS yesrouter DESTINATION bin)

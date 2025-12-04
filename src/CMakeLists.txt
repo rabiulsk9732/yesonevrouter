@@ -24,11 +24,17 @@ add_subdirectory(routing)
 # BGP module
 # add_subdirectory(bgp)
 
-# Network module (ARP)
-# add_subdirectory(network)
+# Network module (ARP/Neighbor)
+add_subdirectory(network)
+
+# Authentication module
+add_subdirectory(auth)
+
+# CLI module
+add_subdirectory(cli)
 
 # Forwarding module
-# add_subdirectory(forwarding)
+add_subdirectory(forwarding)
 
 # Access module (PPPoE, IPoE)
 # add_subdirectory(access)

@@ -132,6 +132,7 @@ struct route_notification {
  * @return Pointer to routing table or NULL on failure
  */
 struct routing_table *routing_table_init(void);
+struct routing_table *routing_table_get_instance(void);
 
 /**
  * Cleanup and free routing table
