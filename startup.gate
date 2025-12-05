@@ -1,38 +1,18 @@
-! YESRouter Startup Configuration
-! This file is loaded by the 'exec' parameter in startup.conf
-
 configure terminal
-hostname yesrouter-vpp
-
-! Configure Loopback
-interface loopback0
- ip address 10.0.0.1 255.255.255.0
- no shutdown
-exit
-
-! Configure WAN Interface (Gi0/1)
+! WAN Interface - Gi0/1
 interface Gi0/1
- ip address 103.174.247.67 255.255.255.192
- no shutdown
+ip address 103.174.247.67/26
+no shutdown
 exit
 
-! Configure LAN Interface (Gi0/2)
+! LAN Interface - Gi0/2
 interface Gi0/2
- ip address 172.16.17.1 255.255.255.0
- no shutdown
+ip address 172.16.17.1/24
+no shutdown
 exit
 
-! Configure Default Route
+! Default route via WAN gateway
 ip route 0.0.0.0 0.0.0.0 103.174.247.65
 
-! Configure NAT for Internet Access
-! Create NAT pool with WAN IP for source NAT
-nat pool WAN-POOL 103.174.247.67 103.174.247.67 netmask 255.255.255.192
-! Enable NAT
-nat enable
-
-! Show configuration
 end
-show version
-show nat config
 show interfaces brief

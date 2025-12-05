@@ -34,14 +34,20 @@ mkdir -p /var/log/yesrouter
 echo "  ✓ Created /etc/yesrouter, /run/yesrouter, /var/log/yesrouter"
 
 echo "[3/6] Installing configuration files..."
-if [ -f "startup.conf" ]; then
-    cp startup.conf /etc/yesrouter/
-    echo "  ✓ Copied startup.conf"
+# Both files are REQUIRED, not optional
+if [ ! -f "yesrouter.conf" ]; then
+    echo "ERROR: yesrouter.conf is required but not found!"
+    exit 1
 fi
-if [ -f "startup.gate" ]; then
-    cp startup.gate /etc/yesrouter/
-    echo "  ✓ Copied startup.gate"
+if [ ! -f "startup.gate" ]; then
+    echo "ERROR: startup.gate is required but not found!"
+    exit 1
 fi
+
+cp yesrouter.conf /etc/yesrouter/
+echo "  ✓ Copied yesrouter.conf"
+cp startup.gate /etc/yesrouter/
+echo "  ✓ Copied startup.gate"
 
 echo "[4/6] Installing systemd service..."
 cp yesrouter.service /etc/systemd/system/
@@ -75,7 +81,7 @@ echo "  systemctl restart yesrouter  # Restart service"
 echo "  systemctl disable yesrouter  # Disable auto-start"
 echo ""
 echo "Configuration:"
-echo "  /etc/yesrouter/startup.conf"
+echo "  /etc/yesrouter/yesrouter.conf"
 echo "  /etc/yesrouter/startup.gate"
 echo ""
 echo "Logs:"

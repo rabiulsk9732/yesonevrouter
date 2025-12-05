@@ -1,34 +1,34 @@
 /**
  * @file dpdk_init.h
  * @brief DPDK Initialization and Management
- * 
+ *
  * Handles DPDK EAL initialization, memory pool setup, and core management.
  */
 
 #ifndef DPDK_INIT_H
 #define DPDK_INIT_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef HAVE_DPDK
 #include <rte_eal.h>
-#include <rte_mempool.h>
-#include <rte_mbuf.h>
-#include <rte_lcore.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
 #endif
 
 /* DPDK Configuration */
-#define DPDK_NUM_MBUFS           8192
-#define DPDK_MBUF_CACHE_SIZE     250
-#define DPDK_BURST_SIZE          32
-#define DPDK_RX_RING_SIZE        1024
-#define DPDK_TX_RING_SIZE        1024
+#define DPDK_NUM_MBUFS 32767 - 1
+#define DPDK_MBUF_CACHE_SIZE 250
+#define DPDK_BURST_SIZE 32
+#define DPDK_RX_RING_SIZE 1024
+#define DPDK_TX_RING_SIZE 1024
 
 /* Memory pool structure */
 struct dpdk_mempool {
-    void *pool;                     /* rte_mempool pointer */
+    void *pool; /* rte_mempool pointer */
     char name[32];
     uint32_t num_elements;
     uint32_t element_size;
@@ -37,9 +37,9 @@ struct dpdk_mempool {
 
 /* DPDK configuration */
 struct dpdk_config {
-    bool enabled;                   /* DPDK enabled/disabled */
-    uint32_t num_lcores;            /* Number of logical cores */
-    uint32_t socket_id;             /* NUMA socket ID */
+    bool enabled;                     /* DPDK enabled/disabled */
+    uint32_t num_lcores;              /* Number of logical cores */
+    uint32_t socket_id;               /* NUMA socket ID */
     struct dpdk_mempool *pkt_mempool; /* Packet memory pool */
 };
 
@@ -61,8 +61,7 @@ int dpdk_init(int argc, char *argv[]);
  * @param socket_id NUMA socket ID
  * @return Pointer to memory pool or NULL on failure
  */
-struct dpdk_mempool *dpdk_mempool_create(const char *name, 
-                                         uint32_t num_elements,
+struct dpdk_mempool *dpdk_mempool_create(const char *name, uint32_t num_elements,
                                          uint32_t socket_id);
 
 /**

@@ -33,12 +33,28 @@
 #define NAT_MAX_WORKERS 16
 #define NAT_WORKER_TABLE_SIZE 65536 /* 64K per worker */
 #define NAT_WORKER_TABLE_MASK (NAT_WORKER_TABLE_SIZE - 1)
+#define NAT_SESSION_CACHE_SIZE 256 /* Per-worker cache for hot sessions */
 
 /* Forward declaration */
 struct nat_session;
 
 /**
+ * Per-worker session cache entry (packed for cache efficiency)
+ * Stores frequently accessed session mappings to avoid hash table lookup
+ */
+struct nat_session_cache_entry {
+    uint32_t inside_ip;
+    uint16_t inside_port;
+    uint16_t outside_port;
+    uint32_t outside_ip;
+    uint8_t protocol;
+    uint8_t valid;
+    uint16_t pad;
+} __attribute__((packed));
+
+/**
  * Per-worker NAT session table and statistics
+ * Cache-line aligned to prevent false sharing between workers
  */
 struct nat_worker_data {
     /* Per-core session tables (lockless within worker) */
@@ -52,6 +68,13 @@ struct nat_worker_data {
     uint64_t out2in_misses;
     uint64_t sessions_created;
     uint64_t sessions_deleted;
+    uint64_t cache_hits;   /* Fast cache hits */
+    uint64_t cache_misses; /* Cache misses - fell through to hash */
+
+    /* Per-worker session cache (L1-resident hot path) */
+    struct nat_session_cache_entry session_cache[NAT_SESSION_CACHE_SIZE];
+    uint32_t cache_count;
+    uint32_t cache_head; /* Circular buffer head for LRU-like eviction */
 
     uint8_t pad[64]; /* Avoid false sharing */
 } __attribute__((aligned(64)));
@@ -99,7 +122,8 @@ struct nat_session {
     uint8_t deterministic : 1; /* Deterministic NAT */
     uint8_t logged : 1;        /* Event logged */
     uint8_t alg_active : 1;    /* ALG processing active */
-    uint8_t reserved : 3;
+    uint8_t is_static : 1;     /* Static mapping */
+    uint8_t reserved : 2;
     uint8_t pad4[7];
 
     /* Hash table linkage */
@@ -173,14 +197,25 @@ struct nat_stats {
     uint64_t out2in_misses;
 
     /* ICMP-specific statistics */
-    uint64_t icmp_echo_requests;      /* ICMP echo requests processed */
-    uint64_t icmp_echo_replies;       /* ICMP echo replies processed */
+    uint64_t icmp_echo_requests;         /* ICMP echo requests processed */
+    uint64_t icmp_echo_replies;          /* ICMP echo replies processed */
     uint64_t icmp_identifier_mismatches; /* ICMP identifier lookup failures */
     uint64_t icmp_session_race_failures; /* Session creation/lookup race failures */
-    
+
     /* Diagnostic counters */
-    uint64_t snat_function_calls;     /* Total SNAT function invocations */
-    uint64_t snat_early_returns;      /* SNAT early returns (disabled/null mbuf) */
+    uint64_t snat_function_calls; /* Total SNAT function invocations */
+    uint64_t snat_early_returns;  /* SNAT early returns (disabled/null mbuf) */
+};
+
+/**
+ * NAT Rule (Policy Based NAT)
+ * Maps an ACL to a NAT Pool
+ */
+struct nat_rule {
+    char acl_name[32];
+    char pool_name[32];
+    uint32_t priority; /* Lower is higher priority (execution order) */
+    bool active;
 };
 
 /**
@@ -192,9 +227,15 @@ struct nat_config {
     bool eim_enabled; /* Endpoint Independent Mapping */
     bool deterministic_enabled;
 
-    /* Pools */
+/* Pools */
+#define NAT_MAX_POOLS 16
     struct nat_pool pools[NAT_MAX_POOLS];
     int num_pools;
+
+/* NAT Rules (Policy Based NAT) */
+#define NAT_MAX_RULES 64
+    struct nat_rule rules[NAT_MAX_RULES];
+    int num_rules;
 
     /* Statistics */
     struct nat_stats stats;
@@ -230,6 +271,12 @@ void nat_cleanup(void);
  * @return true if NAT is enabled, false otherwise
  */
 bool nat_is_enabled(void);
+
+/**
+ * Enable or disable NAT globally
+ * @param enable true to enable, false to disable
+ */
+void nat_enable(bool enable);
 
 /**
  * Create a NAT pool

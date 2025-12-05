@@ -47,9 +47,9 @@ if [ -f yesrouter ]; then
     # Create symlinks to config files for running from build/
     echo ""
     echo "Creating symlinks to config files..."
-    ln -sf ../startup.conf startup.conf
+    ln -sf ../yesrouter.conf yesrouter.conf
     ln -sf ../startup.gate startup.gate
-    echo "  ✓ startup.conf -> ../startup.conf"
+    echo "  ✓ yesrouter.conf -> ../yesrouter.conf"
     echo "  ✓ startup.gate -> ../startup.gate"
 else
     echo "ERROR: Executable not found!"

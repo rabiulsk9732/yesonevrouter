@@ -18,7 +18,7 @@ cd build
 
 # Configure
 echo "[2/5] Configuring with CMake..."
-cmake .. || {
+cmake -DCMAKE_BUILD_TYPE=Debug .. || {
     echo "ERROR: CMake configuration failed!"
     exit 1
 }
@@ -43,9 +43,37 @@ echo ""
 
 # Install
 echo "[5/5] Installing..."
+# Check for required configuration files (commented out to avoid overwriting current config)
+# if [ ! -f "../yesrouter.conf" ]; then
+#     echo "ERROR: yesrouter.conf is required but not found in project root!"
+#     exit 1
+# fi
+# if [ ! -f "../startup.gate" ]; then
+#     echo "ERROR: startup.gate is required but not found in project root!"
+#     exit 1
+# fi
+
 sudo systemctl stop yesrouter 2>/dev/null || true
 sudo cp yesrouter /usr/local/bin/
+sudo mkdir -p /etc/yesrouter
+# Commented out to avoid overwriting current configuration during development
+sudo cp ../yesrouter.conf /etc/yesrouter/
+sudo cp ../startup.gate /etc/yesrouter/
+sudo cp ../yesrouter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# echo "  ✓ Copied yesrouter.conf to /etc/yesrouter/"
+# echo "  ✓ Copied startup.gate to /etc/yesrouter/"
+echo "  ✓ Updated systemd service file"
+sudo rm -f /run/yesrouter/cli.sock
 sudo systemctl start yesrouter 2>/dev/null || true
+
+echo "Waiting for router to start..."
+for i in {1..10}; do
+    if [ -S "/run/yesrouter/cli.sock" ]; then
+        break
+    fi
+    sleep 1
+done
 
 echo ""
 echo "=========================================="

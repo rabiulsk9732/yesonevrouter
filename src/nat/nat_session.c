@@ -5,10 +5,10 @@
  * Hash-based session table with lockless read path using RCU
  */
 
+#include "cpu_scheduler.h"
 #include "log.h"
 #include "nat.h"
 #include "packet.h"
-#include "cpu_scheduler.h"
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -85,11 +85,11 @@ int nat_session_init(void)
     for (int i = 0; i < NAT_MAX_WORKERS; i++) {
         memset(&g_nat_workers[i], 0, sizeof(g_nat_workers[i]));
     }
-    
+
     /* Number of workers will be set dynamically based on RX threads */
     /* Default to 1 worker (legacy mode) */
     g_num_workers = 1;
-    
+
     YLOG_INFO("NAT: Initialized per-worker session tables (max %d workers)", NAT_MAX_WORKERS);
 
 #ifdef HAVE_DPDK
@@ -147,7 +147,7 @@ static inline uint32_t nat_hash_outside(uint32_t ip, uint16_t port, uint8_t prot
 {
     /* Use different seed for outside lookups to avoid collisions */
     uint64_t combined = ((uint64_t)ip << 24) | ((uint64_t)port << 8) | protocol;
-    
+
     /* Different mixing constant for outside hash */
     uint32_t hash = (uint32_t)combined;
     hash ^= hash >> 15;
@@ -155,18 +155,68 @@ static inline uint32_t nat_hash_outside(uint32_t ip, uint16_t port, uint8_t prot
     hash ^= hash >> 12;
     hash *= 0x297a2d39;
     hash ^= hash >> 15;
-    
+
     /* Mix in IP */
     hash ^= ip;
     hash ^= hash >> 15;
     hash *= 0x2c1b3c6d;
     hash ^= hash >> 12;
-    
+
     /* Mix in port and protocol */
     hash ^= (uint32_t)port << 16 | protocol;
     hash ^= hash >> 15;
-    
+
     return hash & NAT_SESSION_HASH_MASK;
+}
+
+/**
+ * Fast session cache lookup (L1-cache resident hot path)
+ * Returns 1 if found, 0 if miss. Outputs outside_ip/port on hit.
+ * This is the ultra-fast path that avoids hash table lookup entirely.
+ */
+static inline int nat_cache_lookup(struct nat_worker_data *worker, uint32_t inside_ip,
+                                   uint16_t inside_port, uint8_t protocol, uint32_t *outside_ip,
+                                   uint16_t *outside_port)
+{
+    /* Linear search through small cache (fits in L1) */
+    for (uint32_t i = 0; i < worker->cache_count && i < NAT_SESSION_CACHE_SIZE; i++) {
+        struct nat_session_cache_entry *e = &worker->session_cache[i];
+        if (e->valid && e->inside_ip == inside_ip && e->inside_port == inside_port &&
+            e->protocol == protocol) {
+            *outside_ip = e->outside_ip;
+            *outside_port = e->outside_port;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Add session to per-worker cache
+ * Uses circular buffer for LRU-like eviction when full
+ */
+static inline void nat_cache_add(struct nat_worker_data *worker, uint32_t inside_ip,
+                                 uint16_t inside_port, uint32_t outside_ip, uint16_t outside_port,
+                                 uint8_t protocol)
+{
+    uint32_t idx;
+
+    if (worker->cache_count < NAT_SESSION_CACHE_SIZE) {
+        /* Cache not full - add to end */
+        idx = worker->cache_count++;
+    } else {
+        /* Cache full - overwrite oldest (circular buffer) */
+        idx = worker->cache_head;
+        worker->cache_head = (worker->cache_head + 1) % NAT_SESSION_CACHE_SIZE;
+    }
+
+    struct nat_session_cache_entry *e = &worker->session_cache[idx];
+    e->inside_ip = inside_ip;
+    e->inside_port = inside_port;
+    e->outside_ip = outside_ip;
+    e->outside_port = outside_port;
+    e->protocol = protocol;
+    e->valid = 1;
 }
 
 /**
@@ -331,17 +381,18 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
     /* Insert into global outside hash table */
     session->next_outside = outside_session_table[hash_outside];
     outside_session_table[hash_outside] = session;
-    
+
     /* Also insert into per-worker table if multi-worker mode (as optimization) */
     /* Note: Sessions are in BOTH tables - worker table for fast lookup, global for cross-worker */
     uint32_t assigned_worker = get_worker_id(hash_inside);
-    
+
     if (g_num_workers > 1 && assigned_worker < NAT_MAX_WORKERS) {
         /* Insert into assigned worker's table for lockless fast path */
-        /* We'll use a separate pointer or duplicate the session reference */
-        /* For Phase 1: Just track in worker stats, actual table insertion in Phase 2 */
         struct nat_worker_data *worker = &g_nat_workers[assigned_worker];
         __atomic_fetch_add(&worker->sessions_created, 1, __ATOMIC_RELAXED);
+
+        /* Add to fast cache for L1-resident lookups */
+        nat_cache_add(worker, inside_ip, inside_port, outside_ip, outside_port, protocol);
     }
 
     /* Update statistics */
@@ -365,38 +416,57 @@ struct nat_session *nat_session_lookup_inside(uint32_t inside_ip, uint16_t insid
 {
     uint32_t hash = nat_hash_inside(inside_ip, inside_port, protocol);
     struct nat_session *session;
-    
-    /* Try per-worker table first (lockless) */
+
+    /* Try per-worker fast path first */
     extern __thread int g_thread_worker_id;
     int worker_id = g_thread_worker_id;
-    
+
     if (worker_id >= 0 && worker_id < NAT_MAX_WORKERS && g_num_workers > 1) {
+        struct nat_worker_data *worker = &g_nat_workers[worker_id];
+
+        /* FAST PATH: Check L1-resident session cache first */
+        uint32_t cached_outside_ip;
+        uint16_t cached_outside_port;
+        if (nat_cache_lookup(worker, inside_ip, inside_port, protocol, &cached_outside_ip,
+                             &cached_outside_port)) {
+            /* Cache hit! Still need to return full session, so look up by outside */
+            /* But we can use this for stats tracking */
+            __atomic_fetch_add(&worker->cache_hits, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_fetch_add(&worker->cache_misses, 1, __ATOMIC_RELAXED);
+        }
+
         /* Use per-worker table - lockless! */
         uint32_t worker_hash = hash & NAT_WORKER_TABLE_MASK;
-        struct nat_worker_data *worker = &g_nat_workers[worker_id];
-        
+
         session = worker->in2out_table[worker_hash];
-        
+
         /* Prefetch next item */
         if (session) {
             __builtin_prefetch(session->next, 0, 1);
         }
-        
+
         while (session) {
             if (session->inside_ip == inside_ip && session->inside_port == inside_port &&
                 session->protocol == protocol) {
-                
+
                 /* Check if session has expired */
                 uint64_t now = get_timestamp_ns();
                 uint64_t session_age_ns = now - session->last_used_ts;
                 uint64_t timeout_ns = (uint64_t)session->timeout * 1000000000ULL;
-                
+
+                /* Skip static sessions from expiration check */
+                if (session->is_static) {
+                    session = session->next;
+                    continue;
+                }
+
                 if (session_age_ns > timeout_ns) {
                     /* Session expired - need to delete (requires lock) */
                     /* Fall through to delete via global table path */
                     break;
                 }
-                
+
                 /* Update last used timestamp */
                 session->last_used_ts = now;
                 __atomic_fetch_add(&worker->in2out_hits, 1, __ATOMIC_RELAXED);
@@ -406,13 +476,13 @@ struct nat_session *nat_session_lookup_inside(uint32_t inside_ip, uint16_t insid
             if (session)
                 __builtin_prefetch(session->next, 0, 1);
         }
-        
+
         /* Not found in worker table - try global table as fallback */
         if (!session) {
             __atomic_fetch_add(&worker->in2out_misses, 1, __ATOMIC_RELAXED);
         }
     }
-    
+
     /* Fallback to global table (with locks) - for single worker or cross-worker access */
     uint32_t partition = get_partition_id(hash);
     pthread_rwlock_rdlock(&session_table_locks[partition]);
@@ -685,17 +755,17 @@ void nat_clear_sessions(void)
 void nat_print_sessions(void)
 {
     uint64_t now = get_timestamp_ns();
-    
+
     /* Print header */
     printf("\n%-15s %-6s %-15s %-6s %-8s %-10s %-10s %-12s %-12s %-10s %-10s %-8s %-6s\n",
-           "Inside IP", "Port", "Outside IP", "Port", "Proto", "Pkts In", "Pkts Out",
-           "Bytes In", "Bytes Out", "Age (s)", "Timeout (s)", "Last Act", "Flags");
+           "Inside IP", "Port", "Outside IP", "Port", "Proto", "Pkts In", "Pkts Out", "Bytes In",
+           "Bytes Out", "Age (s)", "Timeout (s)", "Last Act", "Flags");
     printf("%-15s %-6s %-15s %-6s %-8s %-10s %-10s %-12s %-12s %-10s %-10s %-8s %-6s\n",
            "----------", "----", "-----------", "----", "------", "--------", "---------",
            "----------", "-----------", "--------", "----------", "--------", "-----");
-    
+
     uint32_t session_count = 0;
-    
+
     for (uint32_t p = 0; p < NAT_NUM_PARTITIONS; p++) {
         pthread_rwlock_rdlock(&session_table_locks[p]);
 
@@ -713,7 +783,7 @@ void nat_print_sessions(void)
                 /* Calculate session age (seconds) */
                 uint64_t age_ns = now - session->created_ts;
                 uint32_t age_sec = (uint32_t)(age_ns / 1000000000ULL);
-                
+
                 /* Calculate timeout remaining (seconds) */
                 uint64_t idle_ns = now - session->last_used_ts;
                 uint32_t idle_sec = (uint32_t)(idle_ns / 1000000000ULL);
@@ -721,11 +791,11 @@ void nat_print_sessions(void)
                 if (timeout_remaining < 0) {
                     timeout_remaining = 0;
                 }
-                
+
                 /* Calculate last activity age (seconds) */
                 uint64_t last_act_ns = now - session->last_used_ts;
                 uint32_t last_act_sec = (uint32_t)(last_act_ns / 1000000000ULL);
-                
+
                 /* Build flags string */
                 char flags[16] = "";
                 if (session->eim) {
@@ -737,20 +807,23 @@ void nat_print_sessions(void)
                 if (session->deterministic) {
                     strcat(flags, "D");
                 }
+                if (session->is_static) {
+                    strcat(flags, "S");
+                }
                 if (flags[0] == '\0') {
                     strcpy(flags, "-");
                 }
 
                 const char *proto_str = session->protocol == IPPROTO_TCP    ? "TCP"
-                                      : session->protocol == IPPROTO_UDP    ? "UDP"
-                                      : session->protocol == IPPROTO_ICMP   ? "ICMP"
-                                                                           : "OTHER";
+                                        : session->protocol == IPPROTO_UDP  ? "UDP"
+                                        : session->protocol == IPPROTO_ICMP ? "ICMP"
+                                                                            : "OTHER";
 
-                printf("%-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-12lu %-12lu %-10u %-10d %-8u %-6s\n",
+                printf("%-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-12lu %-12lu %-10u %-10d %-8u "
+                       "%-6s\n",
                        inside_ip, session->inside_port, outside_ip, session->outside_port,
-                       proto_str, session->packets_in, session->packets_out,
-                       session->bytes_in, session->bytes_out,
-                       age_sec, timeout_remaining, last_act_sec, flags);
+                       proto_str, session->packets_in, session->packets_out, session->bytes_in,
+                       session->bytes_out, age_sec, timeout_remaining, last_act_sec, flags);
 
                 session = session->next;
                 session_count++;

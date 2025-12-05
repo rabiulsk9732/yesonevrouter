@@ -2,7 +2,8 @@
 Description=YESRouter vBNG Daemon
 After=network.target
 Documentation=https://github.com/rabiulsk9732/yesonevrouter
-ConditionPathExists=/etc/yesrouter/startup.conf
+ConditionPathExists=/etc/yesrouter/yesrouter.conf
+ConditionPathExists=/etc/yesrouter/startup.gate
 
 [Service]
 Type=simple

@@ -43,7 +43,7 @@ extern struct nat_config g_nat_config;
 #include <netinet/ip_icmp.h>
 #endif
 
-#include "vpp_parser.h"
+#include "yesrouter_config.h"
 
 static volatile bool g_rx_running = false;
 /* static pthread_t g_rx_thread; - Removed, using multiple detached threads */
@@ -325,15 +325,7 @@ static int forward_ipv4_packet(struct pkt_buf *pkt)
     struct in_addr dst_addr;
     dst_addr.s_addr = ip->dst_addr;
 
-    /* Debug: trace route lookup */
-    static uint64_t route_count = 0;
-    route_count++;
-    if (route_count % 50 == 1) {
-        printf("[ROUTE DEBUG #%lu] Lookup dst=%u.%u.%u.%u\n", route_count,
-               (rte_be_to_cpu_32(ip->dst_addr) >> 24) & 0xFF,
-               (rte_be_to_cpu_32(ip->dst_addr) >> 16) & 0xFF,
-               (rte_be_to_cpu_32(ip->dst_addr) >> 8) & 0xFF, rte_be_to_cpu_32(ip->dst_addr) & 0xFF);
-    }
+    /* Debug logging disabled for production */
 
     struct route_entry *route = routing_table_lookup(rt, &dst_addr);
     if (!route) {
@@ -363,14 +355,7 @@ static int forward_ipv4_packet(struct pkt_buf *pkt)
     /* NAT processing - check if NAT is enabled and applies */
     struct interface *ingress_iface = interface_find_by_index(pkt->meta.ingress_ifindex);
 
-    /* Debug: trace NAT path */
-    static uint64_t fwd_count = 0;
-    fwd_count++;
-    if (fwd_count % 50 == 1) {
-        printf("[FWD DEBUG #%lu] nat_enabled=%d ingress=%p egress=%p ingress_idx=%u\n", fwd_count,
-               nat_is_enabled(), (void *)ingress_iface, (void *)egress_iface,
-               pkt->meta.ingress_ifindex);
-    }
+    /* NAT debug logging disabled for production */
 
     if (nat_is_enabled() && ingress_iface && egress_iface) {
         /* Apply SNAT for traffic from inside (LAN) to outside (WAN) */
@@ -465,7 +450,7 @@ static int forward_ipv4_packet(struct pkt_buf *pkt)
             YLOG_DEBUG("ARP entry still not available for %u.%u.%u.%u, queuing packet",
                        (next_hop_ip >> 24) & 0xFF, (next_hop_ip >> 16) & 0xFF,
                        (next_hop_ip >> 8) & 0xFF, next_hop_ip & 0xFF);
-            
+
             /* Queue packet for ARP resolution */
             if (arp_queue_packet(next_hop_ip, pkt, egress_iface, ingress_iface) == 0) {
                 /* Packet queued successfully - don't free it */
@@ -625,8 +610,8 @@ static void process_ipv4(struct pkt_buf *pkt)
                 if (arp_lookup(dst_ip, dst_mac) != 0) {
                     /* Queue packet for ARP resolution */
                     YLOG_DEBUG("DNAT: ARP not available, queuing packet for %u.%u.%u.%u",
-                               (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF,
-                               (dst_ip >> 8) & 0xFF, dst_ip & 0xFF);
+                               (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF,
+                               dst_ip & 0xFF);
                     if (arp_queue_packet(dst_ip, pkt, egress_iface, iface) == 0) {
                         /* Packet queued successfully */
                         return;
@@ -681,12 +666,7 @@ static void process_ipv4(struct pkt_buf *pkt)
 /* Main packet processing function */
 void packet_rx_process_packet(struct pkt_buf *pkt)
 {
-    /* Debug: trace packet entry */
-    static uint64_t rx_count = 0;
-    rx_count++;
-    if (rx_count % 50 == 1) {
-        printf("[RX DEBUG #%lu] Processing packet len=%u\n", rx_count, pkt->len);
-    }
+    /* Debug logging disabled for production */
 
     /* Extract metadata (parse headers) */
     if (pkt_extract_metadata(pkt) != 0) {
@@ -757,12 +737,7 @@ static void *rx_thread_func(void *arg)
     while (g_rx_running) {
         int packets_processed = 0;
 
-        /* Debug: trace loop */
-        static uint64_t loop_count = 0;
-        loop_count++;
-        if (loop_count % 1000000 == 1) {
-            printf("[RX LOOP DEBUG] Loop %lu running on core %d\n", loop_count, core_id);
-        }
+        /* Debug logging disabled for production */
 
         /* Poll all interfaces - simplified for PoC */
         /* In a real implementation, we would only poll DPDK ports assigned to this queue */
@@ -831,8 +806,8 @@ int packet_rx_start(void)
     g_rx_running = true;
 
     /* Parse corelist-workers */
-    extern struct vpp_config g_vpp_config;
-    char *corelist = g_vpp_config.cpu_config.corelist_workers;
+    extern struct yesrouter_hw_config g_yesrouter_hw_config;
+    char *corelist = g_yesrouter_hw_config.cpu_config.corelist_workers;
 
     int cores[32];
     int num_cores = 0;
@@ -856,7 +831,7 @@ int packet_rx_start(void)
     }
 
     YLOG_INFO("Starting %d RX threads", num_cores);
-    
+
     /* Update NAT worker count to match RX threads */
     /* This enables per-worker session tables for lockless operation */
     if (num_cores > 0 && num_cores <= 16) {

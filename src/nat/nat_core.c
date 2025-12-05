@@ -27,7 +27,6 @@ int nat_init(void)
     g_nat_config.enabled = false;
     g_nat_config.hairpinning_enabled = false;
     g_nat_config.eim_enabled = true; /* Default to EIM */
-    g_nat_config.eim_enabled = true; /* Default to EIM */
     g_nat_config.deterministic_enabled = false;
 
     /* Initialize session table locks */
@@ -56,6 +55,15 @@ int nat_init(void)
 bool nat_is_enabled(void)
 {
     return g_nat_config.enabled;
+}
+
+/**
+ * Enable or disable NAT globally
+ */
+void nat_enable(bool enable)
+{
+    g_nat_config.enabled = enable;
+    YLOG_INFO("NAT %s globally", enable ? "enabled" : "disabled");
 }
 
 /**
@@ -143,20 +151,23 @@ uint32_t nat_pool_allocate_ip(struct nat_pool *pool)
         return pool->start_ip;
     }
 
-    /* Multi-IP pool: round-robin allocation */
-    if (pool->used_ips >= pool->total_ips) {
-        return 0; /* Pool exhausted */
-    }
-
+    /* Multi-IP pool: round-robin allocation with IP reuse
+     * Since ports provide session uniqueness, we can reuse IPs.
+     * With 65K ports per IP, each IP can handle thousands of sessions.
+     * We use round-robin for load distribution across the pool. */
     uint32_t ip = pool->current_ip;
 
-    /* Round-robin to next IP */
+    /* Round-robin to next IP for next allocation */
     pool->current_ip++;
     if (pool->current_ip > pool->end_ip) {
         pool->current_ip = pool->start_ip;
     }
 
-    pool->used_ips++;
+    /* Track unique IPs that have been used at least once */
+    if (pool->used_ips < pool->total_ips) {
+        pool->used_ips++;
+    }
+
     return ip;
 }
 

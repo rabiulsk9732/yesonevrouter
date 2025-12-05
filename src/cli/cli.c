@@ -131,6 +131,40 @@ static char **command_completion(const char *text, int start, int end)
 static __thread cli_mode_t current_mode = CLI_MODE_PRIV_EXEC; /* Default to privileged */
 static char hostname[64] = "yesrouter";
 
+/**
+ * Get current CLI prompt based on mode
+ * Used by cli_socket.c for displaying correct prompt
+ */
+const char *cli_get_prompt(void)
+{
+    static __thread char prompt_buf[128];
+    extern struct interface *cli_get_config_interface(void);
+    struct interface *cfg_if = cli_get_config_interface();
+
+    switch (current_mode) {
+    case CLI_MODE_EXEC:
+        snprintf(prompt_buf, sizeof(prompt_buf), "%s> ", hostname);
+        break;
+    case CLI_MODE_PRIV_EXEC:
+        snprintf(prompt_buf, sizeof(prompt_buf), "%s# ", hostname);
+        break;
+    case CLI_MODE_CONFIG:
+        snprintf(prompt_buf, sizeof(prompt_buf), "%s(config)# ", hostname);
+        break;
+    case CLI_MODE_CONFIG_IF:
+        if (cfg_if) {
+            snprintf(prompt_buf, sizeof(prompt_buf), "%s(config-if-%s)# ", hostname, cfg_if->name);
+        } else {
+            snprintf(prompt_buf, sizeof(prompt_buf), "%s(config-if)# ", hostname);
+        }
+        break;
+    default:
+        snprintf(prompt_buf, sizeof(prompt_buf), "%s# ", hostname);
+        break;
+    }
+    return prompt_buf;
+}
+
 /* Forward declarations */
 static int parse_args(char *line, char **argv, int max_args);
 
@@ -169,8 +203,18 @@ int cmd_show(int argc, char **argv)
             return cmd_show_interfaces_brief(argc, argv);
         }
         return cmd_show_interfaces(argc, argv);
-    } else if (strcmp(argv[1], "ip") == 0 && argc >= 3 && strcmp(argv[2], "route") == 0) {
-        return cmd_show_routes(argc, argv);
+    } else if (strcmp(argv[1], "ip") == 0 && argc >= 3) {
+        if (strcmp(argv[2], "route") == 0) {
+            return cmd_show_routes(argc, argv);
+        } else if (strcmp(argv[2], "nat") == 0) {
+            /* show ip nat ... */
+            extern int cmd_show_ip_nat(int argc, char **argv);
+            /* Shift argv for cmd_show_ip_nat which expects: show ip nat ... */
+            /* argv passed is: show ip nat ... */
+            return cmd_show_ip_nat(argc, argv);
+        }
+        printf("%% Unknown show ip command: %s\n", argv[2]);
+        return -1;
     } else if (strcmp(argv[1], "routes") == 0) {
         return cmd_show_routes(argc, argv);
     } else if (strcmp(argv[1], "arp") == 0) {
@@ -208,10 +252,6 @@ int cmd_show(int argc, char **argv)
 #endif
         );
         return 0;
-    } else if (strcmp(argv[1], "nat") == 0) {
-        /* Dispatch to NAT show commands */
-        extern int cmd_show_nat(int argc, char **argv);
-        return cmd_show_nat(argc, argv);
     } else {
         printf("%% Unknown show command: %s\n", argv[1]);
         return -1;
@@ -221,12 +261,13 @@ int cmd_show(int argc, char **argv)
 /* Command: configure terminal */
 static int cmd_configure(int argc, char **argv)
 {
-    if (argc >= 2 && strcmp(argv[1], "terminal") == 0) {
+    /* Accept both 'configure' and 'configure terminal' */
+    if (argc == 1 || (argc >= 2 && strcmp(argv[1], "terminal") == 0)) {
         current_mode = CLI_MODE_CONFIG;
         printf("Enter configuration commands, one per line.  End with CNTL/Z.\n");
         return 0;
     }
-    printf("Usage: configure terminal\n");
+    printf("Usage: configure [terminal]\n");
     return -1;
 }
 
@@ -371,8 +412,6 @@ int cli_execute(const char *cmdline)
     if (argc == 0)
         return 0;
 
-    printf("DEBUG: cli_execute cmd='%s' mode=%d\n", argv[0], current_mode);
-
     /* Handle exit/end in any config mode */
     if (current_mode == CLI_MODE_CONFIG || current_mode == CLI_MODE_CONFIG_IF) {
         if (strcmp(argv[0], "exit") == 0) {
@@ -428,44 +467,17 @@ int cli_execute(const char *cmdline)
             }
             return -1;
         }
-        if (strcmp(argv[0], "hostname") == 0 && argc >= 2) {
-            return cmd_hostname(argc, argv);
-        }
-        /* NAT commands in config mode */
-        if (strcmp(argv[0], "nat") == 0) {
-            extern int cmd_nat_pool(int argc, char **argv);
-            extern int cmd_nat_enable(int argc, char **argv);
-            extern int cmd_nat_disable(int argc, char **argv);
-
-            if (argc >= 2 && strcmp(argv[1], "pool") == 0) {
-                return cmd_nat_pool(argc, argv);
-            } else if (argc >= 2 && strcmp(argv[1], "enable") == 0) {
-                return cmd_nat_enable(argc, argv);
-            } else if (argc >= 2 && strcmp(argv[1], "disable") == 0) {
-                return cmd_nat_disable(argc, argv);
-            } else {
-                printf("Usage: nat {pool|enable|disable}\n");
-                return -1;
-            }
-        }
+        return -1;
     }
 
-    /* NAT commands also available in EXEC mode */
-    if (strcmp(argv[0], "nat") == 0) {
-        extern int cmd_nat_pool(int argc, char **argv);
-        extern int cmd_nat_enable(int argc, char **argv);
-        extern int cmd_nat_disable(int argc, char **argv);
+    if (strcmp(argv[0], "ip") == 0 && argc >= 2 && strcmp(argv[1], "nat") == 0) {
+        /* ip nat ... */
+        extern int cmd_ip_nat(int argc, char **argv);
+        return cmd_ip_nat(argc, argv);
+    }
 
-        if (argc >= 2 && strcmp(argv[1], "pool") == 0) {
-            return cmd_nat_pool(argc, argv);
-        } else if (argc >= 2 && strcmp(argv[1], "enable") == 0) {
-            return cmd_nat_enable(argc, argv);
-        } else if (argc >= 2 && strcmp(argv[1], "disable") == 0) {
-            return cmd_nat_disable(argc, argv);
-        } else {
-            printf("Usage: nat {pool|enable|disable}\n");
-            return -1;
-        }
+    if (strcmp(argv[0], "hostname") == 0 && argc >= 2) {
+        return cmd_hostname(argc, argv);
     }
 
     return cli_execute_registered(argc, argv);

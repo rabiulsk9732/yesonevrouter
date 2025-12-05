@@ -28,6 +28,7 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_spinlock.h>
 #endif
 
 /* DPDK burst size for high-performance packet reception */
@@ -40,8 +41,12 @@ struct physical_priv {
     bool link_detection_enabled;
     uint64_t last_link_check;
 #ifdef HAVE_DPDK
-    uint16_t port_id;  /* DPDK port ID */
-    bool dpdk_enabled; /* Is DPDK enabled for this interface? */
+    uint16_t port_id;       /* DPDK port ID */
+    bool dpdk_enabled;      /* Is DPDK enabled for this interface? */
+    uint16_t num_rx_queues; /* Number of configured RX queues */
+    uint16_t num_tx_queues; /* Number of configured TX queues */
+    bool port_ready;        /* Flag to track if port is fully initialized and ready for polling */
+    rte_spinlock_t lock;    /* Lock for shared queue access (when queues < threads) */
 #endif
 };
 
@@ -149,9 +154,21 @@ static int physical_up(struct interface *iface)
     priv = (struct physical_priv *)iface->priv_data;
 
 #ifdef HAVE_DPDK
-#include "vpp_parser.h"
+#include "yesrouter_config.h"
 
     if (priv->dpdk_enabled) {
+        /* Check if port is already started - if so, just return success */
+        struct rte_eth_link link;
+        rte_eth_link_get_nowait(priv->port_id, &link);
+        if ((link.link_status == RTE_ETH_LINK_UP && priv->port_ready) || priv->num_rx_queues > 0) {
+            /* Port already configured and started */
+            printf("DPDK port %u already configured and up\n", priv->port_id);
+            if (!priv->port_ready) {
+                priv->port_ready = true; /* Mark as ready if not already */
+            }
+            return 0;
+        }
+
         /* DPDK path - configure and start the port */
         struct rte_eth_conf port_conf = {0};
         struct rte_eth_rxconf rxq_conf;
@@ -163,72 +180,64 @@ static int physical_up(struct interface *iface)
         int num_rx_desc = 1024;
         int num_tx_desc = 1024;
 
-        /* Get device info */
+        /* Get device info FIRST to know device capabilities */
         ret = rte_eth_dev_info_get(priv->port_id, &dev_info);
         if (ret != 0) {
             fprintf(stderr, "Error getting device info: %s\n", strerror(-ret));
             return -1;
         }
 
-        /* Clamp requested queues to device maximum */
+        /* Find configuration for this device by matching interface name */
+        extern struct yesrouter_hw_config g_yesrouter_hw_config;
+        bool found_config = false;
+
+        for (int i = 0; i < g_yesrouter_hw_config.dpdk_config.num_devices; i++) {
+            /* Match by interface name (dynamic from config) */
+            if (strcmp(g_yesrouter_hw_config.dpdk_config.devices[i].name, iface->name) == 0) {
+                num_rx_queues = g_yesrouter_hw_config.dpdk_config.devices[i].num_rx_queues;
+                num_tx_queues = g_yesrouter_hw_config.dpdk_config.devices[i].num_tx_queues;
+                num_rx_desc = g_yesrouter_hw_config.dpdk_config.devices[i].num_rx_desc;
+                num_tx_desc = g_yesrouter_hw_config.dpdk_config.devices[i].num_tx_desc;
+                found_config = true;
+                break;
+            }
+        }
+
+        /* If no match found, try port_id-based matching (fallback for dynamic discovery) */
+        if (!found_config && g_yesrouter_hw_config.dpdk_config.num_devices > 0) {
+            /* Try to match by port_id index (port 0 = devices[0], port 1 = devices[1], etc.) */
+            if (priv->port_id < g_yesrouter_hw_config.dpdk_config.num_devices) {
+                num_rx_queues =
+                    g_yesrouter_hw_config.dpdk_config.devices[priv->port_id].num_rx_queues;
+                num_tx_queues =
+                    g_yesrouter_hw_config.dpdk_config.devices[priv->port_id].num_tx_queues;
+                num_rx_desc = g_yesrouter_hw_config.dpdk_config.devices[priv->port_id].num_rx_desc;
+                num_tx_desc = g_yesrouter_hw_config.dpdk_config.devices[priv->port_id].num_tx_desc;
+                found_config = true;
+            }
+        }
+
+        /* Clamp requested queues to device maximum (dynamic based on actual hardware) */
         if (num_rx_queues > dev_info.max_rx_queues) {
-            printf("DPDK port %d: Requested %d RX queues, but device only supports %d. Clamping.\n",
-                   priv->port_id, num_rx_queues, dev_info.max_rx_queues);
+            printf("DPDK port %d (%s): Requested %d RX queues, but device only supports %d. "
+                   "Clamping.\n",
+                   priv->port_id, iface->name, num_rx_queues, dev_info.max_rx_queues);
             num_rx_queues = dev_info.max_rx_queues;
         }
         if (num_tx_queues > dev_info.max_tx_queues) {
-            printf("DPDK port %d: Requested %d TX queues, but device only supports %d. Clamping.\n",
-                   priv->port_id, num_tx_queues, dev_info.max_tx_queues);
+            printf("DPDK port %d (%s): Requested %d TX queues, but device only supports %d. "
+                   "Clamping.\n",
+                   priv->port_id, iface->name, num_tx_queues, dev_info.max_tx_queues);
             num_tx_queues = dev_info.max_tx_queues;
         }
 
-        /* Find configuration for this device */
-        /* Note: We need to map port_id to PCI address to find config */
-        /* rte_eth_dev_info_get populates device info, but mapping back to our config requires
-         * search */
-        /* For simplicity, we'll iterate our config and match by PCI address if available,
-           or just use defaults if not found. */
-
-        /* TODO: Better mapping. For now, we assume 1:1 mapping if possible or just use defaults */
-        /* Actually, we can get the PCI address from dev_info if it's a PCI device */
-        /* Let's look up in g_vpp_config */
-        extern struct vpp_config g_vpp_config;
-
-        /* Helper to find config by PCI addr string */
-        /* We'll just loop through configured devices and see if we can match */
-        /* This is a bit hacky without full PCI address normalization */
-
-        /* For now, let's just use the first configured device's settings if we only have one,
-           or try to match. */
-
-        /* Better approach: The interface name might match the config name? */
-        /* Or we can just use the global defaults if not found */
-
-        for (int i = 0; i < g_vpp_config.dpdk_config.num_devices; i++) {
-            /* Check if this config entry matches our port */
-            /* We can't easily check PCI address here without more DPDK headers */
-            /* But we can check if the interface name matches? */
-            /* The interface name in 'iface' struct is assigned by us. */
-
-            /* Let's assume the user configured them in order? No, unsafe. */
-
-            /* Let's just use the values from the first config entry that has > 1 queue
-               as a heuristic if we are in multi-core mode. */
-
-            /* CORRECT APPROACH: We should have stored the config pointer in priv during init. */
-            /* But priv is created in physical_init. Let's look there. */
-        }
-
-        /* For this implementation, we will use the values from the FIRST device config
-           that specifies multiple queues, applying it to ALL ports.
-           This is a simplification but works for the user's "fully dynamic" request
-           assuming symmetric NICs. */
-
-        if (g_vpp_config.dpdk_config.num_devices > 0) {
-            num_rx_queues = g_vpp_config.dpdk_config.devices[0].num_rx_queues;
-            num_tx_queues = g_vpp_config.dpdk_config.devices[0].num_tx_queues;
-            num_rx_desc = g_vpp_config.dpdk_config.devices[0].num_rx_desc;
-            num_tx_desc = g_vpp_config.dpdk_config.devices[0].num_tx_desc;
+        /* Check if port is already configured - if so, stop it first */
+        struct rte_eth_link existing_link;
+        rte_eth_link_get_nowait(priv->port_id, &existing_link);
+        if (existing_link.link_status == RTE_ETH_LINK_UP) {
+            /* Port is already started, stop it first */
+            rte_eth_dev_stop(priv->port_id);
+            rte_eth_dev_close(priv->port_id);
         }
 
         /* Configure device */
@@ -239,11 +248,27 @@ static int physical_up(struct interface *iface)
                 RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP;
         }
 
+        bool port_already_configured = false;
         ret = rte_eth_dev_configure(priv->port_id, num_rx_queues, num_tx_queues, &port_conf);
         if (ret < 0) {
-            fprintf(stderr, "Error configuring DPDK port %u: %s\n", priv->port_id,
-                    rte_strerror(-ret));
-            return -1;
+            /* If configuration fails, port might already be configured */
+            /* Try to start it - if that works, port was already configured */
+            int start_ret = rte_eth_dev_start(priv->port_id);
+            if (start_ret == 0) {
+                printf("DPDK port %u was already configured, started successfully\n",
+                       priv->port_id);
+                priv->num_rx_queues = num_rx_queues;
+                port_already_configured = true;
+                /* Skip queue setup - they're already configured */
+                /* Add delay for virtio ring initialization before marking ready */
+                usleep(200000); /* 200ms delay for virtio ring initialization */
+                priv->port_ready = true;
+                goto skip_queue_setup;
+            } else {
+                fprintf(stderr, "Error configuring DPDK port %u: %s (start also failed: %s)\n",
+                        priv->port_id, rte_strerror(-ret), rte_strerror(-start_ret));
+                return -1;
+            }
         }
 
         /* Setup RX queues */
@@ -282,15 +307,22 @@ static int physical_up(struct interface *iface)
             }
         }
 
-        /* Start device */
-        ret = rte_eth_dev_start(priv->port_id);
-        if (ret < 0) {
-            fprintf(stderr, "Error starting DPDK port %u: %s\n", priv->port_id, rte_strerror(-ret));
-            return -1;
+        /* Store number of RX/TX queues for queue_id clamping */
+        priv->num_rx_queues = num_rx_queues;
+        priv->num_tx_queues = num_tx_queues;
+
+    skip_queue_setup:
+        /* Start device (skip if already started above) */
+        if (!port_already_configured) {
+            ret = rte_eth_dev_start(priv->port_id);
+            if (ret < 0) {
+                fprintf(stderr, "Error starting DPDK port %u: %s\n", priv->port_id,
+                        rte_strerror(-ret));
+                return -1;
+            }
         }
 
         /* Wait for link to come up (critical for packet reception) */
-        struct rte_eth_link link;
         int link_check_attempts = 10;
         for (int i = 0; i < link_check_attempts; i++) {
             rte_eth_link_get_nowait(priv->port_id, &link);
@@ -324,6 +356,30 @@ static int physical_up(struct interface *iface)
 
         printf("DPDK port %u started with %d RX queues / %d TX queues\n", priv->port_id,
                num_rx_queues, num_tx_queues);
+
+        /* Additional delay for virtio devices to fully initialize ring buffers */
+        /* This prevents race conditions where polling starts before virtio rings are ready */
+        /* Note: This delay is primarily needed for virtio. Real hardware (Intel/Mellanox) */
+        /* initializes faster, but a delay ensures proper initialization for all devices */
+        /* Virtio requires ring buffers to be fully initialized before polling */
+        usleep(300000); /* 300ms - give virtio driver time to fully initialize ring buffers */
+
+        /* Verify port is actually ready by checking device info (sanity check) */
+        struct rte_eth_dev_info verify_dev_info;
+        int verify_ret = rte_eth_dev_info_get(priv->port_id, &verify_dev_info);
+        if (verify_ret != 0) {
+            fprintf(stderr, "Warning: Failed to verify port %u readiness: %s\n", priv->port_id,
+                    strerror(-verify_ret));
+            /* Continue anyway - might still work */
+        }
+
+        /* Mark port as ready for polling AFTER initialization delay and verification */
+        /* This is critical for virtio devices which need ring buffer initialization */
+        /* The delay ensures virtio ring buffers are fully initialized before polling starts */
+        priv->port_ready = true;
+
+        /* Set interface state to UP */
+        iface->state = IF_STATE_UP;
         return 0;
     }
 #endif
@@ -477,8 +533,14 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
         rte_memcpy(data, pkt->data, pkt->len);
 
         /* Send packet */
-        /* Send packet using thread-local queue ID */
-        uint16_t nb_tx = rte_eth_tx_burst(priv->port_id, g_thread_queue_id, &mbuf, 1);
+        /* Send packet using thread-local queue ID, clamped to configured TX queues */
+        /* Use default of 1 if not specified (safe assumption as we configure at least 1) */
+        uint16_t num_tx_queues = (priv->num_tx_queues > 0) ? priv->num_tx_queues : 1;
+        uint16_t tx_queue_id = (g_thread_queue_id >= 0) ? (g_thread_queue_id % num_tx_queues) : 0;
+
+        rte_spinlock_lock(&priv->lock);
+        uint16_t nb_tx = rte_eth_tx_burst(priv->port_id, tx_queue_id, &mbuf, 1);
+        rte_spinlock_unlock(&priv->lock);
         if (nb_tx == 0) {
             rte_pktmbuf_free(mbuf);
             iface->stats.tx_dropped++;
@@ -528,6 +590,29 @@ static int physical_recv(struct interface *iface, struct pkt_buf **pkt)
 
 #ifdef HAVE_DPDK
     if (priv->dpdk_enabled) {
+        /* Safety check: ensure interface is fully configured before polling */
+        if (priv->num_rx_queues == 0) {
+            /* Interface not yet configured, skip polling */
+            return 0;
+        }
+
+        /* Safety check: verify port is marked as ready (fully initialized) */
+        /* This is critical for virtio devices which need ring buffer initialization */
+        /* Prevents segfaults from polling before virtio rings are ready */
+        if (!priv->port_ready) {
+            /* Port not yet ready for polling, skip */
+            return 0;
+        }
+
+        /* Safety check: verify port is actually started and link is up */
+        /* Also important for Mellanox and Intel cards to ensure proper initialization */
+        struct rte_eth_link link;
+        int link_ret = rte_eth_link_get_nowait(priv->port_id, &link);
+        if (link_ret < 0 || link.link_status != RTE_ETH_LINK_UP) {
+            /* Port not up yet or error getting link status, skip polling */
+            return 0;
+        }
+
         /* Thread-local burst buffer */
         static __thread struct rte_mbuf *tl_rx_burst_buf[DPDK_RX_BURST_SIZE];
         static __thread uint16_t tl_rx_burst_count = 0;
@@ -548,31 +633,69 @@ static int physical_recv(struct interface *iface, struct pkt_buf **pkt)
         /* Check if we have buffered packets from previous burst */
         if (tl_rx_burst_idx >= tl_rx_burst_count) {
             /* Need to fetch new burst using thread-local queue ID */
+            extern __thread int g_thread_queue_id;
 
-            /* Debug: trace polling */
-            static uint64_t poll_count = 0;
-            poll_count++;
-            if (poll_count % 100 == 1) { /* Log more frequently */
-                struct rte_eth_stats stats;
-                rte_eth_stats_get(priv->port_id, &stats);
-                printf("[PHY DEBUG] Polling port %u queue %d (burst_idx=%u count=%u) | Q0: %lu Q1: "
-                       "%lu Q2: %lu | Errors: %lu\n",
-                       priv->port_id, g_thread_queue_id, tl_rx_burst_idx, tl_rx_burst_count,
-                       stats.q_ipackets[0], stats.q_ipackets[1], stats.q_ipackets[2],
-                       stats.ierrors);
+            /* Clamp queue_id to valid range to prevent segfault */
+            /* Ensure g_thread_queue_id is non-negative and clamp to valid queue range */
+            /* Use default of 1 if not specified */
+            uint16_t num_rx_queues = (priv->num_rx_queues > 0) ? priv->num_rx_queues : 1;
+            int queue_id = (g_thread_queue_id >= 0) ? (g_thread_queue_id % num_rx_queues) : 0;
+            uint16_t safe_queue_id = queue_id;
+            /* Debug polling disabled for production */
+            /* static uint64_t poll_count = 0; poll_count++; */
+
+            /* Safety: validate port_id before calling DPDK function */
+            if (priv->port_id >= RTE_MAX_ETHPORTS) {
+                return 0;
             }
 
-            tl_rx_burst_count = rte_eth_rx_burst(priv->port_id, g_thread_queue_id, tl_rx_burst_buf,
-                                                 DPDK_RX_BURST_SIZE);
+            /* Call rte_eth_rx_burst with error handling */
+            /* For virtio devices, ensure port is fully ready before polling */
+            /* Virtio requires proper ring buffer initialization before polling */
+            /* Lock required if multiple threads access same queue (e.g. 1 queue, N threads) */
+            rte_spinlock_lock(&priv->lock);
+            tl_rx_burst_count =
+                rte_eth_rx_burst(priv->port_id, safe_queue_id, tl_rx_burst_buf, DPDK_RX_BURST_SIZE);
+            rte_spinlock_unlock(&priv->lock);
             tl_rx_burst_idx = 0;
 
+            /* If burst count is 0, no packets available - this is normal */
             if (tl_rx_burst_count == 0) {
                 return 0;
+            }
+
+            /* Safety: validate burst count doesn't exceed buffer size */
+            if (tl_rx_burst_count > DPDK_RX_BURST_SIZE) {
+                /* This shouldn't happen, but be defensive */
+                tl_rx_burst_count = DPDK_RX_BURST_SIZE;
+            }
+
+            /* Safety: validate all mbufs in burst are valid (especially for virtio) */
+            for (uint16_t i = 0; i < tl_rx_burst_count; i++) {
+                if (!tl_rx_burst_buf[i]) {
+                    /* Invalid mbuf - free any valid ones and return */
+                    for (uint16_t j = 0; j < i; j++) {
+                        if (tl_rx_burst_buf[j]) {
+                            rte_pktmbuf_free(tl_rx_burst_buf[j]);
+                        }
+                    }
+                    tl_rx_burst_count = 0;
+                    return 0;
+                }
             }
         }
 
         /* Get next packet from burst buffer */
+        /* Safety: bounds check before accessing buffer */
+        if (tl_rx_burst_idx >= tl_rx_burst_count || tl_rx_burst_idx >= DPDK_RX_BURST_SIZE) {
+            return 0;
+        }
         struct rte_mbuf *mbuf = tl_rx_burst_buf[tl_rx_burst_idx++];
+
+        /* Safety: validate mbuf pointer */
+        if (!mbuf) {
+            return 0;
+        }
 
         /* Convert mbuf to pkt_buf */
         new_pkt = pkt_alloc();

@@ -3,6 +3,8 @@
  * @brief YESRouter vBNG Main Entry Point
  */
 
+#define _GNU_SOURCE
+
 #include "arp.h"
 #include "arp_queue.h"
 #include "auth.h"
@@ -23,7 +25,7 @@
 #include "qos.h"
 #include "radius.h"
 #include "routing_table.h"
-#include "vpp_parser.h"
+#include "yesrouter_config.h"
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -97,13 +99,16 @@ int main(int argc, char *argv[])
     int dpdk_argc = 0;
 
     /* Initialize VPP config defaults */
-    vpp_config_init_defaults();
+    yesrouter_config_init_defaults();
 
-    /* Check for startup.conf */
-    if (access("startup.conf", F_OK) == 0) {
-        vpp_config_parse("startup.conf");
-    } else if (access("/etc/vpp/startup.conf", F_OK) == 0) {
-        vpp_config_parse("/etc/vpp/startup.conf");
+    /* Check for yesrouter.conf */
+    if (access("yesrouter.conf", F_OK) == 0) {
+        yesrouter_config_parse("yesrouter.conf");
+    } else if (access("/etc/yesrouter/yesrouter.conf", F_OK) == 0) {
+        yesrouter_config_parse("/etc/yesrouter/yesrouter.conf");
+    } else if (access("/etc/yesrouter/startup.conf", F_OK) == 0) {
+        /* Fallback to startup.conf for backward compatibility */
+        yesrouter_config_parse("/etc/yesrouter/startup.conf");
     }
 
     /* Check for --daemon, --interactive and -h before DPDK steals args */
@@ -136,21 +141,23 @@ int main(int argc, char *argv[])
     }
 
     /* Construct DPDK arguments from VPP config */
-    if (g_vpp_config.dpdk_config.enabled) {
+    if (g_yesrouter_hw_config.dpdk_config.enabled) {
         dpdk_argv[dpdk_argc++] = argv[0];
 
         /* Core mask/list */
-        if (strlen(g_vpp_config.cpu_config.corelist_workers) > 0) {
+        if (strlen(g_yesrouter_hw_config.cpu_config.corelist_workers) > 0) {
             dpdk_argv[dpdk_argc++] = "-l";
             char lcore_list[512];
-            snprintf(lcore_list, sizeof(lcore_list), "%d,%s", g_vpp_config.cpu_config.main_core,
-                     g_vpp_config.cpu_config.corelist_workers);
+            snprintf(lcore_list, sizeof(lcore_list), "%d,%s",
+                     g_yesrouter_hw_config.cpu_config.main_core,
+                     g_yesrouter_hw_config.cpu_config.corelist_workers);
             dpdk_argv[dpdk_argc++] = strdup(lcore_list);
         } else {
             /* Default to main core only */
             dpdk_argv[dpdk_argc++] = "-l";
             char lcore_list[32];
-            snprintf(lcore_list, sizeof(lcore_list), "%d", g_vpp_config.cpu_config.main_core);
+            snprintf(lcore_list, sizeof(lcore_list), "%d",
+                     g_yesrouter_hw_config.cpu_config.main_core);
             dpdk_argv[dpdk_argc++] = strdup(lcore_list);
         }
 
@@ -159,21 +166,22 @@ int main(int argc, char *argv[])
         dpdk_argv[dpdk_argc++] = "4";
 
         /* Hugepage memory */
-        if (g_vpp_config.dpdk_config.socket_mem > 0) {
+        if (g_yesrouter_hw_config.dpdk_config.socket_mem > 0) {
             dpdk_argv[dpdk_argc++] = "--socket-mem";
             char mem_str[32];
-            snprintf(mem_str, sizeof(mem_str), "%d", g_vpp_config.dpdk_config.socket_mem);
+            snprintf(mem_str, sizeof(mem_str), "%d", g_yesrouter_hw_config.dpdk_config.socket_mem);
             dpdk_argv[dpdk_argc++] = strdup(mem_str);
         }
 
         /* PCI whitelist/blacklist */
-        if (g_vpp_config.dpdk_config.no_pci) {
+        if (g_yesrouter_hw_config.dpdk_config.no_pci) {
             dpdk_argv[dpdk_argc++] = "--no-pci";
-        } else if (g_vpp_config.dpdk_config.num_devices > 0) {
+        } else if (g_yesrouter_hw_config.dpdk_config.num_devices > 0) {
             /* Add -a for each configured device */
-            for (int i = 0; i < g_vpp_config.dpdk_config.num_devices; i++) {
+            for (int i = 0; i < g_yesrouter_hw_config.dpdk_config.num_devices; i++) {
                 dpdk_argv[dpdk_argc++] = "-a";
-                dpdk_argv[dpdk_argc++] = strdup(g_vpp_config.dpdk_config.devices[i].pci_addr);
+                dpdk_argv[dpdk_argc++] =
+                    strdup(g_yesrouter_hw_config.dpdk_config.devices[i].pci_addr);
             }
         }
 
@@ -200,7 +208,7 @@ int main(int argc, char *argv[])
     }
 
     /* Pin main thread */
-    cpu_scheduler_set_affinity(g_vpp_config.cpu_config.main_core);
+    cpu_scheduler_set_affinity(g_yesrouter_hw_config.cpu_config.main_core);
 
     /* dpdk_init might have modified argc/argv, but for simplicity in this
      * hybrid setup, we'll reset optind to 1 to parse remaining app args */
@@ -283,11 +291,6 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    if (routing_table_init() == NULL) {
-        YLOG_ERROR("Failed to initialize routing table");
-        goto cleanup;
-    }
-
     /* User DB, Session, and Telnet removed as per request */
 
     if (cli_init() != 0) {
@@ -304,11 +307,11 @@ int main(int argc, char *argv[])
     }
 
     /* Execute startup script from VPP config */
-    if (strlen(g_vpp_config.unix_config.exec_script) > 0) {
-        YLOG_INFO("Executing startup script: %s", g_vpp_config.unix_config.exec_script);
-        if (cli_execute_file(g_vpp_config.unix_config.exec_script) != 0) {
+    if (strlen(g_yesrouter_hw_config.unix_config.exec_script) > 0) {
+        YLOG_INFO("Executing startup script: %s", g_yesrouter_hw_config.unix_config.exec_script);
+        if (cli_execute_file(g_yesrouter_hw_config.unix_config.exec_script) != 0) {
             YLOG_WARNING("Failed to execute startup script: %s",
-                         g_vpp_config.unix_config.exec_script);
+                         g_yesrouter_hw_config.unix_config.exec_script);
         }
     }
 
@@ -352,7 +355,7 @@ int main(int argc, char *argv[])
         }
 
         /* Initialize and start CLI socket server */
-        const char *socket_path = g_vpp_config.unix_config.cli_listen;
+        const char *socket_path = g_yesrouter_hw_config.unix_config.cli_listen;
         if (!socket_path || socket_path[0] == '\0') {
             socket_path = "/run/yesrouter/cli.sock";
         }
@@ -400,17 +403,21 @@ cleanup:
     printf("YESRouter vBNG - Shutting Down\n");
     printf("========================================\n\n");
 
+    /* Stop packet RX threads first */
     packet_rx_stop();
 
-    /* Stop NAT timeout timer */
-    g_nat_timeout_running = false;
-    pthread_join(g_nat_timeout_tid, NULL);
+    /* Stop NAT timeout timer with safety check */
+    if (g_nat_timeout_running) {
+        g_nat_timeout_running = false;
+        /* Give thread time to exit before joining */
+        usleep(100000); /* 100ms */
+        pthread_join(g_nat_timeout_tid, NULL);
+    }
 
+    /* Cleanup subsystems - order matters (reverse of init) */
     nat_cleanup();
     pppoe_cleanup();
     routing_table_cleanup(routing_table_get_instance());
-    /* session_cleanup(); */
-    /* user_db_cleanup(); */
     dns_cleanup();
     arp_cleanup();
     interface_cleanup();

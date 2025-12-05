@@ -6,11 +6,11 @@
  * References: VPP NAT44 implementation, DPDK Programmer's Guide
  */
 
+#include "acl.h"
 #include "interface.h"
 #include "log.h"
 #include "nat.h"
 #include "packet.h"
-
 #include <rte_byteorder.h>
 #include <rte_icmp.h>
 #include <rte_ip.h>
@@ -91,7 +91,7 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
         __atomic_fetch_add(&g_nat_config.stats.snat_early_returns, 1, __ATOMIC_RELAXED);
         return -1;
     }
-    
+
     if (!g_nat_config.enabled) {
         /* NAT disabled - track this case */
         __atomic_fetch_add(&g_nat_config.stats.snat_early_returns, 1, __ATOMIC_RELAXED);
@@ -132,6 +132,7 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
     }
 
     /* Debug: Log ICMP lookup attempt */
+    /* Disabled for load testing - too verbose
     static uint64_t snat_call_count = 0;
     snat_call_count++;
     if (protocol == IPPROTO_ICMP && (snat_call_count % 100) == 1) {
@@ -139,6 +140,7 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
                (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF, (inside_ip >> 8) & 0xFF,
                inside_ip & 0xFF, inside_port);
     }
+    */
 
     /* Lookup existing session */
     session = nat_session_lookup_inside(inside_ip, inside_port, protocol);
@@ -151,10 +153,53 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
             return -1;
         }
 
-        /* Allocate public IP/Port */
-        outside_ip = nat_pool_allocate_ip(&g_nat_config.pools[0]);
+        /* Policy Based NAT: Select pool based on rules */
+        struct nat_pool *selected_pool = NULL;
+
+        if (g_nat_config.num_rules > 0) {
+            /* Check rules in order */
+            for (int i = 0; i < g_nat_config.num_rules; i++) {
+                struct nat_rule *rule = &g_nat_config.rules[i];
+                if (!rule->active)
+                    continue;
+
+                /* Check ACL */
+                /* Protocol, SrcIP, DstIP, SrcPort, DstPort */
+                /* For NAT ACLs we usually care about Source IP. Dst IP is 0=any */
+                if (acl_check(rule->acl_name, protocol, inside_ip, 0, inside_port, 0) ==
+                    ACL_PERMIT) {
+                    /* Match found! Find the pool. */
+                    for (int p = 0; p < g_nat_config.num_pools; p++) {
+                        if (strcmp(g_nat_config.pools[p].name, rule->pool_name) == 0 &&
+                            g_nat_config.pools[p].active) {
+                            selected_pool = &g_nat_config.pools[p];
+                            break;
+                        }
+                    }
+                    if (selected_pool)
+                        break;
+                }
+            }
+        }
+
+        /* Fallback: If no rule matched or no rules exist, use first pool (classic behavior) */
+        /* BUT: If rules exist and none matched, typically we should NOT NAT? */
+        /* For backward compatibility with previous steps, if num_rules==0 use pool[0] */
+        if (!selected_pool) {
+            if (g_nat_config.num_rules == 0) {
+                selected_pool = &g_nat_config.pools[0];
+            } else {
+                /* Rules exist but none matched. */
+                /* If user defined specific internal list with 'ip nat inside source list ...' */
+                /* That command now creates a rule. So if no rule matches, traffic is not NATed. */
+                return -1;
+            }
+        }
+
+        /* Allocate public IP/Port from selected pool */
+        outside_ip = nat_pool_allocate_ip(selected_pool);
         if (unlikely(!outside_ip)) {
-            printf("[SNAT FAIL] nat_pool_allocate_ip returned 0\n");
+            // YLOG_WARNING("[SNAT FAIL] Pool %s exhausted", selected_pool->name);
             g_nat_config.stats.no_ip_available++;
             return -1;
         }
@@ -173,7 +218,8 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
         session = nat_session_create(inside_ip, inside_port, outside_ip, outside_port, protocol);
         if (unlikely(!session)) {
             if (protocol == IPPROTO_ICMP) {
-                __atomic_fetch_add(&g_nat_config.stats.icmp_session_race_failures, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_nat_config.stats.icmp_session_race_failures, 1,
+                                   __ATOMIC_RELAXED);
                 YLOG_WARNING("[ICMP-IN2OUT] Session creation failed for in=%u.%u.%u.%u id=%u",
                              (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF,
                              (inside_ip >> 8) & 0xFF, inside_ip & 0xFF, inside_port);
@@ -182,11 +228,11 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
         }
         if (protocol == IPPROTO_ICMP) {
             YLOG_DEBUG("[ICMP-IN2OUT-CREATE] Session created: in=%u.%u.%u.%u id=%u -> "
-                      "out=%u.%u.%u.%u id=%u",
-                      (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF, (inside_ip >> 8) & 0xFF,
-                      inside_ip & 0xFF, inside_port, (outside_ip >> 24) & 0xFF,
-                      (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF, outside_ip & 0xFF,
-                      outside_port);
+                       "out=%u.%u.%u.%u id=%u",
+                       (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF, (inside_ip >> 8) & 0xFF,
+                       inside_ip & 0xFF, inside_port, (outside_ip >> 24) & 0xFF,
+                       (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF, outside_ip & 0xFF,
+                       outside_port);
         }
         static uint64_t session_create_count = 0;
         if (unlikely((++session_create_count % 10) == 0)) {
@@ -304,8 +350,8 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     /* ICMP-specific debug */
     if (protocol == IPPROTO_ICMP) {
         YLOG_DEBUG("[ICMP-OUT2IN] Looking up: dst=%u.%u.%u.%u id=%u", (outside_ip >> 24) & 0xFF,
-                  (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF, outside_ip & 0xFF,
-                  outside_port);
+                   (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF, outside_ip & 0xFF,
+                   outside_port);
     }
 
     session = nat_session_lookup_outside(outside_ip, outside_port, protocol);
@@ -314,15 +360,15 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
             /* Track ICMP identifier mismatches */
             __atomic_fetch_add(&g_nat_config.stats.icmp_identifier_mismatches, 1, __ATOMIC_RELAXED);
             YLOG_DEBUG("[ICMP-OUT2IN-MISS] No session for dst=%u.%u.%u.%u id=%u type=%u",
-                      (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
-                      (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port,
-                      icmp ? icmp->icmp_type : 0xFF);
+                       (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
+                       (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port,
+                       icmp ? icmp->icmp_type : 0xFF);
         }
         static uint64_t out2in_miss_count = 0;
         if (unlikely((++out2in_miss_count % 100) == 0)) {
             YLOG_DEBUG("[NAT-OUT2IN-MISS #%lu] dst=%u.%u.%u.%u:%u proto=%u", out2in_miss_count,
-                      (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
-                      (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port, protocol);
+                       (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
+                       (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port, protocol);
         }
         g_nat_config.stats.out2in_misses++;
         return -1;
@@ -330,7 +376,8 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     if (protocol == IPPROTO_ICMP) {
         /* Validate session matches what we're looking for */
         if (session->outside_ip != outside_ip || session->outside_port != outside_port) {
-            YLOG_WARNING("[ICMP-OUT2IN] Session mismatch: expected out=%u.%u.%u.%u id=%u, got out=%u.%u.%u.%u id=%u",
+            YLOG_WARNING("[ICMP-OUT2IN] Session mismatch: expected out=%u.%u.%u.%u id=%u, got "
+                         "out=%u.%u.%u.%u id=%u",
                          (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
                          (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port,
                          (session->outside_ip >> 24) & 0xFF, (session->outside_ip >> 16) & 0xFF,
@@ -341,9 +388,9 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
             return -1;
         }
         YLOG_DEBUG("[ICMP-OUT2IN-HIT] Session found! inside=%u.%u.%u.%u id=%u",
-                  (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
-                  (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF,
-                  session->inside_port);
+                   (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
+                   (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF,
+                   session->inside_port);
     }
     g_nat_config.stats.out2in_hits++;
 

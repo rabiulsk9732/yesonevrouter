@@ -155,13 +155,24 @@ static void *cli_session_handler(void *arg)
     /* Disable buffering for immediate output */
     setvbuf(client_fp, NULL, _IONBF, 0);
 
-    /* Send welcome banner */
-    fprintf(client_fp, "\nyesrouter vBNG\n");
-    fprintf(client_fp, "Type 'help' for available commands\n");
-    fprintf(client_fp, "Type 'exit' to disconnect\n\n");
+    /* Send professional welcome banner */
+    fprintf(client_fp, "\r\n");
+    fprintf(client_fp, "╔══════════════════════════════════════════════════════════════╗\r\n");
+    fprintf(client_fp, "║           YESRouter vBNG - High Performance Router           ║\r\n");
+    fprintf(client_fp, "║                    Version 1.0.0 (DPDK)                      ║\r\n");
+    fprintf(client_fp, "║          Copyright (c) 2025 - All Rights Reserved            ║\r\n");
+    fprintf(client_fp, "╚══════════════════════════════════════════════════════════════╝\r\n");
+    fprintf(client_fp, "\r\n");
+    fprintf(client_fp, "  Type 'help' or '?' for available commands\r\n");
+    fprintf(client_fp, "  Type 'configure terminal' to enter configuration mode\r\n");
+    fprintf(client_fp, "  Type 'exit' to disconnect\r\n");
+    fprintf(client_fp, "\r\n");
+
+    /* Get prompt based on CLI mode */
+    extern const char *cli_get_prompt(void);
 
     /* Send initial prompt */
-    fprintf(client_fp, "yesrouter# ");
+    fprintf(client_fp, "%s", cli_get_prompt());
     fflush(client_fp);
 
     /* Command loop - handle raw mode character-by-character input */
@@ -331,11 +342,11 @@ static void *cli_session_handler(void *arg)
                 close(saved_stderr);
 
                 /* Prompt for next command */
-                fprintf(client_fp, "yesrouter# ");
+                fprintf(client_fp, "%s", cli_get_prompt());
                 fflush(client_fp);
             } else {
                 /* Empty line - just show prompt */
-                fprintf(client_fp, "\r\nyesrouter# ");
+                fprintf(client_fp, "\r\n%s", cli_get_prompt());
                 fflush(client_fp);
             }
 
@@ -410,7 +421,7 @@ static void *cli_session_handler(void *arg)
                 fflush(stdout);
                 dup2(saved_stdout, STDOUT_FILENO);
                 close(saved_stdout);
-                fprintf(client_fp, "yesrouter# %s", line_buffer);
+                fprintf(client_fp, "%s%s", cli_get_prompt(), line_buffer);
                 fflush(client_fp);
             }
             /* Else no matches - do nothing (like Cisco) */
@@ -430,7 +441,7 @@ static void *cli_session_handler(void *arg)
             close(saved_stdout);
 
             /* Redisplay prompt with current input */
-            fprintf(client_fp, "yesrouter# %s", line_buffer);
+            fprintf(client_fp, "%s%s", cli_get_prompt(), line_buffer);
             fflush(client_fp);
         } else if (c >= 32 && c < 127) {
             /* Printable character */
