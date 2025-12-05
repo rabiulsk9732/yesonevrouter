@@ -10,6 +10,9 @@
 ## 🎯 Current Status Summary
 
 ### ✅ COMPLETED TODAY (2025-12-05)
+- **IPFIX NAT Event Logging (RFC 7011/8158)**: Export NAT create/delete events to IPFIX collectors
+- **NetFlow v9 NAT Event Logging**: Export NAT events to NetFlow v9 collectors (nfcapd, etc.)
+- **NAT Logging CLI Commands**: `nat logging ipfix`, `nat logging netflow`, `show nat logging`
 - **CLI Professional Banner**: Box-style welcome banner with version info on connection
 - **Mode-Aware Prompts**: Dynamic prompts (`yesrouter#`, `yesrouter(config)#`, `yesrouter(config-if-Gi0/1)#`)
 - **Configuration Persistence**: `write`/`save`/`commit` now saves to `/etc/yesrouter/startup.gate`

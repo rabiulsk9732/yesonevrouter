@@ -22,6 +22,9 @@ All notable changes to this project will be documented in this file.
 - **Auto-load on Restart**: Configuration persists across service restarts
 
 #### NAT Improvements
+- **IPFIX Export (RFC 7011/8158)**: Export NAT session events to IPFIX collectors
+- **NetFlow v9 Export**: Export NAT events to legacy NetFlow v9 collectors
+- **NAT Logging CLI**: `nat logging ipfix`, `nat logging netflow`, `show nat logging`
 - **NAT Rule Storage**: Masquerade rules now properly stored in `g_nat_config.rules[]`
 - **Policy-Based NAT**: Support for ACL-based NAT pool selection
 - **Static NAT**: Port forwarding with permanent sessions (is_static flag)
