@@ -7,6 +7,7 @@
 #include "cli.h"
 #include "interface.h"
 #include "nat.h"
+#include "nat_log.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -273,6 +274,150 @@ int cmd_clear_ip_nat_translation(int argc, char **argv)
     return 0;
 }
 
+/* Command: nat logging ipfix collector <ip> port <port> */
+static int cmd_nat_logging_ipfix(int argc, char **argv)
+{
+    /* nat logging ipfix collector <ip> port <port> [domain <id>] */
+    if (argc < 6) {
+        printf("Usage: nat logging ipfix collector <ip> port <port> [domain <id>]\n");
+        return -1;
+    }
+
+    struct in_addr collector_addr;
+    if (inet_pton(AF_INET, argv[4], &collector_addr) != 1) {
+        printf("%% Invalid collector IP address\n");
+        return -1;
+    }
+
+    if (strcmp(argv[5], "port") != 0 || argc < 7) {
+        printf("Usage: nat logging ipfix collector <ip> port <port> [domain <id>]\n");
+        return -1;
+    }
+
+    uint16_t port = (uint16_t)atoi(argv[6]);
+    uint32_t domain_id = 1; /* Default domain ID */
+
+    if (argc >= 9 && strcmp(argv[7], "domain") == 0) {
+        domain_id = (uint32_t)atoi(argv[8]);
+    }
+
+    uint32_t collector_ip = ntohl(collector_addr.s_addr);
+
+    if (nat_log_configure_ipfix(collector_ip, port, domain_id) == 0) {
+        printf("IPFIX exporter configured:\n");
+        printf("  Collector: %s:%u\n", argv[4], port);
+        printf("  Domain ID: %u\n", domain_id);
+    } else {
+        printf("%% Failed to configure IPFIX exporter\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Command: nat logging netflow collector <ip> port <port> */
+static int cmd_nat_logging_netflow(int argc, char **argv)
+{
+    /* nat logging netflow collector <ip> port <port> [source-id <id>] */
+    if (argc < 6) {
+        printf("Usage: nat logging netflow collector <ip> port <port> [source-id <id>]\n");
+        return -1;
+    }
+
+    struct in_addr collector_addr;
+    if (inet_pton(AF_INET, argv[4], &collector_addr) != 1) {
+        printf("%% Invalid collector IP address\n");
+        return -1;
+    }
+
+    if (strcmp(argv[5], "port") != 0 || argc < 7) {
+        printf("Usage: nat logging netflow collector <ip> port <port> [source-id <id>]\n");
+        return -1;
+    }
+
+    uint16_t port = (uint16_t)atoi(argv[6]);
+    uint32_t source_id = 1; /* Default source ID */
+
+    if (argc >= 9 && strcmp(argv[7], "source-id") == 0) {
+        source_id = (uint32_t)atoi(argv[8]);
+    }
+
+    uint32_t collector_ip = ntohl(collector_addr.s_addr);
+
+    if (nat_log_configure_netflow(collector_ip, port, source_id) == 0) {
+        printf("NetFlow v9 exporter configured:\n");
+        printf("  Collector: %s:%u\n", argv[4], port);
+        printf("  Source ID: %u\n", source_id);
+    } else {
+        printf("%% Failed to configure NetFlow v9 exporter\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Command: nat logging events <all|create|delete> */
+static int cmd_nat_logging_events(int argc, char **argv)
+{
+    if (argc < 4) {
+        printf("Usage: nat logging events <all|create|delete|quota>\n");
+        return -1;
+    }
+
+    if (strcmp(argv[3], "all") == 0) {
+        nat_log_set_events(NAT_LOG_EVENTS_ALL, true);
+        printf("All NAT events will be logged\n");
+    } else if (strcmp(argv[3], "create") == 0) {
+        nat_log_set_events(NAT_LOG_EVENTS_CREATE, true);
+        printf("NAT CREATE events will be logged\n");
+    } else if (strcmp(argv[3], "delete") == 0) {
+        nat_log_set_events(NAT_LOG_EVENTS_DELETE, true);
+        printf("NAT DELETE events will be logged\n");
+    } else if (strcmp(argv[3], "quota") == 0) {
+        nat_log_set_events(NAT_LOG_EVENTS_QUOTA, true);
+        printf("NAT QUOTA events will be logged\n");
+    } else {
+        printf("%% Unknown event type: %s\n", argv[3]);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Command: show nat logging */
+static int cmd_show_nat_logging(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    nat_log_print_config();
+    return 0;
+}
+
+/* Dispatcher: nat logging ... */
+int cmd_nat_logging(int argc, char **argv)
+{
+    /* nat logging <ipfix|netflow|events> ... */
+    if (argc < 3) {
+        printf("Usage: nat logging <ipfix|netflow|events>\n");
+        printf("  ipfix collector <ip> port <port> [domain <id>]\n");
+        printf("  netflow collector <ip> port <port> [source-id <id>]\n");
+        printf("  events <all|create|delete|quota>\n");
+        return -1;
+    }
+
+    if (strcmp(argv[2], "ipfix") == 0) {
+        return cmd_nat_logging_ipfix(argc, argv);
+    } else if (strcmp(argv[2], "netflow") == 0) {
+        return cmd_nat_logging_netflow(argc, argv);
+    } else if (strcmp(argv[2], "events") == 0) {
+        return cmd_nat_logging_events(argc, argv);
+    } else {
+        printf("%% Unknown command: nat logging %s\n", argv[2]);
+        return -1;
+    }
+}
+
 /* Dispatcher: ip nat ... */
 int cmd_ip_nat(int argc, char **argv)
 {
@@ -297,14 +442,20 @@ int cmd_ip_nat(int argc, char **argv)
 /* Register NAT commands */
 void cli_register_nat_commands(void)
 {
-    /* We don't register "ip nat" here because "ip" is a top-level command handled in cli.c */
-    /* But we register show commands */
+    /* NAT show commands */
     cli_register_command("show ip nat statistics", "Display NAT statistics", cmd_show_ip_nat);
     cli_register_command("show ip nat translations", "Display NAT translations", cmd_show_ip_nat);
+    cli_register_command("show nat logging", "Display NAT logging config", cmd_show_nat_logging);
 
-    /* Cisco style clear */
+    /* NAT clear commands */
     cli_register_command("clear ip nat translation", "Clear NAT translations",
                          cmd_clear_ip_nat_translation);
 
-    printf("Cisco-style NAT commands registered\n");
+    /* NAT logging commands */
+    cli_register_command("nat logging", "Configure NAT event logging", cmd_nat_logging);
+
+    /* Initialize logging subsystem */
+    nat_log_subsystem_init();
+
+    printf("NAT commands registered (incl. IPFIX/NetFlow logging)\n");
 }

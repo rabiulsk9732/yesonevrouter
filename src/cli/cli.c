@@ -215,6 +215,15 @@ int cmd_show(int argc, char **argv)
         }
         printf("%% Unknown show ip command: %s\n", argv[2]);
         return -1;
+    } else if (strcmp(argv[1], "nat") == 0) {
+        /* show nat logging ... */
+        if (argc >= 3 && strcmp(argv[2], "logging") == 0) {
+            extern void nat_log_print_config(void);
+            nat_log_print_config();
+            return 0;
+        }
+        printf("%% Unknown show nat command. Try: show nat logging\n");
+        return -1;
     } else if (strcmp(argv[1], "routes") == 0) {
         return cmd_show_routes(argc, argv);
     } else if (strcmp(argv[1], "arp") == 0) {
@@ -474,6 +483,12 @@ int cli_execute(const char *cmdline)
         /* ip nat ... */
         extern int cmd_ip_nat(int argc, char **argv);
         return cmd_ip_nat(argc, argv);
+    }
+
+    if (strcmp(argv[0], "nat") == 0 && argc >= 2 && strcmp(argv[1], "logging") == 0) {
+        /* nat logging ... */
+        extern int cmd_nat_logging(int argc, char **argv);
+        return cmd_nat_logging(argc, argv);
     }
 
     if (strcmp(argv[0], "hostname") == 0 && argc >= 2) {

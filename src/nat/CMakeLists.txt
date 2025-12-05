@@ -9,6 +9,8 @@ add_library(yesrouter_nat
     nat_hairpin.c
     alg_icmp.c
     nat_log.c
+    nat_ipfix.c
+    nat_netflow.c
     nat_worker.c
 )
 
