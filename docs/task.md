@@ -15,7 +15,7 @@
 - [x] Fixed config save to write to `/etc/yesrouter/startup.gate`
 - [x] NAT masquerade rules now saved and loaded on boot
 - [x] Interface configurations saved correctly
-- [x] Static routes saved correctly
+- [x] Static routes saved correctlyz
 
 #### 3. Debug Spam Removal ✅
 - [x] Removed `[RX DEBUG]` from packet_rx.c
