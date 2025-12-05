@@ -2,9 +2,6 @@
 # Similar to VPP's setup.gate or boot.vpp
 # Referenced from startup.conf unix { exec ... }
 
-# Enter privileged mode
-enable
-
 # Configure interface
 configure terminal
 interface Gi0/1

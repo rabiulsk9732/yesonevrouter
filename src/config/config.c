@@ -340,8 +340,21 @@ int config_load(const char *filename)
 
         /* Parse configuration file */
         while (fgets(line, sizeof(line), fp)) {
-            if (parse_config_line(line, &new_cfg) < 0) {
-                fprintf(stderr, "Error parsing configuration line: %s\n", line);
+            char *trimmed = trim(line);
+            if (trimmed[0] == '#' || trimmed[0] == ';' || trimmed[0] == '!' || trimmed[0] == '\0') {
+                continue;
+            }
+
+            /* Check if it's a key=value pair */
+            if (strchr(trimmed, '=')) {
+                if (parse_config_line(trimmed, &new_cfg) < 0) {
+                    fprintf(stderr, "Error parsing configuration line: %s\n", trimmed);
+                }
+            } else {
+                /* Assume it's a CLI command */
+                extern int cli_execute(const char *cmdline);
+                printf("Executing startup command: %s\n", trimmed);
+                cli_execute(trimmed);
             }
         }
 

@@ -172,11 +172,93 @@ static int radix_tree_insert_rib(struct routing_table *table,
 
     /* If tree is empty, create root */
     if (!table->rib_root) {
+        printf("DEBUG: Tree empty, creating root for %08x/%d\n", prefix.s_addr, prefix_len);
         table->rib_root = radix_node_create(&prefix, prefix_len);
         if (!table->rib_root) {
             return -1;
         }
         table->rib_root->route = route;
+        table->rib_count++;
+        return 0;
+    }
+
+    printf("DEBUG: Inserting %08x/%d. Root is %08x/%d\n",
+           prefix.s_addr, prefix_len,
+           table->rib_root->prefix.s_addr, table->rib_root->prefix_len);
+
+    /* Check if new prefix is a supernet of the root */
+    if (prefix_len < table->rib_root->prefix_len) {
+        /* Check if root is within new prefix */
+        uint32_t mask_val = PREFIX_MASK(prefix_len);
+        if ((table->rib_root->prefix.s_addr & mask_val) == (prefix.s_addr & mask_val)) {
+            /* New node becomes new root */
+            new_node = radix_node_create(&prefix, prefix_len);
+            if (!new_node) return -1;
+            new_node->route = route;
+
+            /* Old root becomes child */
+            int bit = IP_BIT(table->rib_root->prefix.s_addr, prefix_len);
+            if (bit == 0) {
+                new_node->left = table->rib_root;
+            } else {
+                new_node->right = table->rib_root;
+            }
+            table->rib_root = new_node;
+            table->rib_count++;
+            return 0;
+        }
+    }
+
+    /* Check for disjoint prefixes (divergence before root's prefix length) */
+    /* Find first differing bit */
+    int diff_bit = -1;
+    int min_len = (prefix_len < table->rib_root->prefix_len) ? prefix_len : table->rib_root->prefix_len;
+    for (int i = 0; i < min_len; i++) {
+        if (IP_BIT(prefix.s_addr, i) != IP_BIT(table->rib_root->prefix.s_addr, i)) {
+            diff_bit = i;
+            break;
+        }
+    }
+
+    /* If they diverge, or if new prefix is shorter but not a supernet (diverges) */
+    if (diff_bit != -1 || (prefix_len < table->rib_root->prefix_len)) {
+        /* They diverge at diff_bit. Create a glue node at this level. */
+        /* If diff_bit is -1 here, it means they matched up to min_len, but prefix_len < root_len,
+           which means it should have been handled by the supernet check above.
+           So if we are here and prefix_len < root_len, they MUST have diverged.
+           If diff_bit is -1, it implies they are equal up to min_len. */
+
+        int glue_len = (diff_bit != -1) ? diff_bit : min_len;
+
+        /* Create glue node (no route, just internal node) */
+        /* Prefix of glue node is common prefix */
+        struct in_addr glue_prefix = prefix;
+        /* Zero out bits after glue_len to be clean */
+        uint32_t glue_mask = PREFIX_MASK(glue_len);
+        glue_prefix.s_addr &= glue_mask;
+
+        struct radix_node *glue = radix_node_create(&glue_prefix, glue_len);
+        if (!glue) return -1;
+
+        /* Create new node for the new route */
+        new_node = radix_node_create(&prefix, prefix_len);
+        if (!new_node) {
+            free(glue);
+            return -1;
+        }
+        new_node->route = route;
+
+        /* Attach old root and new node to glue */
+        int old_root_bit = IP_BIT(table->rib_root->prefix.s_addr, glue_len);
+        int new_node_bit = IP_BIT(prefix.s_addr, glue_len);
+
+        if (old_root_bit == 0) glue->left = table->rib_root;
+        else glue->right = table->rib_root;
+
+        if (new_node_bit == 0) glue->left = new_node;
+        else glue->right = new_node;
+
+        table->rib_root = glue;
         table->rib_count++;
         return 0;
     }
@@ -681,13 +763,47 @@ void routing_table_print_route(struct route_entry *route)
     printf(" - %lu packets, %lu bytes\n", route->packets, route->bytes);
 }
 
+static void radix_tree_print_node(struct radix_node *node)
+{
+    if (!node) return;
+
+    if (node->route) {
+        char dest_str[INET_ADDRSTRLEN];
+        char gw_str[INET_ADDRSTRLEN];
+
+        inet_ntop(AF_INET, &node->route->prefix, dest_str, sizeof(dest_str));
+        inet_ntop(AF_INET, &node->route->next_hop, gw_str, sizeof(gw_str));
+
+        printf("  %s/%d via %s dev %u (src: %s)\n",
+               dest_str, node->route->prefix_len,
+               node->route->next_hop.s_addr ? gw_str : "connected",
+               node->route->egress_ifindex,
+               routing_table_source_to_str(node->route->source));
+    }
+
+    radix_tree_print_node(node->left);
+    radix_tree_print_node(node->right);
+}
+
 void routing_table_print(struct routing_table *table)
 {
-    /* Simplified print - full implementation would traverse tree */
+    if (!table) return;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t *)table->lock);
+
     printf("\nRouting Table:\n");
     printf("  RIB entries: %u\n", table->rib_count);
     printf("  FIB entries: %u\n", table->fib_count);
     printf("  Lookups: %lu (hits: %lu, misses: %lu)\n",
            table->lookups, table->hits, table->misses);
+    printf("\nRoutes:\n");
+
+    if (table->rib_root) {
+        radix_tree_print_node(table->rib_root);
+    } else {
+        printf("  (empty)\n");
+    }
     printf("\n");
+
+    pthread_rwlock_unlock((pthread_rwlock_t *)table->lock);
 }

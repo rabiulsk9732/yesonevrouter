@@ -12,6 +12,7 @@ enum interface_type {
     IF_TYPE_VLAN,
     IF_TYPE_LAG,
     IF_TYPE_LOOPBACK,
+    IF_TYPE_DUMMY,
     IF_TYPE_UNKNOWN
 };
 

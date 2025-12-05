@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if_ether.h>
+#include <arpa/inet.h>
 #include <errno.h>
 
 /* Global interface manager */
@@ -28,6 +29,7 @@ extern const struct interface_ops physical_interface_ops;
 extern const struct interface_ops vlan_interface_ops;
 extern const struct interface_ops lag_interface_ops;
 extern const struct interface_ops loopback_interface_ops;
+extern const struct interface_ops dummy_interface_ops;
 
 static const struct interface_ops *get_ops_for_type(enum interface_type type)
 {
@@ -40,6 +42,8 @@ static const struct interface_ops *get_ops_for_type(enum interface_type type)
         return &lag_interface_ops;
     case IF_TYPE_LOOPBACK:
         return &loopback_interface_ops;
+    case IF_TYPE_DUMMY:
+        return &dummy_interface_ops;
     default:
         return NULL;
     }
@@ -181,6 +185,26 @@ struct interface *interface_find_by_index(uint32_t ifindex)
     return NULL;
 }
 
+struct interface *interface_find_by_subnet(const struct in_addr *addr)
+{
+    uint32_t i;
+    uint32_t ip = ntohl(addr->s_addr);
+
+    for (i = 0; i < IF_MAX_INTERFACES; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (iface && iface->config.ipv4_addr.s_addr != 0) {
+            uint32_t if_ip = ntohl(iface->config.ipv4_addr.s_addr);
+            uint32_t if_mask = ntohl(iface->config.ipv4_mask.s_addr);
+
+            if ((ip & if_mask) == (if_ip & if_mask)) {
+                return iface;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 int interface_up(struct interface *iface)
 {
     if (!iface) {
@@ -241,12 +265,8 @@ int interface_send(struct interface *iface, struct pkt_buf *pkt)
 
     int ret = iface->ops->send(iface, pkt);
 
-    if (ret == 0) {
-        /* Update statistics */
-        __atomic_add_fetch(&iface->stats.tx_packets, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&iface->stats.tx_bytes, pkt->len, __ATOMIC_RELAXED);
-        iface->stats.last_tx_time = (uint64_t)time(NULL);
-    } else {
+    /* Statistics are updated by the driver (physical.c) to avoid duplicate time() syscalls */
+    if (ret != 0) {
         __atomic_add_fetch(&iface->stats.tx_errors, 1, __ATOMIC_RELAXED);
     }
 
@@ -269,12 +289,8 @@ int interface_recv(struct interface *iface, struct pkt_buf **pkt)
 
     int ret = iface->ops->recv(iface, pkt);
 
-    if (ret > 0 && *pkt) {
-        /* Update statistics */
-        __atomic_add_fetch(&iface->stats.rx_packets, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&iface->stats.rx_bytes, (*pkt)->len, __ATOMIC_RELAXED);
-        iface->stats.last_rx_time = (uint64_t)time(NULL);
-    } else if (ret < 0) {
+    /* Statistics are updated by the driver (physical.c) to avoid duplicate time() syscalls */
+    if (ret < 0) {
         __atomic_add_fetch(&iface->stats.rx_errors, 1, __ATOMIC_RELAXED);
     }
 
@@ -390,6 +406,16 @@ void interface_print(const struct interface *iface)
     printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
            iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5]);
+
+    /* Show IP address if configured */
+    if (iface->config.ipv4_addr.s_addr != 0) {
+        char ip_str[INET_ADDRSTRLEN];
+        char mask_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &iface->config.ipv4_addr, ip_str, sizeof(ip_str));
+        inet_ntop(AF_INET, &iface->config.ipv4_mask, mask_str, sizeof(mask_str));
+        printf("  IP Address: %s / %s\n", ip_str, mask_str);
+    }
+
     printf("  MTU: %u\n", iface->config.mtu);
     printf("  Speed: %s\n", iface->config.speed > 0 ?
            (char[32]){0} : "Auto");
@@ -493,6 +519,9 @@ int interface_discover_dpdk_ports(void)
 #endif
 }
 
+#include <netpacket/packet.h>
+#include <net/if.h>
+
 int interface_discover_system(void)
 {
     struct ifaddrs *ifaddr, *ifa;
@@ -521,7 +550,20 @@ int interface_discover_system(void)
             continue;
 
         /* Create interface */
-        if (interface_create(ifa->ifa_name, IF_TYPE_PHYSICAL)) {
+        struct interface *iface = interface_create(ifa->ifa_name, IF_TYPE_PHYSICAL);
+        if (iface) {
+            /* Extract MAC address */
+            struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
+            if (sll->sll_halen == 6) {
+                memcpy(iface->mac_addr, sll->sll_addr, 6);
+            }
+
+            /* Set state */
+            if (ifa->ifa_flags & IFF_UP) {
+                iface->state = IF_STATE_UP;
+                iface->link = LINK_STATE_UP;
+            }
+
             count++;
         }
     }
@@ -560,6 +602,7 @@ const char *interface_type_to_str(enum interface_type type)
     case IF_TYPE_VLAN: return "VLAN";
     case IF_TYPE_LAG: return "LAG";
     case IF_TYPE_LOOPBACK: return "Loopback";
+    case IF_TYPE_DUMMY: return "Dummy";
     default: return "Unknown";
     }
 }

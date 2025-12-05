@@ -1,0 +1,182 @@
+/**
+ * @file alg_icmp.c
+ * @brief ICMP Application Level Gateway
+ *
+ * Handles ICMP error message translation for NAT
+ * Translates embedded IP headers in ICMP error messages
+ */
+
+#include "nat.h"
+#include "alg.h"
+#include "packet.h"
+#include "log.h"
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <linux/if_ether.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* IP checksum calculation */
+static uint16_t ip_checksum(void *addr, int len)
+{
+    uint16_t *buf = (uint16_t *)addr;
+    uint32_t sum = 0;
+
+    while (len > 1) {
+        sum += *buf++;
+        len -= 2;
+    }
+
+    if (len == 1) {
+        sum += *(uint8_t *)buf;
+    }
+
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+
+    return (uint16_t)~sum;
+}
+
+/**
+ * Process ICMP error message for NAT ALG
+ *
+ * ICMP error messages (Destination Unreachable, Time Exceeded, etc.)
+ * contain the original IP header + 8 bytes of payload that caused the error.
+ * We need to translate the embedded IP header to match the NAT translation.
+ */
+int alg_icmp_process_error(struct pkt_buf *pkt, bool outbound)
+{
+    struct iphdr *outer_ip;
+    struct iphdr *inner_ip;
+    struct icmphdr *icmp;
+    uint8_t *icmp_data;
+
+    if (!pkt) return -1;
+
+    /* Parse outer IP header */
+    outer_ip = (struct iphdr *)(pkt->data + sizeof(struct ethhdr));
+
+    if (outer_ip->protocol != IPPROTO_ICMP) {
+        return -1;
+    }
+
+    /* Parse ICMP header */
+    icmp = (struct icmphdr *)((uint8_t *)outer_ip + (outer_ip->ihl * 4));
+
+    /* Only process error messages */
+    if (icmp->type != ICMP_DEST_UNREACH &&
+        icmp->type != ICMP_SOURCE_QUENCH &&
+        icmp->type != ICMP_TIME_EXCEEDED &&
+        icmp->type != ICMP_PARAMETERPROB) {
+        return 0;  /* Not an error message - no ALG needed */
+    }
+
+    /* Get pointer to embedded IP header (in ICMP data) */
+    icmp_data = (uint8_t *)(icmp + 1);
+    inner_ip = (struct iphdr *)icmp_data;
+
+    /* Verify it's a valid IP header */
+    if (inner_ip->version != 4) {
+        return -1;
+    }
+
+    /* Translate embedded IP header based on direction */
+    if (outbound) {
+        /* Outbound: inside → outside
+         * Embedded source IP needs to be translated from private to public */
+        uint32_t inside_ip = ntohl(inner_ip->saddr);
+        uint16_t inside_port = 0;
+
+        /* Extract port from embedded transport header (if available) */
+        if (inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_UDP) {
+            struct tcphdr *tcp = (struct tcphdr *)((uint8_t *)inner_ip + (inner_ip->ihl * 4));
+            inside_port = ntohs(tcp->source);
+        }
+
+        /* Lookup NAT session */
+        struct nat_session *session = nat_session_lookup_inside(inside_ip, inside_port, inner_ip->protocol);
+        if (!session) {
+            YLOG_DEBUG("No NAT session for embedded IP %u.%u.%u.%u:%u",
+                       (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF,
+                       (inside_ip >> 8) & 0xFF, inside_ip & 0xFF, inside_port);
+            return -1;
+        }
+
+        /* Translate embedded source IP */
+        inner_ip->saddr = htonl(session->outside_ip);
+
+        /* Translate embedded source port if present */
+        if (inside_port != 0) {
+            struct tcphdr *tcp = (struct tcphdr *)((uint8_t *)inner_ip + (inner_ip->ihl * 4));
+            tcp->source = htons(session->outside_port);
+        }
+
+    } else {
+        /* Inbound: outside → inside
+         * Embedded destination IP needs to be translated from public to private */
+        uint32_t outside_ip = ntohl(inner_ip->daddr);
+        uint16_t outside_port = 0;
+
+        /* Extract port from embedded transport header */
+        if (inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_UDP) {
+            struct tcphdr *tcp = (struct tcphdr *)((uint8_t *)inner_ip + (inner_ip->ihl * 4));
+            outside_port = ntohs(tcp->dest);
+        }
+
+        /* Lookup NAT session */
+        struct nat_session *session = nat_session_lookup_outside(outside_ip, outside_port, inner_ip->protocol);
+        if (!session) {
+            return -1;
+        }
+
+        /* Translate embedded destination IP */
+        inner_ip->daddr = htonl(session->inside_ip);
+
+        /* Translate embedded destination port */
+        if (outside_port != 0) {
+            struct tcphdr *tcp = (struct tcphdr *)((uint8_t *)inner_ip + (inner_ip->ihl * 4));
+            tcp->dest = htons(session->inside_port);
+        }
+    }
+
+    /* Recalculate inner IP checksum */
+    inner_ip->check = 0;
+    inner_ip->check = ip_checksum(inner_ip, inner_ip->ihl * 4);
+
+    /* Recalculate ICMP checksum (covers ICMP header + data) */
+    icmp->checksum = 0;
+    icmp->checksum = ip_checksum(icmp, ntohs(outer_ip->tot_len) - (outer_ip->ihl * 4));
+
+    YLOG_DEBUG("ICMP ALG: Processed %s ICMP error message",
+               outbound ? "outbound" : "inbound");
+
+    return 0;
+}
+
+/**
+ * Check if ICMP ALG is needed for this packet
+ */
+bool alg_icmp_is_needed(struct pkt_buf *pkt)
+{
+    struct iphdr *ip;
+    struct icmphdr *icmp;
+
+    if (!pkt) return false;
+
+    ip = (struct iphdr *)(pkt->data + sizeof(struct ethhdr));
+
+    if (ip->protocol != IPPROTO_ICMP) {
+        return false;
+    }
+
+    icmp = (struct icmphdr *)((uint8_t *)ip + (ip->ihl * 4));
+
+    /* Only error messages need ALG processing */
+    return (icmp->type == ICMP_DEST_UNREACH ||
+            icmp->type == ICMP_SOURCE_QUENCH ||
+            icmp->type == ICMP_TIME_EXCEEDED ||
+            icmp->type == ICMP_PARAMETERPROB);
+}

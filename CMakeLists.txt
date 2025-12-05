@@ -23,7 +23,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 
 # Options
 option(ENABLE_DPDK "Enable DPDK support" ON)
-option(ENABLE_TESTS "Build unit tests" ON)
+option(ENABLE_TESTS "Build unit tests" OFF)
 option(ENABLE_BENCHMARKS "Build performance benchmarks" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
@@ -80,6 +80,19 @@ find_package(Threads REQUIRED)
 # OpenSSL for password hashing
 find_package(OpenSSL REQUIRED)
 
+# GNU readline for CLI tab completion and history
+find_library(READLINE_LIBRARY NAMES readline)
+find_path(READLINE_INCLUDE_DIR readline/readline.h)
+if(READLINE_LIBRARY AND READLINE_INCLUDE_DIR)
+    include_directories(${READLINE_INCLUDE_DIR})
+    add_definitions(-DHAVE_READLINE)
+    message(STATUS "GNU readline found: ${READLINE_LIBRARY}")
+    set(HAVE_READLINE TRUE)
+else()
+    message(WARNING "GNU readline not found, CLI will use basic line input")
+    set(HAVE_READLINE FALSE)
+endif()
+
 # Source files - will be populated as modules are implemented
 set(YESROUTER_SOURCES
     # Core
@@ -108,20 +121,54 @@ target_link_libraries(yesrouter
     yesrouter_config
     yesrouter_auth
     yesrouter_cli
+    yesrouter_cli
     yesrouter_forwarding
     yesrouter_dpdk
+    yesrouter_pppoe
+    yesrouter_radius
+    yesrouter_ippool
+    yesrouter_qos
+    yesrouter_ha
+    yesrouter_pppoe
+    yesrouter_nat
     yesrouter_core
+    yesrouter_management
     pthread
 )
 
 # Subdirectories
-add_subdirectory(src)
+add_subdirectory(src/core)
+add_subdirectory(src/interfaces)
+add_subdirectory(src/network)
+add_subdirectory(src/routing)
+add_subdirectory(src/logging)
+add_subdirectory(src/config)
+add_subdirectory(src/auth)
+add_subdirectory(src/forwarding)
+add_subdirectory(src/dpdk)
+add_subdirectory(src/nat)
+add_subdirectory(src/radius)
+add_subdirectory(src/ippool)
+add_subdirectory(src/qos)
+add_subdirectory(src/ha)
+add_subdirectory(src/pppoe)
+add_subdirectory(src/cli)
+add_subdirectory(src/management)
+
+# yesrouterctl client tool
+add_executable(yesrouterctl src/cli/yesrouterctl.c)
+if(HAVE_READLINE)
+    target_link_libraries(yesrouterctl ${READLINE_LIBRARY})
+endif()
 
 # Testing
 if(ENABLE_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# Tools
+add_subdirectory(tools)
 
 # Installation
 # install(TARGETS yesrouter DESTINATION bin)

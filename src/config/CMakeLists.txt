@@ -2,6 +2,7 @@
 
 set(CONFIG_SOURCES
     config.c
+    vpp_parser.c
 )
 
 add_library(yesrouter_config STATIC ${CONFIG_SOURCES})

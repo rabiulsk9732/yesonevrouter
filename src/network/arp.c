@@ -4,6 +4,7 @@
  */
 
 #include "arp.h"
+#include "arp_queue.h"
 #include "interface.h"
 #include "packet.h"
 #include "log.h"
@@ -269,7 +270,21 @@ int arp_process_packet(const uint8_t *pkt, uint16_t len, uint32_t ifindex)
 
     /* Update ARP table with sender information */
     if (sender_ip != 0) {
+        /* Check if this is a new resolution (entry was INCOMPLETE or didn't exist) */
+        bool was_incomplete = false;
+        pthread_mutex_lock(&arp_table->lock);
+        struct arp_entry *existing = arp_table_lookup_internal(sender_ip);
+        if (existing && (existing->state == ARP_STATE_INCOMPLETE || existing->state == ARP_STATE_FAILED)) {
+            was_incomplete = true;
+        }
+        pthread_mutex_unlock(&arp_table->lock);
+        
         arp_add_entry(sender_ip, arp->ar_sha, ifindex, ARP_STATE_VALID);
+        
+        /* If ARP entry transitioned from INCOMPLETE to VALID, flush queued packets */
+        if (was_incomplete) {
+            arp_queue_flush(sender_ip);
+        }
     }
 
     if (op == ARP_OP_REQUEST) {

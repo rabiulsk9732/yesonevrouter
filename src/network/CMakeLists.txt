@@ -2,8 +2,15 @@
 
 set(NETWORK_SOURCES
     arp.c
+    arp_queue.c
     dns.c
     neighbor.c
+    vlan.c
+    vlan_db.c
+    lacp.c
+    fragmentation.c
+    reassembly.c
+    acl.c
 )
 
 add_library(yesrouter_network STATIC ${NETWORK_SOURCES})

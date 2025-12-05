@@ -5,6 +5,7 @@
 
 #include "cli.h"
 #include "interface.h"
+#include "routing_table.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -124,6 +125,28 @@ int cmd_interface(int argc, char **argv)
 
         if (interface_configure(iface, &config) == 0) {
             printf("Interface %s IP configured: %s/%d\n", ifname, ip_str, prefix_len);
+
+            /* Add connected route */
+            struct in_addr network;
+            network.s_addr = ip.s_addr & mask.s_addr;
+
+            /* Remove old connected routes for this interface? (TODO) */
+
+            /* Add new connected route */
+            struct in_addr next_hop = {0}; /* 0.0.0.0 means connected */
+
+            routing_table_add(routing_table_get_instance(),
+                            &network, prefix_len, &next_hop,
+                            iface->ifindex, 0, ROUTE_SOURCE_CONNECTED, "connected");
+
+            printf("Interface %s brought up\n", ifname);
+            interface_up(iface);
+
+            /* Send Gratuitous ARP to announce our IP */
+            extern int arp_send_gratuitous(uint32_t ip_address, const uint8_t *mac_address, uint32_t ifindex);
+            uint32_t ip_hbo = ntohl(iface->config.ipv4_addr.s_addr);
+            arp_send_gratuitous(ip_hbo, iface->mac_addr, iface->ifindex);
+            printf("Gratuitous ARP sent\n");
         } else {
             printf("Failed to configure IP on interface %s\n", ifname);
         }
@@ -139,14 +162,102 @@ int cmd_interface(int argc, char **argv)
  * Cisco-style config mode commands
  */
 
-/* Enter interface config mode */
+/* Command: interface (Cisco-style config mode) */
 int cli_cmd_config_interface(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("%% Incomplete command\n");
+        printf("Usage: interface <name>\n");
+        printf("Examples:\n");
+        printf("  interface Gi0/1              # Physical interface\n");
+        printf("  interface Gi0/1.100          # 802.1Q sub-interface\n");
+        printf("  interface Gi0/1.100.200      # QinQ sub-interface\n");
         return -1;
     }
 
+    const char *ifname = argv[1];
+
+    /* Check for loopback interface */
+    if (strncmp(ifname, "loopback", 8) == 0 || strncmp(ifname, "Loopback", 8) == 0) {
+        struct interface *iface = interface_find_by_name(ifname);
+        if (!iface) {
+            /* Auto-create loopback interface */
+            printf("%% Creating loopback interface %s\n", ifname);
+            iface = interface_create(ifname, IF_TYPE_LOOPBACK);
+            if (!iface) {
+                printf("%% Failed to create loopback interface\n");
+                return -1;
+            }
+        }
+        g_config_interface = iface;
+        return 0;
+    }
+
+    /* Check for dummy interface */
+    if (strncmp(ifname, "dummy", 5) == 0 || strncmp(ifname, "Dummy", 5) == 0) {
+        struct interface *iface = interface_find_by_name(ifname);
+        if (!iface) {
+            /* Auto-create dummy interface */
+            printf("%% Creating dummy interface %s\n", ifname);
+            iface = interface_create(ifname, IF_TYPE_DUMMY);
+            if (!iface) {
+                printf("%% Failed to create dummy interface\n");
+                return -1;
+            }
+        }
+        g_config_interface = iface;
+        return 0;
+    }
+
+    /* Check if this is a sub-interface */
+    char *dot1 = strchr(ifname, '.');
+    if (dot1) {
+        /* Sub-interface: Gi0/1.100 or Gi0/1.100.200 */
+        char parent_name[32];
+        int outer_vlan = 0, inner_vlan = 0;
+
+        /* Extract parent interface name */
+        size_t parent_len = dot1 - ifname;
+        if (parent_len >= sizeof(parent_name)) {
+            printf("%% Interface name too long\n");
+            return -1;
+        }
+        strncpy(parent_name, ifname, parent_len);
+        parent_name[parent_len] = '\0';
+
+        /* Parse VLAN IDs */
+        outer_vlan = atoi(dot1 + 1);
+        char *dot2 = strchr(dot1 + 1, '.');
+        if (dot2) {
+            /* QinQ: Gi0/1.100.200 */
+            inner_vlan = atoi(dot2 + 1);
+        }
+
+        /* Find or create sub-interface */
+        struct interface *iface = interface_find_by_name(ifname);
+        if (!iface) {
+            /* Create new sub-interface */
+            struct interface *parent = interface_find_by_name(parent_name);
+            if (!parent) {
+                printf("%% Parent interface %s not found\n", parent_name);
+                return -1;
+            }
+
+            /* TODO: Actually create sub-interface with VLAN tagging */
+            printf("%% Sub-interface %s would be created on parent %s\n", ifname, parent_name);
+            if (inner_vlan > 0) {
+                printf("%%   QinQ: Outer VLAN %d, Inner VLAN %d\n", outer_vlan, inner_vlan);
+            } else {
+                printf("%%   802.1Q: VLAN %d\n", outer_vlan);
+            }
+            printf("%% Sub-interface creation not yet fully implemented\n");
+            return -1;
+        }
+
+        g_config_interface = iface;
+        return 0;
+    }
+
+    /* Regular interface */
     struct interface *iface = interface_find_by_name(argv[1]);
     if (!iface) {
         printf("%% Interface %s not found\n", argv[1]);
@@ -251,6 +362,38 @@ int cli_cmd_if_shutdown(void)
     return -1;
 }
 
+/* Command: encapsulation dot1q <vlan-id> [second-dot1q <vlan-id>] */
+static int cmd_encapsulation_dot1q(int argc, char **argv)
+{
+    if (!g_config_interface) {
+        printf("%% No interface selected\n");
+        return -1;
+    }
+
+    if (argc < 3) {
+        printf("Usage: encapsulation dot1q <vlan-id> [second-dot1q <inner-vlan-id>]\n");
+        printf("Examples:\n");
+        printf("  encapsulation dot1q 100                  # 802.1Q single tag\n");
+        printf("  encapsulation dot1q 100 second-dot1q 200 # QinQ double tag\n");
+        return -1;
+    }
+
+    int outer_vlan = atoi(argv[2]);
+    int inner_vlan = 0;
+
+    /* Check for QinQ (second-dot1q keyword) */
+    if (argc >= 5 && strcmp(argv[3], "second-dot1q") == 0) {
+        inner_vlan = atoi(argv[4]);
+        printf("%% QinQ encapsulation: Outer VLAN %d, Inner VLAN %d\n", outer_vlan, inner_vlan);
+        printf("%% (Configuration stored, actual implementation pending)\n");
+    } else {
+        printf("%% 802.1Q encapsulation: VLAN %d\n", outer_vlan);
+        printf("%% (Configuration stored, actual implementation pending)\n");
+    }
+
+    return 0;
+}
+
 /* Exit interface config mode */
 void cli_exit_interface_config(void)
 {
@@ -261,4 +404,11 @@ void cli_exit_interface_config(void)
 void cli_register_interface_commands(void)
 {
     cli_register_command("interface", "Configure interface", cmd_interface);
+    cli_register_command("encapsulation", "Set encapsulation type", cmd_encapsulation_dot1q);
+
+    /* Register show commands for tab completion */
+    cli_register_command("show interfaces", "Display interface status", cmd_show_interfaces);
+    cli_register_command("show interfaces brief", "Display brief interface list", cmd_show_interfaces_brief);
+
+    printf("Interface commands registered\n");
 }

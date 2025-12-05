@@ -240,6 +240,13 @@ struct interface *interface_find_by_name(const char *name);
 struct interface *interface_find_by_index(uint32_t ifindex);
 
 /**
+ * Find interface by IP address within its configured subnet
+ * @param addr IP address to search for
+ * @return Pointer to interface or NULL if not found
+ */
+struct interface *interface_find_by_subnet(const struct in_addr *addr);
+
+/**
  * Bring interface up
  * @param iface Interface structure
  * @return 0 on success, -1 on failure

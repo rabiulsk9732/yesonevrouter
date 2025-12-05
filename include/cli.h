@@ -6,8 +6,8 @@
 #ifndef CLI_H
 #define CLI_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /* CLI command handler function type */
 typedef int (*cli_cmd_handler_t)(int argc, char **argv);
@@ -38,6 +38,13 @@ void cli_cleanup(void);
 int cli_execute(const char *cmdline);
 
 /**
+ * @brief Execute CLI commands from a file
+ * @param filename Path to file containing CLI commands
+ * @return 0 on success, -1 on error
+ */
+int cli_execute_file(const char *filename);
+
+/**
  * @brief Start interactive CLI mode
  * @return 0 on success, -1 on error
  */
@@ -50,8 +57,7 @@ int cli_interactive(void);
  * @param handler Command handler function
  * @return 0 on success, -1 on error
  */
-int cli_register_command(const char *name, const char *help,
-                         cli_cmd_handler_t handler);
+int cli_register_command(const char *name, const char *help, cli_cmd_handler_t handler);
 
 /* Module registration functions */
 void cli_register_interface_commands(void);
@@ -59,6 +65,12 @@ void cli_register_route_commands(void);
 void cli_register_arp_commands(void);
 void cli_register_system_commands(void);
 void cli_register_auth_commands(void);
+void cli_vlan_register_commands(void);
+void cli_register_config_commands(void);
+void cli_register_debug_commands(void);
+void cli_register_nat_commands(void);
+void cli_register_log_commands(void);  // Added new module registration
+void cli_register_user_commands(void); // Added new module registration
 
 /* Built-in command handlers */
 int cmd_show(int argc, char **argv);
@@ -88,5 +100,7 @@ int cli_cmd_if_ip_address(int argc, char **argv);
 int cli_cmd_if_no_shutdown(void);
 int cli_cmd_if_shutdown(void);
 void cli_exit_interface_config(void);
+
+void show_context_help(const char *partial);
 
 #endif /* CLI_H */

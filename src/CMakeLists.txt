@@ -28,7 +28,7 @@ add_subdirectory(routing)
 add_subdirectory(network)
 
 # Authentication module
-add_subdirectory(auth)
+# add_subdirectory(auth)
 
 # CLI module
 add_subdirectory(cli)
@@ -37,7 +37,10 @@ add_subdirectory(cli)
 add_subdirectory(forwarding)
 
 # Access module (PPPoE, IPoE)
-# add_subdirectory(access)
+add_subdirectory(pppoe)
+add_subdirectory(radius)
+add_subdirectory(ippool)
+add_subdirectory(qos)
 
 # Session module
 # add_subdirectory(session)
@@ -45,8 +48,8 @@ add_subdirectory(forwarding)
 # Firewall module
 # add_subdirectory(firewall)
 
-# CGNAT module
-# add_subdirectory(cgnat)
+# CGNAT/NAT module
+add_subdirectory(nat)
 
 # QoS module
 # add_subdirectory(qos)

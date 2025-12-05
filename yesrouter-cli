@@ -1,8 +1,0 @@
-#!/bin/bash
-#
-# YESRouter CLI Client
-# Connects to running daemon or starts interactive session
-#
-
-# Just use the simple interactive mode
-exec /root/vbng/start.sh

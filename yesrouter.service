@@ -1,23 +1,51 @@
 [Unit]
-Description=YESRouter vBNG Service
+Description=YESRouter vBNG Daemon
 After=network.target
+Documentation=https://github.com/rabiulsk9732/yesonevrouter
+ConditionPathExists=/etc/yesrouter/startup.conf
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/vbng
-ExecStartPre=/bin/bash -c 'pkill -9 yesrouter || true'
-ExecStartPre=/bin/bash -c 'rm -f /var/run/dpdk/rte/config || true'
-ExecStartPre=/bin/bash -c 'rm -f /tmp/vbng_cmd || true'
-ExecStart=/root/vbng/yesrouter-daemon.sh
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:/root/vbng/logs/yesrouter.log
-StandardError=append:/root/vbng/logs/yesrouter.log
+WorkingDirectory=/etc/yesrouter
 
-# Resource limits
-LimitNOFILE=65535
-LimitMEMLOCK=infinity
+# DPDK requires these directories
+RuntimeDirectory=yesrouter dpdk/rte
+RuntimeDirectoryMode=0755
+
+# Environment
+Environment="RTE_SDK=/usr/local/share/dpdk"
+
+# Pre-start: Set up DPDK requirements
+ExecStartPre=/bin/mkdir -p /var/run/dpdk/rte
+ExecStartPre=/bin/chmod 0777 /var/run/dpdk/rte
+ExecStartPre=/bin/mkdir -p /run/yesrouter
+ExecStartPre=/bin/chmod 0755 /run/yesrouter
+
+# Main service
+ExecStart=/usr/local/bin/yesrouter -d
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+
+# DPDK needs these permissions
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_IPC_LOCK CAP_SYS_RAWIO
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_IPC_LOCK CAP_SYS_RAWIO
+
+# Security
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
+
+# Allow access to devices and runtime
+ReadWritePaths=/dev /var/run /run /var/log/yesrouter /sys/bus/pci /sys/devices
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yesrouter
 
 [Install]
 WantedBy=multi-user.target

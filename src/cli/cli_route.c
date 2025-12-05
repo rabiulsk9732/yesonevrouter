@@ -5,6 +5,7 @@
 
 #include "cli.h"
 #include "routing_table.h"
+#include "interface.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -55,10 +56,25 @@ int cmd_route(int argc, char **argv)
             return -1;
         }
 
+        /* Resolve egress interface for gateway */
+        uint32_t egress_ifindex = 0;
+        struct route_entry *gw_route = routing_table_lookup(routing_table_get_instance(), &gw);
+        if (gw_route) {
+            egress_ifindex = gw_route->egress_ifindex;
+        } else {
+            /* Check connected interfaces */
+            struct interface *iface = interface_find_by_subnet(&gw);
+            if (iface) {
+                egress_ifindex = iface->ifindex;
+            }
+        }
+
+        if (egress_ifindex == 0) {
+            printf("Warning: Could not resolve egress interface for gateway %s\n", gw_str);
+        }
+
         /* Add route to global table */
-        /* Note: We assume egress_ifindex is 0 for now (recursive lookup or unspecified) */
-        /* In a real implementation, we'd look up the egress interface for the gateway */
-        if (routing_table_add(routing_table_get_instance(), &dest, prefix_len, &gw, 0, 1, ROUTE_SOURCE_STATIC, "static") == 0) {
+        if (routing_table_add(routing_table_get_instance(), &dest, prefix_len, &gw, egress_ifindex, 1, ROUTE_SOURCE_STATIC, "static") == 0) {
             printf("Route added: %s/%d via %s\n", dest_str, prefix_len, gw_str);
         } else {
             printf("Failed to add route\n");
@@ -103,4 +119,9 @@ int cmd_route(int argc, char **argv)
 void cli_register_route_commands(void)
 {
     cli_register_command("route", "Manage routes", cmd_route);
+
+    /* Register show commands for tab completion */
+    cli_register_command("show ip route", "Display routing table", cmd_show_routes);
+
+    printf("Route commands registered\n");
 }

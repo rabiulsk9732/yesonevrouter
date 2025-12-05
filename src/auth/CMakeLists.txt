@@ -5,6 +5,9 @@ set(AUTH_SOURCES
     auth.c
     authz.c
     session.c
+    local_auth.c
+    password_hash.c
+    audit_log.c
 )
 
 add_library(yesrouter_auth STATIC ${AUTH_SOURCES})

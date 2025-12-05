@@ -9,11 +9,11 @@
 
 #define _DEFAULT_SOURCE
 #include "packet.h"
+#include "interface.h"
+#include "log.h"
 #include "dpdk_init.h"
-#include <stdio.h>
-#include <stdlib.h>
+#include <rte_mbuf.h>
 #include <string.h>
-#include <time.h>
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -22,6 +22,8 @@
 #ifdef HAVE_DPDK
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_tcp.h>
+#include <rte_udp.h>
 #include <rte_arp.h>
 #endif
 
@@ -51,7 +53,7 @@ struct pkt_buf *pkt_alloc(void)
 
     pkt = calloc(1, sizeof(*pkt));
     if (!pkt) {
-        __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_RELAXED);
         return NULL;
     }
 
@@ -60,7 +62,7 @@ struct pkt_buf *pkt_alloc(void)
         pkt->mbuf = rte_pktmbuf_alloc((struct rte_mempool *)g_dpdk_config.pkt_mempool->pool);
         if (!pkt->mbuf) {
             free(pkt);
-            __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_RELAXED);
             return NULL;
         }
         pkt->data = rte_pktmbuf_mtod(pkt->mbuf, uint8_t *);
@@ -76,7 +78,7 @@ struct pkt_buf *pkt_alloc(void)
         pkt->buf = malloc(pkt->buf_size);
         if (!pkt->buf) {
             free(pkt);
-            __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&pkt_stats.alloc_failed, 1, __ATOMIC_RELAXED);
             return NULL;
         }
         pkt->data = pkt->buf + PKT_DEFAULT_HEADROOM;
@@ -85,9 +87,9 @@ struct pkt_buf *pkt_alloc(void)
     }
 
     pkt->refcnt = 1;
-    pkt->timestamp = time(NULL);
+    pkt->timestamp = 0;  /* Avoid time() syscall in fast path - caller sets if needed */
 
-    __atomic_add_fetch(&pkt_stats.allocated, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&pkt_stats.allocated, 1, __ATOMIC_RELAXED);
 
     return pkt;
 }
@@ -99,7 +101,7 @@ void pkt_free(struct pkt_buf *pkt)
     }
 
     /* Decrement reference count */
-    uint32_t refs = __atomic_sub_fetch(&pkt->refcnt, 1, __ATOMIC_SEQ_CST);
+    uint32_t refs = __atomic_sub_fetch(&pkt->refcnt, 1, __ATOMIC_RELAXED);
     if (refs > 0) {
         return;
     }
@@ -116,7 +118,7 @@ void pkt_free(struct pkt_buf *pkt)
     }
 
     free(pkt);
-    __atomic_add_fetch(&pkt_stats.freed, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&pkt_stats.freed, 1, __ATOMIC_RELAXED);
 }
 
 struct pkt_buf *pkt_clone(struct pkt_buf *pkt)
@@ -254,13 +256,15 @@ int pkt_extract_metadata(struct pkt_buf *pkt)
             pkt->meta.dst_port = rte_be_to_cpu_16(udp->dst_port);
             pkt->flags |= PKT_FLAG_L4_VALID;
             pkt->meta.payload_offset = pkt->meta.l4_offset + sizeof(struct rte_udp_hdr);
-
         } else if (ip->next_proto_id == IPPROTO_ICMP) {
             pkt->meta.l4_type = PKT_L4_ICMP;
             pkt->flags |= PKT_FLAG_L4_VALID;
             pkt->meta.payload_offset = pkt->meta.l4_offset + 8;
         }
-    } else if (eth_type == RTE_ETHER_TYPE_ARP) {
+    }
+
+    /* Handle ARP */
+    if (eth_type == RTE_ETHER_TYPE_ARP) {
         pkt->meta.l3_type = PKT_L3_ARP;
         pkt->meta.l3_offset = sizeof(struct rte_ether_hdr);
         pkt->flags |= PKT_FLAG_L3_VALID;

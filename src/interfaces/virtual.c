@@ -4,6 +4,8 @@
  */
 
 #include "interface.h"
+#include "vlan.h"
+#include "lacp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +21,7 @@ struct vlan_priv {
 
 /* Private data for LAG interface */
 struct lag_priv {
+    struct bond_interface *bond;    /* Bond management structure */
     struct interface *members[IF_MAX_VLAN_MEMBERS];
     uint32_t num_members;
     uint8_t mode;                   /* LAG mode */
@@ -99,8 +102,13 @@ static int vlan_send(struct interface *iface, struct pkt_buf *pkt)
         return -1;
     }
 
-    /* TODO: Add VLAN tag to packet if needed */
-    /* For now, just forward to parent */
+    /* Add VLAN tag to packet */
+    if (vlan_tag_packet(pkt, priv->vlan_id, VLAN_PCP_BE) < 0) {
+        fprintf(stderr, "Failed to tag packet with VLAN %u\n", priv->vlan_id);
+        return -1;
+    }
+
+    /* Forward to parent interface */
     return interface_send(priv->parent, pkt);
 }
 
@@ -118,9 +126,29 @@ static int vlan_recv(struct interface *iface, struct pkt_buf **pkt)
         return -1;
     }
 
-    /* TODO: Filter packets by VLAN ID */
-    /* For now, just receive from parent */
-    return interface_recv(priv->parent, pkt);
+    /* Receive from parent */
+    int ret = interface_recv(priv->parent, pkt);
+    if (ret <= 0) {
+        return ret;
+    }
+
+    /* Filter by VLAN ID */
+    if (*pkt && vlan_is_tagged(*pkt)) {
+        uint16_t vid = vlan_get_id(*pkt);
+
+        if (vid != priv->vlan_id) {
+            /* Not our VLAN, drop it */
+            return -1;
+        }
+
+        /* Strip VLAN tag */
+        if (vlan_untag_packet(*pkt) < 0) {
+            fprintf(stderr, "Failed to untag VLAN packet\n");
+            return -1;
+        }
+    }
+
+    return ret;
 }
 
 static enum link_state vlan_get_link_state(struct interface *iface)
@@ -477,6 +505,19 @@ static void loopback_cleanup(struct interface *iface)
 }
 
 const struct interface_ops loopback_interface_ops = {
+    .init = loopback_init,
+    .up = loopback_up,
+    .down = loopback_down,
+    .send = loopback_send,
+    .recv = loopback_recv,
+    .get_link_state = loopback_get_link_state,
+    .get_stats = loopback_get_stats,
+    .configure = loopback_configure,
+    .cleanup = loopback_cleanup
+};
+
+/* Dummy interface operations (same as loopback) */
+const struct interface_ops dummy_interface_ops = {
     .init = loopback_init,
     .up = loopback_up,
     .down = loopback_down,
