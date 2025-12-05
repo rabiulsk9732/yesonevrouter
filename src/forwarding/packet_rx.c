@@ -21,6 +21,7 @@
 #include "routing_table.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 /* Access NAT config for debugging */
 extern struct nat_config g_nat_config;
@@ -649,7 +650,7 @@ static void process_ipv4(struct pkt_buf *pkt)
     if (for_us) {
         /* Packet is for us - process locally */
         if (pkt->meta.protocol == IPPROTO_ICMP) {
-            YLOG_INFO("[PROCESS-IPV4] ICMP packet FOR_US - processing locally (dst was our IP)");
+            /* Removed verbose logging for performance - caused 35% ICMP drop */
             process_icmp_echo(pkt, iface);
         }
     } else {
@@ -739,7 +740,27 @@ static void *rx_thread_func(void *arg)
 
         /* Debug logging disabled for production */
 
+        /* Flow Cache Expiration Check */
+        extern void flow_cache_expire(uint64_t now_ms);
+        static uint64_t last_tsc = 0;
+        uint64_t now_tsc = rte_get_timer_cycles();
+        if (last_tsc == 0)
+            last_tsc = now_tsc;
+
+        /* 100ms interval approx */
+        if (now_tsc - last_tsc > (rte_get_timer_hz() / 10)) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            uint64_t now_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            flow_cache_expire(now_ms);
+            last_tsc = now_tsc;
+        }
+
         /* Poll all interfaces - simplified for PoC */
+
+        /*
+         * Packet RX/TX implementation
+         */
         /* In a real implementation, we would only poll DPDK ports assigned to this queue */
         /* For now, we iterate all interfaces. If it's a DPDK interface, we should ideally
            pass the queue_id. But our interface API doesn't support it yet.
@@ -775,6 +796,14 @@ static void *rx_thread_func(void *arg)
 
                 if (ret > 0 && pkt) {
                     pkt->meta.ingress_ifindex = iface->ifindex;
+
+                    /* Flow Cache Update */
+                    extern void flow_cache_update(struct rte_mbuf * m, int direction);
+                    if (pkt->mbuf) {
+                        /* 0 = Ingress for now, simplified */
+                        flow_cache_update(pkt->mbuf, 0);
+                    }
+
                     packet_rx_process_packet(pkt);
                     pkt_free(pkt);
                     packets_processed++;

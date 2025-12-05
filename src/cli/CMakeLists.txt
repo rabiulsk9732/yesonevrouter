@@ -27,6 +27,7 @@ target_link_libraries(yesrouter_cli
     yesrouter_routing
     yesrouter_logging
     yesrouter_nat
+    yesrouter_export
     pthread
 )
 

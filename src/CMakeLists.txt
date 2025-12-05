@@ -18,17 +18,22 @@ add_subdirectory(core)
 # Interfaces module
 add_subdirectory(interfaces)
 
-# Routing module
-add_subdirectory(routing)
-
-# BGP module
-# add_subdirectory(bgp)
-
 # Network module (ARP/Neighbor)
 add_subdirectory(network)
 
-# Authentication module
-# add_subdirectory(auth)
+# Export module (IPFIX/NetFlow)
+add_subdirectory(export)
+
+# Routing module
+add_subdirectory(routing)
+
+# Management modules
+add_subdirectory(ippool)
+add_subdirectory(qos)
+add_subdirectory(radius)
+add_subdirectory(pppoe)
+add_subdirectory(auth)
+add_subdirectory(management)
 
 # CLI module
 add_subdirectory(cli)
@@ -36,25 +41,11 @@ add_subdirectory(cli)
 # Forwarding module
 add_subdirectory(forwarding)
 
-# Access module (PPPoE, IPoE)
-add_subdirectory(pppoe)
-add_subdirectory(radius)
-add_subdirectory(ippool)
-add_subdirectory(qos)
-
-# Session module
-# add_subdirectory(session)
-
-# Firewall module
-# add_subdirectory(firewall)
-
 # CGNAT/NAT module
 add_subdirectory(nat)
 
-# QoS module
-# add_subdirectory(qos)
+# High Availability
+add_subdirectory(ha)
 
-# Management module
-# add_subdirectory(management)
-
-# Note: Subdirectories will be uncommented as modules are implemented
+# Main executable
+# (Handled by parent CMakeLists usually, or strict lib definition here)

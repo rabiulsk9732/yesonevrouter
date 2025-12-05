@@ -58,7 +58,7 @@ static void *nat_timeout_thread(void *arg)
 {
     (void)arg;
     while (g_nat_timeout_running) {
-        sleep(10); /* Check every 10 seconds */
+        usleep(100000); /* Check every 100ms (incremental scan) */
         int deleted = nat_session_timeout_check();
         if (deleted > 0) {
             YLOG_INFO("NAT timeout: deleted %d sessions", deleted);
@@ -165,12 +165,43 @@ int main(int argc, char *argv[])
         dpdk_argv[dpdk_argc++] = "-n";
         dpdk_argv[dpdk_argc++] = "4";
 
-        /* Hugepage memory */
-        if (g_yesrouter_hw_config.dpdk_config.socket_mem > 0) {
-            dpdk_argv[dpdk_argc++] = "--socket-mem";
-            char mem_str[32];
-            snprintf(mem_str, sizeof(mem_str), "%d", g_yesrouter_hw_config.dpdk_config.socket_mem);
-            dpdk_argv[dpdk_argc++] = strdup(mem_str);
+        /* Check if hugepages are available, if not use --no-huge */
+        FILE *hugepage_check = fopen("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages", "r");
+        int hugepages_available = 0;
+        if (hugepage_check) {
+            fscanf(hugepage_check, "%d", &hugepages_available);
+            fclose(hugepage_check);
+        }
+        
+        /* Check if vfio is in no-iommu mode (for virtio devices) */
+        FILE *vfio_noiommu = fopen("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "r");
+        bool vfio_noiommu_mode = false;
+        if (vfio_noiommu) {
+            char buf[8];
+            if (fgets(buf, sizeof(buf), vfio_noiommu) != NULL) {
+                vfio_noiommu_mode = (buf[0] == 'Y' || buf[0] == 'y' || buf[0] == '1');
+            }
+            fclose(vfio_noiommu);
+        }
+        
+        if (hugepages_available == 0) {
+            /* No hugepages available, use --no-huge for virtio devices */
+            dpdk_argv[dpdk_argc++] = "--no-huge";
+            printf("No hugepages detected, using --no-huge for DPDK\n");
+        } else {
+            /* Hugepage memory */
+            if (g_yesrouter_hw_config.dpdk_config.socket_mem > 0) {
+                dpdk_argv[dpdk_argc++] = "--socket-mem";
+                char mem_str[32];
+                snprintf(mem_str, sizeof(mem_str), "%d", g_yesrouter_hw_config.dpdk_config.socket_mem);
+                dpdk_argv[dpdk_argc++] = strdup(mem_str);
+            }
+        }
+        
+        /* If using vfio-pci in no-iommu mode, force VA IOVA mode */
+        if (vfio_noiommu_mode) {
+            dpdk_argv[dpdk_argc++] = "--iova-mode=va";
+            printf("vfio-pci no-iommu mode detected, using --iova-mode=va\n");
         }
 
         /* PCI whitelist/blacklist */
@@ -178,10 +209,12 @@ int main(int argc, char *argv[])
             dpdk_argv[dpdk_argc++] = "--no-pci";
         } else if (g_yesrouter_hw_config.dpdk_config.num_devices > 0) {
             /* Add -a for each configured device */
+            printf("Adding DPDK devices to probe:\n");
             for (int i = 0; i < g_yesrouter_hw_config.dpdk_config.num_devices; i++) {
                 dpdk_argv[dpdk_argc++] = "-a";
                 dpdk_argv[dpdk_argc++] =
                     strdup(g_yesrouter_hw_config.dpdk_config.devices[i].pci_addr);
+                printf("  -a %s\n", g_yesrouter_hw_config.dpdk_config.devices[i].pci_addr);
             }
         }
 

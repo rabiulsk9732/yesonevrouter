@@ -10,6 +10,7 @@
 #include "interface.h"
 #include "log.h"
 #include "nat.h"
+#include "nat_log.h"
 #include "packet.h"
 #include <rte_byteorder.h>
 #include <rte_icmp.h>
@@ -201,6 +202,16 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
         if (unlikely(!outside_ip)) {
             // YLOG_WARNING("[SNAT FAIL] Pool %s exhausted", selected_pool->name);
             g_nat_config.stats.no_ip_available++;
+
+            /* Log quota exceeded */
+            /* Log quota exceeded */
+            extern void nat_logger_log_event(uint8_t event_type, uint32_t original_ip,
+                                             uint16_t original_port, uint32_t translated_ip,
+                                             uint16_t translated_port, uint32_t dest_ip,
+                                             uint16_t dest_port, uint8_t protocol);
+            /* 3=QUOTA_EXCEEDED */
+            nat_logger_log_event(3, inside_ip, inside_port, 0, 0, 0, 0, protocol);
+
             return -1;
         }
 

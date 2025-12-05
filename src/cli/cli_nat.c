@@ -152,8 +152,8 @@ int cmd_ip_nat_inside_source(int argc, char **argv)
                 /* Create NAT Rule for this masquerade */
                 if (g_nat_config.num_rules < NAT_MAX_RULES) {
                     struct nat_rule *rule = &g_nat_config.rules[g_nat_config.num_rules];
-                    strncpy(rule->acl_name, acl_name, 31);
-                    strncpy(rule->pool_name, pool_name, 63);
+                    snprintf(rule->acl_name, 32, "%.31s", acl_name);
+                    snprintf(rule->pool_name, 32, "%.31s", pool_name);
                     rule->active = true;
                     rule->priority = g_nat_config.num_rules;
                     g_nat_config.num_rules++;
@@ -412,6 +412,17 @@ int cmd_nat_logging(int argc, char **argv)
         return cmd_nat_logging_netflow(argc, argv);
     } else if (strcmp(argv[2], "events") == 0) {
         return cmd_nat_logging_events(argc, argv);
+    } else if (strcmp(argv[2], "template-refresh") == 0) {
+        /* nat logging template-refresh <seconds> */
+        /* Note: argument validation omitted for test command brevity */
+        extern int nat_ipfix_send_template(void);
+        if (nat_ipfix_send_template() == 0) {
+            printf("Template refresh triggered\n");
+            return 0;
+        } else {
+            printf("Failed to send template (maybe logging disabled)\n");
+            return -1;
+        }
     } else {
         printf("%% Unknown command: nat logging %s\n", argv[2]);
         return -1;

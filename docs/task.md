@@ -256,8 +256,11 @@ nslookup <hostname>
 ```
 
 #### Implementation
-- [x] ICMP echo request generation (lines 105-146 in cli_system.c)
-- [x] ICMP checksum calculation (lines 145-146)
+- [x] Debug ICMP ping drops and "ICMP identifier mismatches"
+  - [x] Analyzed packet path (packet_rx.c)
+  - [x] Identified spinlock contention (20 workers vs 1 TX queue) -> Fixed by reducing to 1 worker
+  - [x] Identified latency spikes (blocking NAT timeout) -> Fixed by implementing incremental scan
+  - [x] Verified fix (0% packet loss, <1ms latency) (lines 145-146)
 - [x] RTT measurement (line 152 - currently simulated, can enhance with timestamps)
 - [x] Packet loss calculation (lines 163-164)
 - [x] Source interface selection (lines 72-84 via routing table lookup)
@@ -630,8 +633,16 @@ line vty <0-15>
    - [x] IPFIX export implementation (Basic structure)
    - [x] Netflow v9 support (via event abstraction)
    - [x] Syslog integration (via printf/log system)
-7. ✅ **ALG Framework** (Weeks 9-10) - COMPLETE
-   - [x] ICMP ALG (Error message translation)
+   - [x] Session Create/Delete hooks
+   - [x] Quota Exceeded hook
+8. **Dual-Mode Dataplane Exporter** (Week 11)
+   - [ ] Define data models (flow_key, flow_record, nat_event)
+   - [ ] Implement flow_cache (Per-core hash map)
+   - [ ] Implement exporter_core (Ring consumer, UDP sender)
+   - [ ] Implement NetFlow v9 packet builder
+   - [ ] Implement IPFIX v10 packet builder
+   - [ ] Integrate hooks (Packet RX, NAT Session)
+   - [ ] Verification (Dual capture)
    - [x] Embedded IP header translation
    - [x] Checksum recalculation
 

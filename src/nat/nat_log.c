@@ -10,7 +10,6 @@
 
 #include "nat_log.h"
 #include "log.h"
-#include "nat_ipfix.h"
 #include "nat_netflow.h"
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -59,13 +58,15 @@ int nat_log_configure_ipfix(uint32_t collector_ip, uint16_t collector_port,
     g_nat_log.config.ipfix_collector_port = collector_port;
     g_nat_log.config.ipfix_observation_domain = observation_domain_id;
 
-    int ret = nat_ipfix_init(collector_ip, collector_port, observation_domain_id);
-    if (ret == 0) {
-        g_nat_log.config.targets |= NAT_LOG_TARGET_IPFIX;
-    }
+    /* Legacy hook - new exporter configured via export_config_set_collector */
+    /* This function might be called by legacy CLI, so we map it to new config if needed */
+    extern void export_config_set_collector(int idx, uint32_t ip, uint16_t port);
+    export_config_set_collector(0, collector_ip, collector_port);
+
+    g_nat_log.config.targets |= NAT_LOG_TARGET_IPFIX;
 
     pthread_mutex_unlock(&g_nat_log.lock);
-    return ret;
+    return 0;
 }
 
 int nat_log_configure_netflow(uint32_t collector_ip, uint16_t collector_port, uint32_t source_id)
@@ -76,13 +77,16 @@ int nat_log_configure_netflow(uint32_t collector_ip, uint16_t collector_port, ui
     g_nat_log.config.netflow_collector_port = collector_port;
     g_nat_log.config.netflow_source_id = source_id;
 
-    int ret = nat_netflow_init(collector_ip, collector_port, source_id);
-    if (ret == 0) {
-        g_nat_log.config.targets |= NAT_LOG_TARGET_NETFLOW;
-    }
+    /* Legacy hook - NetFlow v9 now also handled by Exporter core */
+    /* Assuming NetFlow maps to a specific collector index or we use same core */
+    extern void export_config_set_collector(int idx, uint32_t ip, uint16_t port);
+    export_config_set_collector(1, collector_ip,
+                                collector_port); /* Use idx 1 for NetFlow example */
+
+    g_nat_log.config.targets |= NAT_LOG_TARGET_NETFLOW;
 
     pthread_mutex_unlock(&g_nat_log.lock);
-    return ret;
+    return 0;
 }
 
 void nat_log_set_target(uint32_t target, bool enable)
@@ -93,14 +97,7 @@ void nat_log_set_target(uint32_t target, bool enable)
         g_nat_log.config.targets |= target;
     } else {
         g_nat_log.config.targets &= ~target;
-
-        /* Cleanup disabled exporters */
-        if (target & NAT_LOG_TARGET_IPFIX) {
-            nat_ipfix_cleanup();
-        }
-        if (target & NAT_LOG_TARGET_NETFLOW) {
-            nat_netflow_cleanup();
-        }
+        /* Cleanup disabled exporters - No-op for new exporter (runs continuously) */
     }
 
     pthread_mutex_unlock(&g_nat_log.lock);
@@ -210,27 +207,10 @@ void nat_log_session_event(enum nat_event_type event_type, uint32_t inside_ip, u
 
     /* Dispatch to enabled targets (outside lock for performance) */
 
-    /* IPFIX */
-    if (targets & NAT_LOG_TARGET_IPFIX) {
-        uint8_t ipfix_event = (event_type == NAT_EVENT_CREATE) ? NAT44_EVENT_SESSION_CREATE
-                                                               : NAT44_EVENT_SESSION_DELETE;
-
-        if (nat_ipfix_log_session(ipfix_event, inside_ip, inside_port, outside_ip, outside_port,
-                                  dest_ip, dest_port, protocol) == 0) {
-            __atomic_fetch_add(&g_nat_log.stats.ipfix_events, 1, __ATOMIC_RELAXED);
-        }
-    }
-
-    /* NetFlow v9 */
-    if (targets & NAT_LOG_TARGET_NETFLOW) {
-        uint8_t nf_event =
-            (event_type == NAT_EVENT_CREATE) ? NF9_NAT_EVENT_CREATE : NF9_NAT_EVENT_DELETE;
-
-        if (nat_netflow_log_session(nf_event, inside_ip, inside_port, outside_ip, outside_port,
-                                    dest_ip, dest_port, protocol) == 0) {
-            __atomic_fetch_add(&g_nat_log.stats.netflow_events, 1, __ATOMIC_RELAXED);
-        }
-    }
+    /* Dispatch to enabled targets (outside lock for performance) */
+    /* Note: IPFIX and NetFlow now handled via new Dual-Mode Exporter subsystem (nat_logger.c) */
+    /* The hooks in nat_session.c now call nat_logger_log_event directly. */
+    /* This function handles Syslog mainly now. */
 
     /* Syslog */
     if (targets & NAT_LOG_TARGET_SYSLOG) {
@@ -252,17 +232,7 @@ void nat_log_event(enum nat_event_type event_type, uint32_t inside_ip, uint16_t 
 
 void nat_log_flush(void)
 {
-    pthread_mutex_lock(&g_nat_log.lock);
-    uint32_t targets = g_nat_log.config.targets;
-    pthread_mutex_unlock(&g_nat_log.lock);
-
-    if (targets & NAT_LOG_TARGET_IPFIX) {
-        nat_ipfix_flush();
-    }
-
-    if (targets & NAT_LOG_TARGET_NETFLOW) {
-        nat_netflow_flush();
-    }
+    /* Legacy flush - no op for now as new exporter runs continuously in thread */
 }
 
 void nat_log_get_stats(struct nat_log_stats *stats)
@@ -288,6 +258,7 @@ void nat_log_print_config(void)
     printf("    IPFIX:    %s",
            (g_nat_log.config.targets & NAT_LOG_TARGET_IPFIX) ? "Enabled" : "Disabled");
     if (g_nat_log.config.targets & NAT_LOG_TARGET_IPFIX) {
+        /* New exporter init handled via global init or lazy load */
         printf(" (collector: %u.%u.%u.%u:%u, domain: %u)",
                (g_nat_log.config.ipfix_collector_ip >> 24) & 0xFF,
                (g_nat_log.config.ipfix_collector_ip >> 16) & 0xFF,
@@ -300,6 +271,7 @@ void nat_log_print_config(void)
     printf("    NetFlow:  %s",
            (g_nat_log.config.targets & NAT_LOG_TARGET_NETFLOW) ? "Enabled" : "Disabled");
     if (g_nat_log.config.targets & NAT_LOG_TARGET_NETFLOW) {
+        /* New exporter init handled via global init or lazy load */
         printf(" (collector: %u.%u.%u.%u:%u, source: %u)",
                (g_nat_log.config.netflow_collector_ip >> 24) & 0xFF,
                (g_nat_log.config.netflow_collector_ip >> 16) & 0xFF,
@@ -332,14 +304,7 @@ void nat_log_cleanup(void)
     pthread_mutex_lock(&g_nat_log.lock);
 
     if (g_nat_log.initialized) {
-        /* Cleanup exporters */
-        if (g_nat_log.config.targets & NAT_LOG_TARGET_IPFIX) {
-            nat_ipfix_cleanup();
-        }
-
-        if (g_nat_log.config.targets & NAT_LOG_TARGET_NETFLOW) {
-            nat_netflow_cleanup();
-        }
+        /* Cleanup exporters - No-op */
 
         g_nat_log.initialized = false;
         YLOG_INFO("NAT logging cleanup complete");

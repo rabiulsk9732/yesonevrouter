@@ -133,6 +133,7 @@ target_link_libraries(yesrouter
     yesrouter_nat
     yesrouter_core
     yesrouter_management
+    yesrouter_export
     pthread
 )
 
@@ -154,6 +155,7 @@ add_subdirectory(src/ha)
 add_subdirectory(src/pppoe)
 add_subdirectory(src/cli)
 add_subdirectory(src/management)
+add_subdirectory(src/export)
 
 # yesrouterctl client tool
 add_executable(yesrouterctl src/cli/yesrouterctl.c)

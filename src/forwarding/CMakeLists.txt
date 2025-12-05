@@ -22,4 +22,5 @@ target_link_libraries(yesrouter_forwarding
     yesrouter_radius
     yesrouter_ippool
     yesrouter_qos
+    yesrouter_export
 )
