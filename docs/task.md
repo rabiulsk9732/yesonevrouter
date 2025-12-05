@@ -3,21 +3,31 @@
 **Project**: YESRouter Virtual Broadband Network Gateway
 **Total Tasks**: 29 tasks across 6 phases
 **Duration**: 28 weeks (7 months)
-**Last Updated**: 2025-12-04
+**Last Updated**: 2025-12-05
 
 ---
 
 ## 🎯 Current Status Summary
 
-### ✅ COMPLETED TODAY (2025-12-04)
+### ✅ COMPLETED TODAY (2025-12-05)
+- **CLI Professional Banner**: Box-style welcome banner with version info on connection
+- **Mode-Aware Prompts**: Dynamic prompts (`yesrouter#`, `yesrouter(config)#`, `yesrouter(config-if-Gi0/1)#`)
+- **Configuration Persistence**: `write`/`save`/`commit` now saves to `/etc/yesrouter/startup.gate`
+- **NAT Masquerade Persistence**: NAT rules saved and auto-restored on boot
+- **`save` Command**: New alias for `write memory` (VyOS/Juniper style)
+- **`commit` Command**: VyOS-style commit with validation
+- **`configure` Shorthand**: Works without requiring `terminal` keyword
+- **Shutdown Fix**: Fixed segfault on service stop/restart
+- **Debug Spam Removal**: Removed all `[RX DEBUG]`, `[PHY DEBUG]`, `[FWD DEBUG]` messages
+- **NAT Stability**: Confirmed 7000+ packets with <0.02% loss after restart
+
+### ✅ COMPLETED PREVIOUSLY (2025-12-04)
 - **VLAN Interface Fetcher (802.1Q)**: Complete packet tagging/untagging with DPDK hardware offload
 - **LACP Bonding Fetcher (802.3ad)**: Multiple bonding modes (active-backup, round-robin, XOR, 802.3ad)
 - **Dummy Interface Support**: Added IF_TYPE_DUMMY for multiple dummy interfaces
 - **Load Balancing**: L2/L3/L4 hashing for bond member selection
 - **VLAN Filtering**: Packet filtering by VLAN ID in receive path
 - **Comprehensive Testing**: 8 test cases validating VLAN, LACP, and dummy interfaces - ALL PASSED
-
-### ✅ COMPLETED PREVIOUSLY (2025-12-04)
 - **VPP-Style Configuration**: Implemented startup.conf + setup.gate auto-loading system
 - **Auto-Configuration**: Network settings (IP, routes) persist across reboots
 - **Traceroute Fixed**: Working traceroute using system command (DPDK bypass issue resolved)
@@ -41,7 +51,6 @@
 
 ### 📋 PLANNED
 - DNS implementation
-- Packet forwarding between interfaces
 - BGP protocol
 - SSH/Telnet Server with User Management (deferred)
 
