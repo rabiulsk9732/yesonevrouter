@@ -303,6 +303,12 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
+    /* Set NAT workers BEFORE nat_init (fixes g_num_workers=1 bug) */
+    extern void nat_set_num_workers(uint32_t num_workers);
+    int nat_workers = g_env_config.workers.nat_count > 0 ? g_env_config.workers.nat_count : 4;
+    YLOG_INFO("Setting NAT workers to %d before nat_init", nat_workers);
+    nat_set_num_workers(nat_workers);
+
     /* Initialize NAT subsystem */
     if (nat_init() != 0) {
         YLOG_ERROR("Failed to initialize NAT subsystem");

@@ -1092,9 +1092,10 @@ static void *rx_thread_func(void *arg)
 
             poll_count++;
 
-            /* Poll BOTH DPDK ports (for DAC loopback topology) */
+            /* Poll ALL available DPDK ports (dynamic from env) */
             uint16_t nb_rx = 0;
-            for (uint16_t port_id = 0; port_id < 2; port_id++) {
+            uint16_t num_ports = rte_eth_dev_count_avail();
+            for (uint16_t port_id = 0; port_id < num_ports; port_id++) {
                 uint16_t rx_count = rte_eth_rx_burst(port_id, queue_id, rx_pkts + nb_rx, FAST_BURST_SIZE - nb_rx);
                 nb_rx += rx_count;
                 if (nb_rx >= FAST_BURST_SIZE) break;
@@ -1158,28 +1159,28 @@ static void *rx_thread_func(void *arg)
                     rte_memcpy(pkt + 6, tmp, 6);
                 }
 
-                /* TX burst - NAT: send packets out the OPPOSITE port (inside->outside) */
-                static __thread uint64_t tx_debug = 0;
-                if (nb_tx > 0 && tx_debug++ < 10) {
-                    YLOG_INFO("[TX-DEBUG] nb_tx=%u from NAT", nb_tx);
-                }
+                /* TX burst - dynamic port handling */
                 uint16_t sent = 0;
-                for (uint16_t tx_port = 0; tx_port < 2; tx_port++) {
-                    struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
-                    uint16_t port_count = 0;
-                    for (uint16_t j = 0; j < nb_tx; j++) {
-                        /* NAT: packets go out opposite port (port 0->1, port 1->0) */
-                        uint16_t egress_port = (local_pkts[j]->port == 0) ? 1 : 0;
-                        if (egress_port == tx_port) {
-                            port_pkts[port_count++] = local_pkts[j];
+                uint16_t num_tx_ports = rte_eth_dev_count_avail();
+
+                if (num_tx_ports == 1) {
+                    /* Single port mode: loopback on same port */
+                    sent = rte_eth_tx_burst(0, queue_id, local_pkts, nb_tx);
+                } else {
+                    /* Multi-port mode: NAT sends to opposite port */
+                    for (uint16_t tx_port = 0; tx_port < num_tx_ports; tx_port++) {
+                        struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
+                        uint16_t port_count = 0;
+                        for (uint16_t j = 0; j < nb_tx; j++) {
+                            uint16_t egress_port = (num_tx_ports > 1) ?
+                                ((local_pkts[j]->port == 0) ? 1 : 0) : 0;
+                            if (egress_port == tx_port) {
+                                port_pkts[port_count++] = local_pkts[j];
+                            }
                         }
-                    }
-                    if (port_count > 0) {
-                        uint16_t tx_sent = rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
-                        if (tx_debug < 15) {
-                            YLOG_INFO("[TX-DEBUG] port=%u queue=%u count=%u sent=%u", tx_port, queue_id, port_count, tx_sent);
+                        if (port_count > 0) {
+                            sent += rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
                         }
-                        sent += tx_sent;
                     }
                 }
                 total_tx += sent;
@@ -1218,19 +1219,27 @@ static void *rx_thread_func(void *arg)
                         rte_memcpy(pkt + 6, tmp, 6);
                     }
 
-                    /* TX burst - NAT: send packets out OPPOSITE port */
+                    /* TX burst - dynamic port handling */
                     uint16_t sent = 0;
-                    for (uint16_t tx_port = 0; tx_port < 2; tx_port++) {
-                        struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
-                        uint16_t port_count = 0;
-                        for (uint16_t j = 0; j < nb_tx; j++) {
-                            uint16_t egress_port = (ring_pkts[j]->port == 0) ? 1 : 0;
-                            if (egress_port == tx_port) {
-                                port_pkts[port_count++] = ring_pkts[j];
+                    uint16_t num_ring_tx_ports = rte_eth_dev_count_avail();
+
+                    if (num_ring_tx_ports == 1) {
+                        /* Single port mode: loopback on same port */
+                        sent = rte_eth_tx_burst(0, queue_id, ring_pkts, nb_tx);
+                    } else {
+                        /* Multi-port mode: NAT sends to opposite port */
+                        for (uint16_t tx_port = 0; tx_port < num_ring_tx_ports; tx_port++) {
+                            struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
+                            uint16_t port_count = 0;
+                            for (uint16_t j = 0; j < nb_tx; j++) {
+                                uint16_t egress_port = (ring_pkts[j]->port == 0) ? 1 : 0;
+                                if (egress_port == tx_port) {
+                                    port_pkts[port_count++] = ring_pkts[j];
+                                }
                             }
-                        }
-                        if (port_count > 0) {
-                            sent += rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            if (port_count > 0) {
+                                sent += rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            }
                         }
                     }
                     total_tx += sent;
