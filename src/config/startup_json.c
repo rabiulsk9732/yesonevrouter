@@ -13,6 +13,9 @@
 #include <string.h>
 #include <arpa/inet.h>
 
+/* Global default gateway - used by NAT for next-hop routing */
+uint32_t g_default_gateway = 0;
+
 /* Simple JSON value extractor */
 static char *json_get_string(const char *json, const char *key, char *out, int max) {
     char search[128];
@@ -67,23 +70,51 @@ int startup_json_load(const char *path) {
                 strncpy(iface_name, name_start, name_end - name_start);
                 iface_name[name_end - name_start] = '\0';
 
-                /* Find ipv4 for this interface */
-                char ipv4[32] = {0};
-                json_get_string(search_pos, "ipv4", ipv4, sizeof(ipv4));
-                if (ipv4[0]) {
-                    struct interface *iface = interface_find_by_name(iface_name);
-                    if (iface) {
-                        char *slash = strchr(ipv4, '/');
-                        int prefix = 24;
-                        if (slash) {
-                            *slash = '\0';
-                            prefix = atoi(slash + 1);
-                        }
-                        struct in_addr addr;
+                struct interface *iface = interface_find_by_name(iface_name);
+                if (iface) {
+                    /* Find ipv4_address for this interface */
+                    char ipv4[32] = {0};
+                    json_get_string(search_pos, "ipv4_address", ipv4, sizeof(ipv4));
+                    if (ipv4[0]) {
+                        char mask_str[32] = {0};
+                        json_get_string(search_pos, "ipv4_mask", mask_str, sizeof(mask_str));
+
+                        struct in_addr addr, mask;
                         if (inet_pton(AF_INET, ipv4, &addr) == 1) {
                             iface->config.ipv4_addr = addr;
-                            iface->config.ipv4_mask.s_addr = htonl(0xFFFFFFFF << (32 - prefix));
-                            YLOG_INFO("[STARTUP] %s configured with IP %s/%d", iface_name, ipv4, prefix);
+                            if (mask_str[0] && inet_pton(AF_INET, mask_str, &mask) == 1) {
+                                iface->config.ipv4_mask = mask;
+                            } else {
+                                iface->config.ipv4_mask.s_addr = htonl(0xFFFFFF00); /* /24 default */
+                            }
+                            YLOG_INFO("[STARTUP] %s configured with IP %s", iface_name, ipv4);
+                        }
+                    }
+
+                    /* Parse NAT inside/outside flags - DYNAMIC NAT direction */
+                    /* Find the end of this interface's JSON block (next '}') */
+                    char *block_end = strchr(search_pos, '}');
+                    if (block_end) {
+                        /* Check for nat_inside: true - look for "true" within 20 chars of key */
+                        char *nat_in = strstr(search_pos, "\"nat_inside\"");
+                        if (nat_in && nat_in < block_end) {
+                            /* Check only the next 20 chars for "true" (avoids finding next field) */
+                            char val_buf[24] = {0};
+                            strncpy(val_buf, nat_in + 12, 20);
+                            if (strstr(val_buf, "true")) {
+                                iface->config.nat_inside = true;
+                                YLOG_INFO("[STARTUP] %s: NAT inside (LAN)", iface_name);
+                            }
+                        }
+                        /* Check for nat_outside: true */
+                        char *nat_out = strstr(search_pos, "\"nat_outside\"");
+                        if (nat_out && nat_out < block_end) {
+                            char val_buf[24] = {0};
+                            strncpy(val_buf, nat_out + 13, 20);
+                            if (strstr(val_buf, "true")) {
+                                iface->config.nat_outside = true;
+                                YLOG_INFO("[STARTUP] %s: NAT outside (WAN)", iface_name);
+                            }
                         }
                     }
                 }
@@ -129,6 +160,37 @@ int startup_json_load(const char *path) {
         if (strstr(nat_section, "\"hairpin\": true") || strstr(nat_section, "\"hairpin\":true")) {
             g_nat_config.hairpinning_enabled = true;
             YLOG_INFO("[STARTUP] NAT44 hairpin enabled");
+        }
+    }
+
+    /* Parse routing section for default gateway */
+    char *routing_section = strstr(json, "\"routing\"");
+    if (routing_section) {
+        char *static_routes = strstr(routing_section, "\"static_routes\"");
+        if (static_routes) {
+            /* Look for default route (0.0.0.0/0) */
+            char *default_route = strstr(static_routes, "\"0.0.0.0/0\"");
+            if (default_route) {
+                char next_hop[32] = {0};
+                json_get_string(default_route, "next_hop", next_hop, sizeof(next_hop));
+                if (next_hop[0]) {
+                    struct in_addr gw;
+                    if (inet_pton(AF_INET, next_hop, &gw) == 1) {
+                        g_default_gateway = ntohl(gw.s_addr);
+                        YLOG_INFO("[STARTUP] Default gateway: %s (0x%08x)", next_hop, g_default_gateway);
+
+                        /* Send ARP request to gateway to populate ARP table early */
+                        struct interface *wan_iface = interface_find_by_name("Gi0/1");
+                        if (wan_iface && wan_iface->config.ipv4_addr.s_addr != 0) {
+                            extern int arp_send_request(uint32_t target_ip, uint32_t source_ip,
+                                                       const uint8_t *source_mac, uint32_t ifindex);
+                            uint32_t wan_ip = ntohl(wan_iface->config.ipv4_addr.s_addr);
+                            arp_send_request(g_default_gateway, wan_ip, wan_iface->mac_addr, wan_iface->ifindex);
+                            YLOG_INFO("[STARTUP] Sent ARP request to gateway %s", next_hop);
+                        }
+                    }
+                }
+            }
         }
     }
 

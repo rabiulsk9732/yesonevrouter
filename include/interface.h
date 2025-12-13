@@ -82,6 +82,10 @@ struct interface_config_data {
     uint32_t num_members;
     uint32_t member_ifindexes[IF_MAX_VLAN_MEMBERS];
     uint8_t lag_mode;               /* 0 = active-backup, 1 = balance-rr, etc. */
+
+    /* NAT interface role (dynamic - not hardcoded to port numbers) */
+    bool nat_inside;                /* true = LAN side, source of SNAT traffic */
+    bool nat_outside;               /* true = WAN side, destination of SNAT traffic */
 };
 
 /* Forward declaration */

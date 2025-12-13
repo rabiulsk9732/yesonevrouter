@@ -1046,10 +1046,24 @@ static void *rx_thread_func(void *arg)
 
 #ifdef HAVE_DPDK
     /* Initialize per-worker NAT port pool for LOCKLESS allocation */
-    /* Each worker gets NAT IP 203.0.113.X where X = worker_id + 1 */
+    /* Use actual NAT pool IP from config (first active pool) */
     extern void nat_worker_port_pool_init(uint32_t worker_id, uint32_t nat_ip,
                                           uint16_t port_min, uint16_t port_max);
-    uint32_t nat_ip = 0xCB007101 + worker_id;  /* 203.0.113.1 + worker_id */
+    extern struct nat_config g_nat_config;
+    uint32_t nat_ip = 0;
+    /* Get IP from first active NAT pool */
+    for (int i = 0; i < g_nat_config.num_pools && nat_ip == 0; i++) {
+        if (g_nat_config.pools[i].active) {
+            nat_ip = g_nat_config.pools[i].start_ip;
+        }
+    }
+    if (nat_ip == 0) {
+        /* Fallback: get WAN interface IP */
+        struct interface *wan = interface_find_by_name("Gi0/1");
+        if (wan && wan->config.ipv4_addr.s_addr != 0) {
+            nat_ip = ntohl(wan->config.ipv4_addr.s_addr);
+        }
+    }
     nat_worker_port_pool_init(worker_id, nat_ip, 1024, 65535);
     YLOG_INFO("[NAT] Worker %d: NAT IP pool initialized (IP=%u.%u.%u.%u)",
               worker_id, (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF,
@@ -1076,11 +1090,14 @@ static void *rx_thread_func(void *arg)
          * DEBUG: Comprehensive logging to find where packets are lost
          * ============================================================ */
         {
-            #define FAST_BURST_SIZE 64
+            #define FAST_BURST_SIZE 128  /* Increased for higher throughput */
             static __thread struct rte_mbuf *rx_pkts[FAST_BURST_SIZE];
             static __thread uint64_t total_rx = 0, total_tx = 0, total_drops = 0;
+            static __thread uint64_t total_rx_bytes = 0, total_tx_bytes = 0;
+            static __thread uint64_t last_rx = 0, last_tx = 0, last_rx_bytes = 0, last_tx_bytes = 0;
             static __thread uint64_t poll_count = 0, empty_polls = 0;
             static __thread uint64_t last_log = 0;
+            static __thread uint64_t last_stats_time = 0;
             static __thread int logged_start = 0;
 
             /* Log once at start */
@@ -1103,6 +1120,10 @@ static void *rx_thread_func(void *arg)
 
             if (nb_rx > 0) {
                 total_rx += nb_rx;
+                /* Count RX bytes */
+                for (uint16_t b = 0; b < nb_rx; b++) {
+                    total_rx_bytes += rx_pkts[b]->pkt_len;
+                }
 
                 /* VPP-STYLE WORKER HANDOFF:
                  * 1. Hash each packet to determine owning worker
@@ -1150,40 +1171,36 @@ static void *rx_thread_func(void *arg)
                     nb_tx = nat_process_burst_dpdk(local_pkts, local_count, worker_id);
                 }
 
-                /* Swap MACs for return path (TRex sink hole) */
-                for (uint16_t i = 0; i < nb_tx; i++) {
-                    uint8_t *pkt = rte_pktmbuf_mtod(local_pkts[i], uint8_t *);
-                    uint8_t tmp[6];
-                    rte_memcpy(tmp, pkt, 6);
-                    rte_memcpy(pkt, pkt + 6, 6);
-                    rte_memcpy(pkt + 6, tmp, 6);
-                }
-
-                /* TX burst - dynamic port handling */
+                /* NAT fastpath now handles MAC rewriting and sets pkt->port for egress */
+                /* TX burst - route based on pkt->port set by NAT */
                 uint16_t sent = 0;
                 uint16_t num_tx_ports = rte_eth_dev_count_avail();
 
                 if (num_tx_ports == 1) {
-                    /* Single port mode: loopback on same port */
+                    /* Single port mode */
                     sent = rte_eth_tx_burst(0, queue_id, local_pkts, nb_tx);
                 } else {
-                    /* Multi-port mode: NAT sends to opposite port */
+                    /* Multi-port mode: use pkt->port set by NAT for egress routing */
                     for (uint16_t tx_port = 0; tx_port < num_tx_ports; tx_port++) {
                         struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
                         uint16_t port_count = 0;
                         for (uint16_t j = 0; j < nb_tx; j++) {
-                            uint16_t egress_port = (num_tx_ports > 1) ?
-                                ((local_pkts[j]->port == 0) ? 1 : 0) : 0;
-                            if (egress_port == tx_port) {
+                            /* NAT sets pkt->port to correct egress port */
+                            if (local_pkts[j]->port == tx_port) {
                                 port_pkts[port_count++] = local_pkts[j];
                             }
                         }
                         if (port_count > 0) {
-                            sent += rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            uint16_t tx_sent = rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            sent += tx_sent;
                         }
                     }
                 }
                 total_tx += sent;
+                /* Count TX bytes */
+                for (uint16_t b = 0; b < sent; b++) {
+                    total_tx_bytes += local_pkts[b]->pkt_len;
+                }
 
                 if (sent < nb_tx) {
                     total_drops += (nb_tx - sent);
@@ -1192,6 +1209,30 @@ static void *rx_thread_func(void *arg)
                     }
                 }
                 packets_processed = nb_rx;
+            }
+
+            /* Print stats every 2 seconds */
+            uint64_t now = rte_rdtsc();
+            uint64_t hz = rte_get_tsc_hz();
+            if (now - last_stats_time > hz * 2) {
+                uint64_t delta_rx = total_rx - last_rx;
+                uint64_t delta_tx = total_tx - last_tx;
+                uint64_t delta_rx_bytes = total_rx_bytes - last_rx_bytes;
+                uint64_t delta_tx_bytes = total_tx_bytes - last_tx_bytes;
+                double rx_pps = delta_rx / 2.0;
+                double tx_pps = delta_tx / 2.0;
+                double rx_gbps = (delta_rx_bytes * 8.0) / (2.0 * 1000000000.0);
+                double tx_gbps = (delta_tx_bytes * 8.0) / (2.0 * 1000000000.0);
+
+                if (delta_rx > 0 || delta_tx > 0) {
+                    YLOG_INFO("[STATS] W%d: RX %.0f pps (%.2f Gbps) | TX %.0f pps (%.2f Gbps) | Drops %lu",
+                             worker_id, rx_pps, rx_gbps, tx_pps, tx_gbps, total_drops);
+                }
+                last_rx = total_rx;
+                last_tx = total_tx;
+                last_rx_bytes = total_rx_bytes;
+                last_tx_bytes = total_tx_bytes;
+                last_stats_time = now;
             }
 
             /* VPP-STYLE: Also process packets from our handoff ring */
@@ -1210,30 +1251,20 @@ static void *rx_thread_func(void *arg)
                         YLOG_INFO("[RING-TX] worker=%d nb_tx=%u from NAT", worker_id, nb_tx);
                     }
 
-                    /* Swap MACs */
-                    for (uint16_t i = 0; i < nb_tx; i++) {
-                        uint8_t *pkt = rte_pktmbuf_mtod(ring_pkts[i], uint8_t *);
-                        uint8_t tmp[6];
-                        rte_memcpy(tmp, pkt, 6);
-                        rte_memcpy(pkt, pkt + 6, 6);
-                        rte_memcpy(pkt + 6, tmp, 6);
-                    }
+                    /* NAT fastpath handles MAC rewriting - no swap needed */
 
-                    /* TX burst - dynamic port handling */
+                    /* TX burst - use pkt->port set by NAT for egress routing */
                     uint16_t sent = 0;
                     uint16_t num_ring_tx_ports = rte_eth_dev_count_avail();
 
                     if (num_ring_tx_ports == 1) {
-                        /* Single port mode: loopback on same port */
                         sent = rte_eth_tx_burst(0, queue_id, ring_pkts, nb_tx);
                     } else {
-                        /* Multi-port mode: NAT sends to opposite port */
                         for (uint16_t tx_port = 0; tx_port < num_ring_tx_ports; tx_port++) {
                             struct rte_mbuf *port_pkts[FAST_BURST_SIZE];
                             uint16_t port_count = 0;
                             for (uint16_t j = 0; j < nb_tx; j++) {
-                                uint16_t egress_port = (ring_pkts[j]->port == 0) ? 1 : 0;
-                                if (egress_port == tx_port) {
+                                if (ring_pkts[j]->port == tx_port) {
                                     port_pkts[port_count++] = ring_pkts[j];
                                 }
                             }
@@ -1258,8 +1289,8 @@ static void *rx_thread_func(void *arg)
             }
 
             /* Log stats every 5 seconds - write to file for guaranteed visibility */
-            uint64_t now = rte_rdtsc();
-            if (now - last_log > rte_get_tsc_hz() * 5) {
+            uint64_t now_log = rte_rdtsc();
+            if (now_log - last_log > rte_get_tsc_hz() * 5) {
                 struct rte_eth_stats eth_stats;
                 rte_eth_stats_get(0, &eth_stats);  /* Stats from port 0 */
 

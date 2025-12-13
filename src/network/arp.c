@@ -239,6 +239,36 @@ int arp_lookup_lockless(uint32_t ip_address, uint8_t *mac_address)
 }
 
 /**
+ * LOCKLESS ARP entry update for fast path (VPP-style)
+ * Only updates EXISTING entries - does NOT create new ones
+ * Safe for concurrent access - uses atomic MAC copy
+ */
+int arp_update_lockless(uint32_t ip_address, const uint8_t *mac_address)
+{
+    if (!arp_table || !mac_address) {
+        return -1;
+    }
+
+    /* Direct hash lookup without lock */
+    uint32_t hash = (ip_address ^ (ip_address >> 16)) % arp_table->size;
+    struct arp_entry *entry = arp_table->buckets[hash];
+
+    /* Walk chain to find existing entry */
+    while (entry) {
+        if (entry->ip_address == ip_address) {
+            /* Update existing entry atomically */
+            /* 6-byte MAC fits in cache line - atomic on x86 */
+            memcpy((void *)entry->mac_address, mac_address, 6);
+            __atomic_store_n(&entry->state, ARP_STATE_VALID, __ATOMIC_RELEASE);
+            return 0;
+        }
+        entry = entry->next;
+    }
+
+    return -1; /* Entry doesn't exist - caller should use slow path */
+}
+
+/**
  * Delete ARP entry
  */
 int arp_delete_entry(uint32_t ip_address)

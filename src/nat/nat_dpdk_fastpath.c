@@ -27,13 +27,56 @@
 #endif
 
 /* Performance tuning constants */
-#define NAT_BURST_SIZE         64    /* Packets per burst (cache line aligned) */
-#define NAT_PREFETCH_OFFSET    4     /* Prefetch N packets ahead */
+#define NAT_BURST_SIZE         128   /* Packets per burst - larger for higher throughput */
+#define NAT_PREFETCH_OFFSET    8     /* Prefetch N packets ahead for cache warming */
+
+/* Performance: disable hot-path logging for production */
+#define NAT_PERF_MODE          1     /* 1 = disable debug logs in hot path */
 #define NAT_CACHE_LINE_SIZE    64
 
-/* NAT interface direction - port 0 = inside, port 1 = outside */
-#define NAT_INSIDE_PORT        0
-#define NAT_OUTSIDE_PORT       1
+/* NAT interface direction - determined dynamically from interface config */
+#include "interface.h"
+
+/* Cached interface lookup for performance - avoid per-packet lookup */
+static __thread struct interface *g_cached_iface[RTE_MAX_ETHPORTS];
+static __thread int g_iface_cache_init = 0;
+
+static inline void nat_init_iface_cache(void) {
+    if (likely(g_iface_cache_init)) return;
+    for (int i = 0; i < RTE_MAX_ETHPORTS; i++) {
+        g_cached_iface[i] = interface_find_by_dpdk_port(i);
+    }
+    g_iface_cache_init = 1;
+}
+
+/* Check if port is NAT inside (LAN) - CACHED lookup */
+static inline bool nat_is_inside_port(uint16_t port_id) {
+    struct interface *iface = g_cached_iface[port_id];
+    return iface ? iface->config.nat_inside : false;
+}
+
+/* Check if port is NAT outside (WAN) - CACHED lookup */
+static inline bool nat_is_outside_port(uint16_t port_id) {
+    struct interface *iface = g_cached_iface[port_id];
+    return iface ? iface->config.nat_outside : false;
+}
+
+/* Legacy functions for compatibility */
+static inline bool nat_is_inside_port_slow(uint16_t port_id) {
+    struct interface *iface = interface_find_by_dpdk_port(port_id);
+    if (iface) {
+        return iface->config.nat_inside;
+    }
+    return false;  /* Default: not inside */
+}
+
+static inline bool nat_is_outside_port_slow(uint16_t port_id) {
+    struct interface *iface = interface_find_by_dpdk_port(port_id);
+    if (iface) {
+        return iface->config.nat_outside;
+    }
+    return false;  /* Default: not outside */
+}
 
 /* Per-lcore statistics for zero contention */
 struct nat_lcore_stats {
@@ -107,6 +150,9 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
     stats->bursts_processed++;
 
+    /* Initialize interface cache on first call (per-thread) */
+    nat_init_iface_cache();
+
     /* Stage 1: Prefetch all packet headers */
     for (int i = 0; i < nb_rx && i < NAT_PREFETCH_OFFSET; i++) {
         rte_prefetch0(rte_pktmbuf_mtod(pkts[i], void *));
@@ -146,12 +192,38 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             continue;
         }
 
-        /* Check packet direction based on ingress port */
+        /* Check packet direction based on ingress port - DYNAMIC lookup */
         uint16_t ingress_port = pkt->port;
-        int is_inside_to_outside = (ingress_port == NAT_INSIDE_PORT);
+        int is_inside_to_outside = nat_is_inside_port(ingress_port);
 
         /* Get IP header */
         ip = (struct rte_ipv4_hdr *)(eth + 1);
+
+        /* VPP-STYLE: Learn MACs from incoming packets (optimized - not every packet) */
+        /* Only learn on first packet of burst to reduce overhead */
+        if (unlikely(i == 0)) {
+            extern int arp_update_lockless(uint32_t ip_address, const uint8_t *mac_address);
+            extern int arp_add_entry(uint32_t ip_address, const uint8_t *mac_address,
+                                    uint32_t ifindex, int state);
+
+            if (is_inside_to_outside) {
+                /* LAN packet: learn client MAC (create if first packet) */
+                uint32_t src_ip_learn = rte_be_to_cpu_32(ip->src_addr);
+                if (arp_update_lockless(src_ip_learn, eth->src_addr.addr_bytes) != 0) {
+                    /* Entry doesn't exist - create it (slow path, first packet only) */
+                    struct interface *in_iface = g_cached_iface[ingress_port];
+                    if (in_iface) {
+                        arp_add_entry(src_ip_learn, eth->src_addr.addr_bytes, in_iface->ifindex, 1);
+                    }
+                }
+            } else {
+                /* WAN packet: update gateway MAC (lockless - entry created at startup) */
+                extern uint32_t g_default_gateway;
+                if (g_default_gateway != 0) {
+                    arp_update_lockless(g_default_gateway, eth->src_addr.addr_bytes);
+                }
+            }
+        }
 
         src_ip = rte_be_to_cpu_32(ip->src_addr);
         dst_ip = rte_be_to_cpu_32(ip->dst_addr);
@@ -166,9 +238,56 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
             src_port = rte_be_to_cpu_16(tcp->src_port);
             dst_port = rte_be_to_cpu_16(tcp->dst_port);
+        } else if (proto == IPPROTO_ICMP) {
+            /* ICMP handling */
+            struct rte_icmp_hdr *icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+
+            /* Check if ICMP echo request to router's own IP - respond directly */
+            if (icmp->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
+                struct interface *dst_iface = interface_find_by_dpdk_port(ingress_port);
+                if (dst_iface && dst_iface->config.ipv4_addr.s_addr == ip->dst_addr) {
+                    /* Ping to our own IP - send echo reply */
+                    /* Swap src/dst MAC */
+                    struct rte_ether_addr tmp_mac;
+                    rte_ether_addr_copy(&eth->dst_addr, &tmp_mac);
+                    rte_ether_addr_copy(&eth->src_addr, &eth->dst_addr);
+                    rte_ether_addr_copy(&tmp_mac, &eth->src_addr);
+
+                    /* Swap src/dst IP */
+                    uint32_t tmp_ip = ip->src_addr;
+                    ip->src_addr = ip->dst_addr;
+                    ip->dst_addr = tmp_ip;
+
+                    /* Change ICMP type to echo reply */
+                    icmp->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+
+                    /* Update ICMP checksum */
+                    icmp->icmp_cksum = 0;
+                    uint16_t icmp_len = rte_be_to_cpu_16(ip->total_length) - (ip->ihl << 2);
+                    icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
+
+                    /* Update IP checksum */
+                    ip->hdr_checksum = 0;
+                    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+                    /* Send reply back on same port */
+                    rte_eth_tx_burst(ingress_port, 0, &pkt, 1);
+                    continue;
+                }
+            }
+
+            /* For NAT: use identifier as port */
+            src_port = rte_be_to_cpu_16(icmp->icmp_ident);
+            dst_port = src_port;
         } else {
-            /* Pass through non-TCP/UDP */
-            pkts[nb_tx++] = pkt;
+            /* Non-TCP/UDP/ICMP from INSIDE: pass through */
+            /* Non-TCP/UDP/ICMP from OUTSIDE: drop (no NAT session possible) */
+            if (is_inside_to_outside) {
+                pkts[nb_tx++] = pkt;
+            } else {
+                stats->dropped++;
+                rte_pktmbuf_free(pkt);
+            }
             continue;
         }
 
@@ -176,12 +295,14 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
         if (is_inside_to_outside) {
             /* INSIDE -> OUTSIDE: SNAT (translate source) */
             static __thread uint64_t snat_count = 0;
+#if !NAT_PERF_MODE
             if (snat_count++ < 10) {
                 LOG_INFO("[NAT-SNAT] pkt from port %u: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u",
                     ingress_port,
                     (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
                     (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port, proto);
             }
+#endif
 
             /* Fast path: Check per-worker cache first (L1 resident) */
             uint32_t hash = nat_hash_inside(src_ip, src_port, proto);
@@ -254,11 +375,10 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             }
 
             uint32_t old_src = ip->src_addr;
-            uint16_t old_port = (proto == IPPROTO_UDP) ? udp->src_port : tcp->src_port;
-
             ip->src_addr = rte_cpu_to_be_32(session->outside_ip);
 
             if (proto == IPPROTO_UDP) {
+                uint16_t old_port = udp->src_port;
                 udp->src_port = rte_cpu_to_be_16(session->outside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
@@ -267,7 +387,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                         udp->dgram_cksum, old_src, ip->src_addr,
                         old_port, udp->src_port);
                 }
-            } else {
+            } else if (proto == IPPROTO_TCP) {
+                uint16_t old_port = tcp->src_port;
                 tcp->src_port = rte_cpu_to_be_16(session->outside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
@@ -276,15 +397,19 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                         tcp->cksum, old_src, ip->src_addr,
                         old_port, tcp->src_port);
                 }
+            } else if (proto == IPPROTO_ICMP) {
+                /* ICMP SNAT - update identifier */
+                struct rte_icmp_hdr *icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+                icmp->icmp_ident = rte_cpu_to_be_16(session->outside_port);
+                /* Recalculate ICMP checksum */
+                icmp->icmp_cksum = 0;
+                uint16_t icmp_len = rte_be_to_cpu_16(ip->total_length) - (ip->ihl << 2);
+                icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
             }
 
             /* Update IP checksum */
-            if (pkt->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
-                ip->hdr_checksum = 0;
-            } else {
-                ip->hdr_checksum = nat_fast_cksum_update(
-                    ip->hdr_checksum, old_src, ip->src_addr, 0, 0);
-            }
+            ip->hdr_checksum = 0;
+            ip->hdr_checksum = rte_ipv4_cksum(ip);
         } else {
             /* OUTSIDE -> INSIDE: DNAT (translate destination) */
 
@@ -300,11 +425,10 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
             /* Apply DNAT translation (outside -> inside) */
             uint32_t old_dst = ip->dst_addr;
-            uint16_t old_port = (proto == IPPROTO_UDP) ? udp->dst_port : tcp->dst_port;
-
             ip->dst_addr = rte_cpu_to_be_32(session->inside_ip);
 
             if (proto == IPPROTO_UDP) {
+                uint16_t old_port = udp->dst_port;
                 udp->dst_port = rte_cpu_to_be_16(session->inside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
@@ -313,7 +437,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                         udp->dgram_cksum, old_dst, ip->dst_addr,
                         old_port, udp->dst_port);
                 }
-            } else {
+            } else if (proto == IPPROTO_TCP) {
+                uint16_t old_port = tcp->dst_port;
                 tcp->dst_port = rte_cpu_to_be_16(session->inside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
@@ -322,24 +447,79 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                         tcp->cksum, old_dst, ip->dst_addr,
                         old_port, tcp->dst_port);
                 }
+            } else if (proto == IPPROTO_ICMP) {
+                /* ICMP DNAT - update identifier */
+                struct rte_icmp_hdr *icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+                icmp->icmp_ident = rte_cpu_to_be_16(session->inside_port);
+                /* Recalculate ICMP checksum */
+                icmp->icmp_cksum = 0;
+                uint16_t icmp_len = rte_be_to_cpu_16(ip->total_length) - (ip->ihl << 2);
+                icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
             }
 
             /* Update IP checksum */
-            if (pkt->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
-                ip->hdr_checksum = 0;
-            } else {
-                ip->hdr_checksum = nat_fast_cksum_update(
-                    ip->hdr_checksum, old_dst, ip->dst_addr, 0, 0);
-            }
+            ip->hdr_checksum = 0;
+            ip->hdr_checksum = rte_ipv4_cksum(ip);
         }
 
-        /* Mark packet for transmission */
-        static __thread uint64_t tx_count = 0;
-        if (tx_count++ < 5) {
-            LOG_INFO("[NAT-TX] Adding pkt to output, nb_tx=%u", nb_tx);
+        /* VPP-STYLE: Rewrite L2 headers for routing (not just MAC swap) */
+        {
+            uint16_t egress_port;
+            uint32_t next_hop_ip;
+
+            if (is_inside_to_outside) {
+                /* SNAT: Send to WAN port (0), next-hop is gateway */
+                egress_port = 0;  /* WAN port */
+                /* Get gateway from config (parsed from startup.json routing section) */
+                extern uint32_t g_default_gateway;
+                next_hop_ip = g_default_gateway;
+            } else {
+                /* DNAT: Send to LAN port (1), next-hop is inside IP */
+                egress_port = 1;  /* LAN port */
+                next_hop_ip = session->inside_ip;
+            }
+
+            /* Get egress interface MAC */
+            struct rte_ether_addr egress_mac;
+            rte_eth_macaddr_get(egress_port, &egress_mac);
+
+            /* Lookup next-hop MAC via ARP (lockless for performance) */
+            uint8_t dst_mac[6];
+            extern int arp_lookup_lockless(uint32_t ip_address, uint8_t *mac_address);
+
+            if (arp_lookup_lockless(next_hop_ip, dst_mac) == 0) {
+                /* ARP hit - rewrite MACs */
+                rte_ether_addr_copy(&egress_mac, &eth->src_addr);
+                memcpy(&eth->dst_addr, dst_mac, 6);
+
+                /* Set egress port for TX routing */
+                pkt->port = egress_port;
+
+                pkts[nb_tx++] = pkt;
+                stats->tx_packets++;
+            } else {
+                /* ARP miss - need to send ARP request and queue packet */
+                /* For now, drop packet (VPP queues it) */
+                static __thread uint64_t arp_miss = 0;
+                if (arp_miss++ < 10) {
+                    LOG_WARN("[NAT] ARP miss for %u.%u.%u.%u - dropping",
+                        (next_hop_ip >> 24) & 0xFF, (next_hop_ip >> 16) & 0xFF,
+                        (next_hop_ip >> 8) & 0xFF, next_hop_ip & 0xFF);
+                }
+
+                /* Trigger ARP request (slow path) */
+                struct interface *egress_iface = interface_find_by_dpdk_port(egress_port);
+                if (egress_iface) {
+                    extern int arp_send_request(uint32_t target_ip, uint32_t source_ip,
+                                               const uint8_t *source_mac, uint32_t ifindex);
+                    uint32_t src_ip = ntohl(egress_iface->config.ipv4_addr.s_addr);
+                    arp_send_request(next_hop_ip, src_ip, egress_iface->mac_addr, egress_iface->ifindex);
+                }
+
+                stats->dropped++;
+                rte_pktmbuf_free(pkt);
+            }
         }
-        pkts[nb_tx++] = pkt;
-        stats->tx_packets++;
     }
 
     stats->rx_packets += nb_rx;

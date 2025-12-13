@@ -1,39 +1,48 @@
 {
   "_comment": "YESRouter Cisco-Style CLI Configuration (Runtime)",
-
   "interfaces": {
     "Gi0/1": {
-      "description": "NAT Hairpin Interface",
-      "ipv4_address": "192.168.1.1",
+      "description": "WAN Interface",
+      "ipv4_address": "103.181.65.166",
+      "ipv4_mask": "255.255.255.248",
+      "nat_inside": false,
+      "nat_outside": true
+    },
+    "Gi0/2": {
+      "description": "LAN Interface",
+      "ipv4_address": "172.16.17.1",
       "ipv4_mask": "255.255.255.0",
       "nat_inside": true,
-      "nat_outside": true
+      "nat_outside": false
     }
   },
-
   "nat44": {
     "enabled": true,
-    "hairpin": true,
+    "hairpin": false,
     "pools": [
       {
-        "name": "CGNAT",
-        "start_ip": "203.0.113.1",
-        "end_ip": "203.0.113.254",
+        "name": "SNAT_WAN",
+        "start_ip": "103.181.65.166",
+        "end_ip": "103.181.65.166",
         "port_start": 1024,
         "port_end": 65535
       }
     ],
-    "inside_networks": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"],
+    "inside_networks": [
+      "172.16.17.0/24"
+    ],
     "timeouts": {
       "udp": 300,
       "tcp": 7200,
       "icmp": 60
     }
   },
-
   "routing": {
     "static_routes": [
-      { "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1" }
+      {
+        "prefix": "0.0.0.0/0",
+        "next_hop": "103.181.65.161"
+      }
     ]
   }
 }
