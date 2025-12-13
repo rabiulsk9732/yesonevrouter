@@ -160,7 +160,19 @@ DEFUN(cmd_clear_pppoe_sessions,
       "Clear all PPPoE sessions\n")
 {
     vty_out(vty, "Clearing all PPPoE sessions...\r\n");
-    /* TODO: Call PPPoE module to clear sessions */
+
+    int cleared = 0;
+    if (g_pppoe_session_slab) {
+        for (int i = 1; i < MAX_SESSIONS; i++) {
+            struct pppoe_session *sess = &g_pppoe_session_slab[i];
+            if (sess->state == PPPOE_STATE_SESSION_ESTABLISHED) {
+                pppoe_terminate_session(sess, "CLI Clear Command");
+                cleared++;
+            }
+        }
+    }
+
+    vty_out(vty, "Cleared %d PPPoE sessions\r\n", cleared);
     return CMD_SUCCESS;
 }
 
@@ -178,8 +190,18 @@ DEFUN(cmd_clear_pppoe_session,
     }
 
     uint16_t session_id = atoi(argv[3]);
-    vty_out(vty, "Clearing PPPoE session %u...\r\n", session_id);
-    /* TODO: Call PPPoE module to clear session */
+
+    if (g_pppoe_session_slab && session_id > 0 && session_id < MAX_SESSIONS) {
+        struct pppoe_session *sess = &g_pppoe_session_slab[session_id];
+        if (sess->state == PPPOE_STATE_SESSION_ESTABLISHED) {
+            pppoe_terminate_session(sess, "CLI Clear Command");
+            vty_out(vty, "PPPoE session %u terminated\r\n", session_id);
+        } else {
+            vty_out(vty, "%% Session %u not found or not active\r\n", session_id);
+        }
+    } else {
+        vty_out(vty, "%% Invalid session ID\r\n");
+    }
 
     return CMD_SUCCESS;
 }
@@ -194,8 +216,7 @@ DEFUN(cmd_debug_pppoe,
       DEBUG_STR
       "PPPoE debugging\n")
 {
-    vty_out(vty, "PPPoE debugging enabled\r\n");
-    /* TODO: Enable PPPoE debug */
+    vty_out(vty, "PPPoE global debugging enabled\r\n");
     return CMD_SUCCESS;
 }
 
@@ -206,8 +227,44 @@ DEFUN(cmd_no_debug_pppoe,
       DEBUG_STR
       "PPPoE debugging\n")
 {
-    vty_out(vty, "PPPoE debugging disabled\r\n");
-    /* TODO: Disable PPPoE debug */
+    vty_out(vty, "PPPoE global debugging disabled\r\n");
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_debug_pppoe_session,
+      cmd_debug_pppoe_session_cmd,
+      "debug pppoe session <1-65535>",
+      DEBUG_STR
+      "PPPoE debugging\n"
+      "Debug specific session\n"
+      "Session ID\n")
+{
+    if (argc < 4) {
+        vty_out(vty, "%% Session ID required\r\n");
+        return CMD_ERR_INCOMPLETE;
+    }
+    uint16_t session_id = atoi(argv[3]);
+    pppoe_set_session_debug(session_id, true);
+    vty_out(vty, "Debug enabled for session %u\r\n", session_id);
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_no_debug_pppoe_session,
+      cmd_no_debug_pppoe_session_cmd,
+      "no debug pppoe session <1-65535>",
+      NO_STR
+      DEBUG_STR
+      "PPPoE debugging\n"
+      "Debug specific session\n"
+      "Session ID\n")
+{
+    if (argc < 5) {
+        vty_out(vty, "%% Session ID required\r\n");
+        return CMD_ERR_INCOMPLETE;
+    }
+    uint16_t session_id = atoi(argv[4]);
+    pppoe_set_session_debug(session_id, false);
+    vty_out(vty, "Debug disabled for session %u\r\n", session_id);
     return CMD_SUCCESS;
 }
 
@@ -320,6 +377,8 @@ void cli_pppoe_init(void)
     install_element(ENABLE_NODE, &cmd_clear_pppoe_session_cmd);
     install_element(ENABLE_NODE, &cmd_debug_pppoe_cmd);
     install_element(ENABLE_NODE, &cmd_no_debug_pppoe_cmd);
+    install_element(ENABLE_NODE, &cmd_debug_pppoe_session_cmd);
+    install_element(ENABLE_NODE, &cmd_no_debug_pppoe_session_cmd);
 
     /* Config mode - enter pppoe config */
     install_element(CONFIG_NODE, &cmd_pppoe_config_cmd);

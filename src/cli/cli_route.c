@@ -212,10 +212,20 @@ DEFUN(cmd_ip_default_gateway,
       "Set default gateway\n"
       "Gateway IP address\n")
 {
+    extern uint32_t g_default_gateway;
+
     if (argc < 3) {
         vty_out(vty, "%% Gateway address required\r\n");
         return CMD_ERR_INCOMPLETE;
     }
+
+    struct in_addr gw;
+    if (inet_pton(AF_INET, argv[2], &gw) != 1) {
+        vty_out(vty, "%% Invalid IP address: %s\r\n", argv[2]);
+        return CMD_ERR_INCOMPLETE;
+    }
+
+    g_default_gateway = ntohl(gw.s_addr);
 
     vty_out(vty, "Default gateway set to %s\r\n", argv[2]);
     return CMD_SUCCESS;

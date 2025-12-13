@@ -148,6 +148,33 @@ DEFUN(cmd_clear_nat_sessions,
 }
 
 /* ============================================================================
+ * Debug Commands
+ * ============================================================================ */
+
+DEFUN(cmd_debug_nat,
+      cmd_debug_nat_cmd,
+      "debug nat",
+      DEBUG_STR
+      "NAT debugging\n")
+{
+    vty_out(vty, "NAT debugging enabled\r\n");
+    /* TODO: Enable NAT debugging */
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_no_debug_nat,
+      cmd_no_debug_nat_cmd,
+      "no debug nat",
+      NO_STR
+      DEBUG_STR
+      "NAT debugging\n")
+{
+    vty_out(vty, "NAT debugging disabled\r\n");
+    /* TODO: Disable NAT debugging */
+    return CMD_SUCCESS;
+}
+
+/* ============================================================================
  * Initialization
  * ============================================================================ */
 
@@ -163,4 +190,6 @@ void cli_nat_init(void)
     install_element(ENABLE_NODE, &cmd_show_nat_sessions_cmd);
     install_element(ENABLE_NODE, &cmd_show_nat_statistics_cmd);
     install_element(ENABLE_NODE, &cmd_clear_nat_sessions_cmd);
+    install_element(ENABLE_NODE, &cmd_debug_nat_cmd);
+    install_element(ENABLE_NODE, &cmd_no_debug_nat_cmd);
 }

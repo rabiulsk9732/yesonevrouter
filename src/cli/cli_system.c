@@ -447,6 +447,8 @@ DEFUN(cmd_terminal_length,
     return CMD_SUCCESS;
 }
 
+
+
 DEFUN(cmd_terminal_width,
       cmd_terminal_width_cmd,
       "terminal width <40-512>",
@@ -466,42 +468,35 @@ DEFUN(cmd_terminal_width,
  * Initialization
  * ============================================================================ */
 
+/* ============================================================================
+ * Initialization
+ * ============================================================================ */
+
 void cli_system_init(void)
 {
     printf("[CLI] cli_system_init: Registering system commands\n");
 
-    /* View mode */
+    /* View mode commands */
     install_element(VIEW_NODE, &cmd_show_clock_cmd);
-    printf("[CLI] Registered: show clock\n");
     install_element(VIEW_NODE, &cmd_show_uptime_cmd);
-    install_element(VIEW_NODE, &cmd_show_memory_cmd);
-    install_element(VIEW_NODE, &cmd_show_cpu_cmd);
-    install_element(VIEW_NODE, &cmd_show_processes_cmd);
     install_element(VIEW_NODE, &cmd_show_logging_cmd);
-    install_element(VIEW_NODE, &cmd_terminal_length_cmd);
-    install_element(VIEW_NODE, &cmd_terminal_width_cmd);
 
-    /* Enable mode */
+    /* Enable mode commands */
     install_element(ENABLE_NODE, &cmd_show_clock_cmd);
     install_element(ENABLE_NODE, &cmd_show_uptime_cmd);
     install_element(ENABLE_NODE, &cmd_show_memory_cmd);
-    install_element(ENABLE_NODE, &cmd_show_cpu_cmd);
     install_element(ENABLE_NODE, &cmd_show_processes_cmd);
-    install_element(ENABLE_NODE, &cmd_show_logging_cmd);
-    install_element(ENABLE_NODE, &cmd_show_running_config_cmd);
-    install_element(ENABLE_NODE, &cmd_show_startup_config_cmd);
     install_element(ENABLE_NODE, &cmd_show_tech_support_cmd);
-    install_element(ENABLE_NODE, &cmd_write_cmd);
     install_element(ENABLE_NODE, &cmd_write_memory_cmd);
+    install_element(ENABLE_NODE, &cmd_write_cmd);
     install_element(ENABLE_NODE, &cmd_copy_running_startup_cmd);
-    install_element(ENABLE_NODE, &cmd_reload_cmd);
-    install_element(ENABLE_NODE, &cmd_clear_counters_cmd);
-    install_element(ENABLE_NODE, &cmd_clear_logging_cmd);
-    install_element(ENABLE_NODE, &cmd_terminal_length_cmd);
-    install_element(ENABLE_NODE, &cmd_terminal_width_cmd);
+    install_element(ENABLE_NODE, &cmd_show_logging_cmd);
 
-    /* Config mode */
+    /* Config mode commands */
+    install_element(CONFIG_NODE, &cmd_logging_level_cmd);
     install_element(CONFIG_NODE, &cmd_logging_console_cmd);
     install_element(CONFIG_NODE, &cmd_logging_file_cmd);
     install_element(CONFIG_NODE, &cmd_logging_level_cmd);
+    install_element(CONFIG_NODE, &cmd_terminal_length_cmd);
+    install_element(CONFIG_NODE, &cmd_terminal_width_cmd);
 }

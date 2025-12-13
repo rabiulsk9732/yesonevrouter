@@ -312,6 +312,32 @@ DEFUN(cmd_if_mtu,
     return CMD_SUCCESS;
 }
 
+/* ============================================================================
+ * Clear Commands
+ * ============================================================================ */
+
+DEFUN(cmd_clear_counters,
+      cmd_clear_counters_cmd,
+      "clear counters",
+      CLEAR_STR
+      "Clear counter statistics\n")
+{
+    extern struct interface_manager g_if_mgr;
+
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (iface) {
+            memset(&iface->stats, 0, sizeof(struct interface_stats));
+        }
+    }
+
+    vty_out(vty, "Clear \"show interface\" counters on all interfaces [confirm]\r\n");
+    /* In a real CLI we would wait for confirmation, but here we just do it */
+    vty_out(vty, "Counters cleared\r\n");
+
+    return CMD_SUCCESS;
+}
+
 DEFUN(cmd_if_pppoe_enable,
       cmd_if_pppoe_enable_cmd,
       "pppoe enable",
@@ -335,6 +361,94 @@ DEFUN(cmd_if_no_pppoe_enable,
     return CMD_SUCCESS;
 }
 
+DEFUN(cmd_if_ip_nat_inside,
+      cmd_if_ip_nat_inside_cmd,
+      "ip nat inside",
+      "IP configuration\n"
+      "NAT configuration\n"
+      "Mark interface as NAT inside\n")
+{
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->config.nat_inside = true;
+    iface->config.nat_outside = false;  /* Mutually exclusive */
+
+    vty_out(vty, "NAT inside enabled on %s\r\n", ifname);
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_if_ip_nat_outside,
+      cmd_if_ip_nat_outside_cmd,
+      "ip nat outside",
+      "IP configuration\n"
+      "NAT configuration\n"
+      "Mark interface as NAT outside\n")
+{
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->config.nat_outside = true;
+    iface->config.nat_inside = false;  /* Mutually exclusive */
+
+    vty_out(vty, "NAT outside enabled on %s\r\n", ifname);
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_if_no_ip_nat_inside,
+      cmd_if_no_ip_nat_inside_cmd,
+      "no ip nat inside",
+      NO_STR
+      "IP configuration\n"
+      "NAT configuration\n"
+      "Remove NAT inside\n")
+{
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->config.nat_inside = false;
+
+    vty_out(vty, "NAT inside disabled on %s\r\n", ifname);
+    return CMD_SUCCESS;
+}
+
+DEFUN(cmd_if_no_ip_nat_outside,
+      cmd_if_no_ip_nat_outside_cmd,
+      "no ip nat outside",
+      NO_STR
+      "IP configuration\n"
+      "NAT configuration\n"
+      "Remove NAT outside\n")
+{
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->config.nat_outside = false;
+
+    vty_out(vty, "NAT outside disabled on %s\r\n", ifname);
+    return CMD_SUCCESS;
+}
+
 /* ============================================================================
  * Initialization
  * ============================================================================ */
@@ -350,6 +464,7 @@ void cli_interface_init(void)
     install_element(ENABLE_NODE, &cmd_show_interfaces_cmd);
     install_element(ENABLE_NODE, &cmd_show_interfaces_brief_cmd);
     install_element(ENABLE_NODE, &cmd_show_interface_cmd);
+    install_element(ENABLE_NODE, &cmd_clear_counters_cmd);
 
     /* Config mode */
     install_element(CONFIG_NODE, &cmd_interface_cmd);
@@ -363,4 +478,8 @@ void cli_interface_init(void)
     install_element(INTERFACE_NODE, &cmd_if_mtu_cmd);
     install_element(INTERFACE_NODE, &cmd_if_pppoe_enable_cmd);
     install_element(INTERFACE_NODE, &cmd_if_no_pppoe_enable_cmd);
+    install_element(INTERFACE_NODE, &cmd_if_ip_nat_inside_cmd);
+    install_element(INTERFACE_NODE, &cmd_if_ip_nat_outside_cmd);
+    install_element(INTERFACE_NODE, &cmd_if_no_ip_nat_inside_cmd);
+    install_element(INTERFACE_NODE, &cmd_if_no_ip_nat_outside_cmd);
 }
