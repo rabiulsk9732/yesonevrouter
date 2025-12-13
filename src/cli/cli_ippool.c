@@ -11,6 +11,10 @@
 #include "command.h"
 #include "vty.h"
 #include "ippool.h"
+#include "nat.h"
+
+/* External NAT config */
+extern struct nat_config g_nat_config;
 
 /* ============================================================================
  * Show Commands
@@ -24,16 +28,36 @@ DEFUN(cmd_show_ip_pool,
       "IP address pool\n")
 {
     vty_out(vty, "\r\n");
-    vty_out(vty, "IP Address Pools\r\n");
-    vty_out(vty, "================\r\n");
+    vty_out(vty, "NAT IP Pools\r\n");
+    vty_out(vty, "============\r\n");
     vty_out(vty, "\r\n");
-    vty_out(vty, "%-16s %-16s %-16s %-8s %-8s\r\n",
-            "Pool Name", "Start", "End", "Used", "Free");
-    vty_out(vty, "%-16s %-16s %-16s %-8s %-8s\r\n",
-            "---------------", "---------------", "---------------", "-------", "-------");
-    /* TODO: Get actual pool info */
-    vty_out(vty, "%-16s %-16s %-16s %-8d %-8d\r\n",
-            "POOL1", "10.100.0.2", "10.100.0.254", 0, 253);
+    vty_out(vty, "%-16s %-16s %-16s %-10s\r\n",
+            "Pool Name", "Start IP", "End IP", "Total IPs");
+    vty_out(vty, "%-16s %-16s %-16s %-10s\r\n",
+            "---------------", "---------------", "---------------", "---------");
+
+    int pool_count = 0;
+    for (int i = 0; i < NAT_MAX_POOLS && i < g_nat_config.num_pools; i++) {
+        struct nat_pool *pool = &g_nat_config.pools[i];
+        if (!pool->active && pool->start_ip == 0)
+            continue;
+
+        struct in_addr start_addr, end_addr;
+        start_addr.s_addr = htonl(pool->start_ip);
+        end_addr.s_addr = htonl(pool->end_ip);
+
+        vty_out(vty, "%-16s %-16s %-16s %-10u\r\n",
+                pool->name[0] ? pool->name : "CGNAT",
+                inet_ntoa(start_addr),
+                inet_ntoa(end_addr),
+                pool->total_ips);
+        pool_count++;
+    }
+
+    if (pool_count == 0) {
+        vty_out(vty, "(no pools configured)\r\n");
+    }
+
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;
 }

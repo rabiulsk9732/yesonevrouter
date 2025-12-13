@@ -69,8 +69,8 @@ struct vty *vty_new(int fd)
 
     vty->fd = fd;
     vty->type = VTY_TERM;
-    vty->node = VIEW_NODE;
-    vty->privilege = 1;
+    vty->node = ENABLE_NODE;
+    vty->privilege = 15;
     vty->status = VTY_NORMAL;
 
     /* Allocate buffers */
@@ -389,9 +389,89 @@ int vty_read(struct vty *vty)
             }
             break;
 
-        case '\t':  /* Tab - completion */
-            /* TODO: implement completion */
+        case '\t':  /* Tab - completion (Cisco-style) */
+            {
+                int count = 0;
+                char **completions;
+
+                vty->buf[vty->length] = '\0';
+                completions = cmd_complete(vty, vty->buf, &count);
+
+                if (count == 0) {
+                    /* No completions - beep */
+                    vty_out(vty, "\a");
+                } else if (count == 1) {
+                    /* Single completion - complete it with trailing space */
+                    const char *comp = completions[0];
+                    int comp_len = strlen(comp);
+
+                    /* Find partial word start */
+                    int partial_start = vty->length;
+                    while (partial_start > 0 && vty->buf[partial_start-1] != ' ')
+                        partial_start--;
+                    int partial_len = vty->length - partial_start;
+
+                    /* Erase partial and print full completion + space */
+                    for (int k = 0; k < partial_len; k++)
+                        vty_out(vty, "\b \b");
+
+                    strcpy(vty->buf + partial_start, comp);
+                    vty->buf[partial_start + comp_len] = ' ';
+                    vty->buf[partial_start + comp_len + 1] = '\0';
+                    vty->length = partial_start + comp_len + 1;
+                    vty->cp = vty->length;
+                    vty_out(vty, "%s ", comp);
+                } else {
+                    /* Multiple completions - find longest common prefix */
+                    int prefix_len = strlen(completions[0]);
+                    for (int k = 1; k < count && prefix_len > 0; k++) {
+                        int j = 0;
+                        while (j < prefix_len &&
+                               tolower(completions[0][j]) == tolower(completions[k][j])) {
+                            j++;
+                        }
+                        prefix_len = j;
+                    }
+
+                    /* Find what user has typed */
+                    int partial_start = vty->length;
+                    while (partial_start > 0 && vty->buf[partial_start-1] != ' ')
+                        partial_start--;
+                    int partial_len = vty->length - partial_start;
+
+                    if (prefix_len > partial_len) {
+                        /* Complete to common prefix (no trailing space) */
+                        for (int k = 0; k < partial_len; k++)
+                            vty_out(vty, "\b \b");
+
+                        /* Copy common prefix */
+                        char prefix[256];
+                        strncpy(prefix, completions[0], prefix_len);
+                        prefix[prefix_len] = '\0';
+
+                        strcpy(vty->buf + partial_start, prefix);
+                        vty->length = partial_start + prefix_len;
+                        vty->cp = vty->length;
+                        vty->buf[vty->length] = '\0';
+                        vty_out(vty, "%s", prefix);
+                    } else {
+                        /* Already at common prefix - show options */
+                        vty_out(vty, "\r\n");
+                        for (int k = 0; k < count; k++) {
+                            vty_out(vty, "  %s\r\n", completions[k]);
+                        }
+                        vty_prompt(vty);
+                        vty_out(vty, "%s", vty->buf);
+                    }
+                }
+
+                /* Free completions */
+                for (int k = 0; k < count; k++)
+                    free(completions[k]);
+                free(completions);
+            }
             break;
+
 
         case '?':
             /* Context help */
@@ -617,6 +697,7 @@ extern void cli_system_init(void);
 extern void cli_radius_init(void);
 extern void cli_ippool_init(void);
 extern void cli_route_init(void);
+extern void cli_nat_init(void);
 
 /**
  * Initialize CLI (called from main.c)
@@ -630,6 +711,7 @@ int cli_init(void)
     cli_radius_init();
     cli_ippool_init();
     cli_route_init();
+    cli_nat_init();
     return 0;
 }
 

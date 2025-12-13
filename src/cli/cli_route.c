@@ -6,13 +6,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "command.h"
 #include "vty.h"
+#include "interface.h"
 
 /* ============================================================================
  * Show Commands
  * ============================================================================ */
+
+/* Helper: Convert mask to CIDR prefix length */
+static int mask_to_cidr(struct in_addr mask)
+{
+    uint32_t m = ntohl(mask.s_addr);
+    int bits = 0;
+    while (m & 0x80000000) {
+        bits++;
+        m <<= 1;
+    }
+    return bits;
+}
 
 DEFUN(cmd_show_ip_route,
       cmd_show_ip_route_cmd,
@@ -21,15 +35,45 @@ DEFUN(cmd_show_ip_route,
       "IP information\n"
       "IP routing table\n")
 {
+    extern struct interface_manager g_if_mgr;
+    extern uint32_t g_default_gateway;
+
     vty_out(vty, "\r\n");
     vty_out(vty, "Codes: C - connected, S - static, R - RIP, O - OSPF, B - BGP\r\n");
     vty_out(vty, "       * - candidate default\r\n");
     vty_out(vty, "\r\n");
-    vty_out(vty, "Gateway of last resort is not set\r\n");
+
+    /* Show default gateway if configured */
+    if (g_default_gateway) {
+        struct in_addr gw;
+        gw.s_addr = htonl(g_default_gateway);
+        vty_out(vty, "Gateway of last resort is %s\r\n", inet_ntoa(gw));
+    } else {
+        vty_out(vty, "Gateway of last resort is not set\r\n");
+    }
     vty_out(vty, "\r\n");
-    /* TODO: Get actual routing table */
-    vty_out(vty, "C    192.168.1.0/24 is directly connected, GigabitEthernet0/0\r\n");
-    vty_out(vty, "S*   0.0.0.0/0 [1/0] via 192.168.1.1\r\n");
+
+    /* Show connected routes from interfaces */
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (iface && iface->config.ipv4_addr.s_addr != 0) {
+            /* Calculate network address */
+            struct in_addr network;
+            network.s_addr = iface->config.ipv4_addr.s_addr & iface->config.ipv4_mask.s_addr;
+            int prefix_len = mask_to_cidr(iface->config.ipv4_mask);
+
+            vty_out(vty, "C    %s/%d is directly connected, %s\r\n",
+                    inet_ntoa(network), prefix_len, iface->name);
+        }
+    }
+
+    /* Show static default route */
+    if (g_default_gateway) {
+        struct in_addr gw;
+        gw.s_addr = htonl(g_default_gateway);
+        vty_out(vty, "S*   0.0.0.0/0 [1/0] via %s\r\n", inet_ntoa(gw));
+    }
+
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;
 }

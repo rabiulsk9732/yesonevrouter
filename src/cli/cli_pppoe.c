@@ -6,16 +6,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <arpa/inet.h>
 
 #include "command.h"
 #include "vty.h"
 #include "pppoe.h"
 
-/* External PPPoE functions */
-extern void pppoe_print_sessions(void);
+/* External PPPoE session slab */
+extern struct pppoe_session *g_pppoe_session_slab;
+
+/* External functions */
 extern void pppoe_print_statistics(void);
-extern int pppoe_get_session_count(void);
-extern struct pppoe_session *pppoe_get_session_by_id(uint16_t session_id);
 
 /* ============================================================================
  * Show Commands
@@ -44,13 +46,60 @@ DEFUN(cmd_show_pppoe_sessions,
     vty_out(vty, "PPPoE Sessions\r\n");
     vty_out(vty, "==============\r\n");
     vty_out(vty, "\r\n");
-    vty_out(vty, "%-8s %-18s %-16s %-10s %-10s\r\n",
-            "Session", "MAC Address", "IP Address", "State", "Uptime");
-    vty_out(vty, "%-8s %-18s %-16s %-10s %-10s\r\n",
-            "-------", "-----------------", "---------------", "---------", "---------");
+    vty_out(vty, "%-8s %-18s %-16s %-10s %-12s %-10s\r\n",
+            "Session", "MAC Address", "IP Address", "State", "Username", "Uptime");
+    vty_out(vty, "%-8s %-18s %-16s %-10s %-12s %-10s\r\n",
+            "-------", "-----------------", "---------------", "---------", "-----------", "---------");
 
-    /* Call PPPoE module to print sessions */
-    pppoe_print_sessions();
+    int session_count = 0;
+
+    if (g_pppoe_session_slab) {
+        for (int i = 1; i < MAX_SESSIONS; i++) {
+            struct pppoe_session *sess = &g_pppoe_session_slab[i];
+
+            if (sess->state == PPPOE_STATE_SESSION_ESTABLISHED) {
+                struct in_addr ip;
+                ip.s_addr = htonl(sess->client_ip);
+
+                /* Format MAC address */
+                char mac_str[20];
+                snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                        sess->client_mac.addr_bytes[0], sess->client_mac.addr_bytes[1],
+                        sess->client_mac.addr_bytes[2], sess->client_mac.addr_bytes[3],
+                        sess->client_mac.addr_bytes[4], sess->client_mac.addr_bytes[5]);
+
+                /* Calculate uptime */
+                uint64_t now = time(NULL);
+                uint64_t uptime_sec = now - (sess->created_ts / 1000000000ULL);
+                char uptime_str[16];
+                if (uptime_sec < 60) {
+                    snprintf(uptime_str, sizeof(uptime_str), "%lus", (unsigned long)uptime_sec);
+                } else if (uptime_sec < 3600) {
+                    snprintf(uptime_str, sizeof(uptime_str), "%lum", (unsigned long)(uptime_sec / 60));
+                } else {
+                    snprintf(uptime_str, sizeof(uptime_str), "%luh%lum",
+                            (unsigned long)(uptime_sec / 3600), (unsigned long)((uptime_sec % 3600) / 60));
+                }
+
+                const char *state = "ACTIVE";
+
+                vty_out(vty, "%-8u %-18s %-16s %-10s %-12s %-10s\r\n",
+                        sess->session_id,
+                        mac_str,
+                        inet_ntoa(ip),
+                        state,
+                        sess->username[0] ? sess->username : "-",
+                        uptime_str);
+                session_count++;
+            }
+        }
+    }
+
+    if (session_count == 0) {
+        vty_out(vty, "(no active sessions)\r\n");
+    } else {
+        vty_out(vty, "\r\nTotal: %d active session(s)\r\n", session_count);
+    }
 
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;

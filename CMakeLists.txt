@@ -160,11 +160,10 @@ add_subdirectory(src/cli)
 add_subdirectory(src/management)
 add_subdirectory(src/natexport)
 
-# yesrouterctl client tool (DEPRECATED - use vbng_cli instead)
-# add_executable(yesrouterctl src/cli/yesrouterctl.c)
-# if(HAVE_READLINE)
-#     target_link_libraries(yesrouterctl ${READLINE_LIBRARY})
-# endif()
+# yesrouter CLI client tool (named 'yesrouter' for user, daemon is 'yesrouterd')
+add_executable(yesrouter_client src/cli/yesrouter_cli.c)
+set_target_properties(yesrouter_client PROPERTIES OUTPUT_NAME "yesroutercli")
+install(TARGETS yesrouter_client DESTINATION bin)
 
 # Testing
 if(ENABLE_TESTS)

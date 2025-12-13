@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #ifdef HAVE_DPDK
 #include <rte_eal.h>
@@ -15,6 +17,97 @@
 #include <rte_lcore.h>
 #include <rte_errno.h>
 #endif
+
+/**
+ * Bind PCI device to DPDK driver (vfio-pci)
+ * Called before EAL init to ensure NICs are available
+ */
+static int dpdk_bind_device(const char *pci_addr)
+{
+    char path[256];
+    char driver_path[256];
+    FILE *f;
+
+    /* Check if device exists */
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", pci_addr);
+    if (access(path, F_OK) != 0) {
+        fprintf(stderr, "[DPDK] PCI device %s not found\n", pci_addr);
+        return -1;
+    }
+
+    /* Check if already bound to vfio-pci */
+    snprintf(driver_path, sizeof(driver_path), "/sys/bus/pci/devices/%s/driver", pci_addr);
+    char driver_link[256] = {0};
+    ssize_t len = readlink(driver_path, driver_link, sizeof(driver_link) - 1);
+    if (len > 0) {
+        char *drv_name = strrchr(driver_link, '/');
+        if (drv_name && strcmp(drv_name + 1, "vfio-pci") == 0) {
+            printf("[DPDK] %s already bound to vfio-pci\n", pci_addr);
+            return 0;
+        }
+    }
+
+    printf("[DPDK] Binding %s to vfio-pci...\n", pci_addr);
+
+    /* Load vfio-pci module */
+    system("modprobe vfio-pci 2>/dev/null");
+
+    /* Enable no-iommu mode */
+    f = fopen("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "w");
+    if (f) { fprintf(f, "1"); fclose(f); }
+
+    /* Use driver_override (safer method) */
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver_override", pci_addr);
+    f = fopen(path, "w");
+    if (f) { fprintf(f, "vfio-pci"); fclose(f); }
+
+    /* Bind to vfio-pci */
+    f = fopen("/sys/bus/pci/drivers/vfio-pci/bind", "w");
+    if (f) { fprintf(f, "%s", pci_addr); fclose(f); }
+
+    printf("[DPDK] %s bound to vfio-pci\n", pci_addr);
+    return 0;
+}
+
+/**
+ * Auto-bind NICs from env file before EAL init
+ */
+static void dpdk_auto_bind_nics(void)
+{
+    /* Read PCI addresses from env file */
+    FILE *f = fopen("/etc/yesrouter/yesrouter.env", "r");
+    if (!f) return;
+
+    char line[256];
+    int in_pci_block = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Skip comments */
+        if (line[0] == '#') continue;
+
+        /* Check for PCI=( start */
+        if (strstr(line, "PCI=(")) {
+            in_pci_block = 1;
+            continue;
+        }
+
+        /* Check for ) end */
+        if (in_pci_block && strchr(line, ')')) {
+            in_pci_block = 0;
+            continue;
+        }
+
+        /* Parse PCI address */
+        if (in_pci_block) {
+            char pci_addr[32] = {0};
+            /* Extract PCI address (format: "    0000:06:13.0  # comment") */
+            if (sscanf(line, " %31[0-9a-fA-F:.]", pci_addr) == 1 && strlen(pci_addr) > 5) {
+                dpdk_bind_device(pci_addr);
+            }
+        }
+    }
+    fclose(f);
+}
 
 /* Global DPDK configuration */
 struct dpdk_config g_dpdk_config = {
@@ -36,6 +129,9 @@ int dpdk_init(int argc, char *argv[])
         g_dpdk_config.enabled = false;
         return 0;
     }
+
+    /* Auto-bind NICs from env file before EAL init */
+    dpdk_auto_bind_nics();
 
     printf("Initializing DPDK EAL...\n");
 

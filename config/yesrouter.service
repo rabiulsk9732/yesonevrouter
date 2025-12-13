@@ -1,65 +1,92 @@
 [Unit]
-Description=YESRouter vBNG - High Performance Virtual BNG
+Description=YESRouter vBNG - Carrier-Grade Virtual Broadband Network Gateway
 Documentation=https://github.com/yesrouter/yesrouter
-After=network.target network-online.target
+After=network-online.target syslog.target
 Wants=network-online.target
-Before=multi-user.target
+Requires=network.target
 
 [Service]
 Type=simple
 User=root
 Group=root
 
-# Pre-start: cleanup and preparation
-ExecStartPre=/bin/rm -rf /var/run/dpdk/vbng
-ExecStartPre=/bin/mkdir -p /var/run/yesrouter /var/log/yesrouter
+# Pre-start: cleanup stale state and prepare directories
+ExecStartPre=-/bin/rm -rf /var/run/dpdk/vbng
+ExecStartPre=/bin/mkdir -p /run/yesrouter /var/log/yesrouter
+ExecStartPre=-/sbin/modprobe uio_pci_generic
 
-# Main executable with runner script
-ExecStart=/usr/local/bin/yesrouter-runner.sh
+# Main executable - DPDK vBNG daemon
+ExecStart=/root/yesonevrouter/build/yesrouter --daemon
 ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 
-# Restart policy - carrier-grade reliability
+# Restart policy - carrier-grade 99.999% uptime
 Restart=always
-RestartSec=5
-TimeoutStartSec=60
-TimeoutStopSec=30
+RestartSec=3
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStartSec=30
+TimeoutStopSec=5
 
-# Resource limits for DPDK
+# Kill behavior
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+
+# Resource limits for DPDK high-performance packet processing
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
+LimitRTPRIO=99
 TasksMax=infinity
 
-# Memory and CPU
+# Memory management
 MemoryMax=90%
-CPUWeight=1000
+MemoryHigh=80%
+
+# CPU scheduling - real-time priority for packet processing
+Nice=-20
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=99
+CPUAffinity=0-31
+CPUWeight=10000
 
 # Capabilities for DPDK and raw network access
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE
 
-# Security settings (relaxed for DPDK)
+# Security settings (relaxed for DPDK hugepages and NIC access)
 NoNewPrivileges=no
 ProtectSystem=false
 ProtectHome=false
 PrivateTmp=false
+PrivateDevices=false
 
-# Working directory
-WorkingDirectory=/var/lib/yesrouter
+# Working directory and runtime
+WorkingDirectory=/root/yesonevrouter
 RuntimeDirectory=yesrouter
 RuntimeDirectoryMode=0755
+StateDirectory=yesrouter
+LogsDirectory=yesrouter
 
-# Logging - use journald
-StandardOutput=journal
-StandardError=journal
+# Logging - dual output: journald + file for carrier-grade logging
+StandardOutput=append:/var/log/yesrouter.log
+StandardError=append:/var/log/yesrouter.log
 SyslogIdentifier=yesrouter
 SyslogFacility=daemon
 
 # Environment
-Environment="DPDK_DRIVER=uio_pci_generic"
 Environment="HOME=/root"
+Environment="DPDK_DRIVER=vfio-pci"
+Environment="RTE_SDK=/usr/local/share/dpdk"
+EnvironmentFile=-/etc/yesrouter/yesrouter.env
+
+# OOM handling - never kill the router
+OOMScoreAdjust=-1000
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
+Alias=vbng.service

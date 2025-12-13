@@ -147,92 +147,52 @@ int env_config_load(const char *path) {
             if (*vend == '"') *vend = '\0';
         }
 
-        /* DPDK Core Configuration */
-        if (strcmp(key, "DPDK_MAIN_LCORE") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.main_lcore, 0, 127) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_MAIN_LCORE: %s\n", value);
-                errors++;
-            }
+        /* SIMPLIFIED: Core Configuration (Bison-style) */
+        if (strcmp(key, "MAIN_LCORE") == 0 || strcmp(key, "DPDK_MAIN_LCORE") == 0) {
+            parse_int(value, &g_env_config.dpdk.main_lcore, 0, 127);
         }
-        else if (strcmp(key, "DPDK_WORKER_LCORES") == 0) {
-            if (parse_lcores(value, g_env_config.dpdk.worker_lcores,
-                            &g_env_config.dpdk.num_workers) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_WORKER_LCORES: %s\n", value);
-                errors++;
-            }
+        else if (strcmp(key, "WORKER_LCORES") == 0 || strcmp(key, "DPDK_WORKER_LCORES") == 0) {
+            parse_lcores(value, g_env_config.dpdk.worker_lcores,
+                        &g_env_config.dpdk.num_workers);
         }
         else if (strcmp(key, "DPDK_NUMA_NODE") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.numa_node, 0, 7) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_NUMA_NODE: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.numa_node, 0, 7);
         }
-        /* DPDK Memory */
-        else if (strcmp(key, "DPDK_SOCKET_MEM_MB") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.socket_mem_mb, 256, 65536) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_SOCKET_MEM_MB: %s\n", value);
-                errors++;
-            }
+        /* SIMPLIFIED: Memory */
+        else if (strcmp(key, "MEMORY_MB") == 0 || strcmp(key, "DPDK_SOCKET_MEM_MB") == 0) {
+            parse_int(value, &g_env_config.dpdk.socket_mem_mb, 256, 65536);
         }
         else if (strcmp(key, "DPDK_MBUF_COUNT") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.mbuf_count, 8192, 16777216) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_MBUF_COUNT: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.mbuf_count, 8192, 16777216);
         }
         else if (strcmp(key, "DPDK_MBUF_CACHE_SIZE") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.mbuf_cache_size, 0, 1024) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_MBUF_CACHE_SIZE: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.mbuf_cache_size, 0, 1024);
         }
         else if (strcmp(key, "DPDK_HUGEPAGES") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.hugepages, 64, 65536) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_HUGEPAGES: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.hugepages, 64, 65536);
         }
         /* NIC Configuration */
         else if (strcmp(key, "DPDK_PORTS") == 0) {
-            if (parse_ports(value, g_env_config.dpdk.ports,
-                           &g_env_config.dpdk.num_ports) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_PORTS: %s\n", value);
-                errors++;
-            }
+            parse_ports(value, g_env_config.dpdk.ports, &g_env_config.dpdk.num_ports);
         }
         else if (strcmp(key, "DPDK_DRIVER") == 0) {
             strncpy(g_env_config.dpdk.driver, value, 63);
         }
         else if (strcmp(key, "DPDK_PORT_MTU") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.port_mtu, 64, 9216) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_PORT_MTU: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.port_mtu, 64, 9216);
         }
-        /* Queue Configuration */
-        else if (strcmp(key, "DPDK_RX_QUEUES") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.rx_queues, 1, 64) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_RX_QUEUES: %s\n", value);
-                errors++;
-            }
+        /* SIMPLIFIED: Queue Configuration */
+        else if (strcmp(key, "RX_QUEUES") == 0 || strcmp(key, "DPDK_RX_QUEUES") == 0) {
+            parse_int(value, &g_env_config.dpdk.rx_queues, 1, 64);
         }
-        else if (strcmp(key, "DPDK_TX_QUEUES") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.tx_queues, 1, 64) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_TX_QUEUES: %s\n", value);
-                errors++;
-            }
+        else if (strcmp(key, "TX_QUEUES") == 0 || strcmp(key, "DPDK_TX_QUEUES") == 0) {
+            parse_int(value, &g_env_config.dpdk.tx_queues, 1, 64);
         }
         else if (strcmp(key, "DPDK_RX_DESC") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.rx_desc, 64, 8192) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_RX_DESC: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.rx_desc, 64, 8192);
         }
         else if (strcmp(key, "DPDK_TX_DESC") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.tx_desc, 64, 8192) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_TX_DESC: %s\n", value);
-                errors++;
-            }
+            parse_int(value, &g_env_config.dpdk.tx_desc, 64, 8192);
         }
         /* Burst Sizes */
         else if (strcmp(key, "DPDK_RX_BURST_SIZE") == 0) {
@@ -292,38 +252,46 @@ int env_config_load(const char *path) {
                 errors++;
             }
         }
-        /* Logging */
+        /* Logging - accept string or int */
         else if (strcmp(key, "LOG_LEVEL") == 0) {
-            if (parse_int(value, &g_env_config.log.level, 0, 7) != 0) {
-                fprintf(stderr, "ERROR: Invalid LOG_LEVEL: %s\n", value);
-                errors++;
-            }
+            if (strcmp(value, "debug") == 0) g_env_config.log.level = 7;
+            else if (strcmp(value, "info") == 0) g_env_config.log.level = 6;
+            else if (strcmp(value, "warn") == 0) g_env_config.log.level = 4;
+            else if (strcmp(value, "error") == 0) g_env_config.log.level = 3;
+            else parse_int(value, &g_env_config.log.level, 0, 7);
         }
     }
 
     fclose(f);
 
-    /* Validation: Check required fields */
+    /* Apply defaults for missing values (Bison-style - minimal config) */
     if (g_env_config.dpdk.num_workers == 0) {
-        fprintf(stderr, "ERROR: DPDK_WORKER_LCORES not specified\n");
-        errors++;
-    }
-    if (g_env_config.dpdk.num_ports == 0) {
-        fprintf(stderr, "ERROR: DPDK_PORTS not specified\n");
-        errors++;
+        g_env_config.dpdk.num_workers = 1;
+        g_env_config.dpdk.worker_lcores[0] = 1;
     }
     if (g_env_config.dpdk.rx_queues == 0) {
-        fprintf(stderr, "ERROR: DPDK_RX_QUEUES not specified\n");
-        errors++;
+        g_env_config.dpdk.rx_queues = 1;
+    }
+    if (g_env_config.dpdk.tx_queues == 0) {
+        g_env_config.dpdk.tx_queues = 1;
     }
     if (g_env_config.dpdk.rx_burst_size == 0) {
-        fprintf(stderr, "ERROR: DPDK_RX_BURST_SIZE not specified\n");
-        errors++;
+        g_env_config.dpdk.rx_burst_size = 128;
     }
-
-    if (errors > 0) {
-        fprintf(stderr, "FATAL: %d configuration errors, cannot start\n", errors);
-        return -1;
+    if (g_env_config.dpdk.tx_burst_size == 0) {
+        g_env_config.dpdk.tx_burst_size = 128;
+    }
+    if (g_env_config.dpdk.rx_desc == 0) {
+        g_env_config.dpdk.rx_desc = 2048;
+    }
+    if (g_env_config.dpdk.tx_desc == 0) {
+        g_env_config.dpdk.tx_desc = 2048;
+    }
+    if (g_env_config.dpdk.mbuf_count == 0) {
+        g_env_config.dpdk.mbuf_count = 262144;
+    }
+    if (g_env_config.dpdk.socket_mem_mb == 0) {
+        g_env_config.dpdk.socket_mem_mb = 2048;
     }
 
     g_env_config.validated = true;

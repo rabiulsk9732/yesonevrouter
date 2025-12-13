@@ -10,6 +10,7 @@ set(CLI_SOURCES
     cli_radius.c
     cli_ippool.c
     cli_route.c
+    cli_nat.c
 )
 
 add_library(yesrouter_cli STATIC ${CLI_SOURCES})

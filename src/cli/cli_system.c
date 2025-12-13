@@ -9,9 +9,12 @@
 #include <time.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
+#include <arpa/inet.h>
 
 #include "command.h"
 #include "vty.h"
+#include "interface.h"
+#include "nat.h"
 
 /* ============================================================================
  * Show Commands
@@ -23,13 +26,61 @@ DEFUN(cmd_show_running_config,
       SHOW_STR
       "Current operating configuration\n")
 {
+    extern uint32_t g_default_gateway;
+    extern struct nat_config g_nat_config;
+
     vty_out(vty, "!\r\n");
     vty_out(vty, "! YESRouter Running Configuration\r\n");
     vty_out(vty, "! Generated: %s", ctime(&(time_t){time(NULL)}));
     vty_out(vty, "!\r\n");
     vty_out(vty, "hostname %s\r\n", g_hostname);
     vty_out(vty, "!\r\n");
-    /* TODO: Dump actual running config */
+
+    /* Interfaces */
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (!iface) continue;
+
+        vty_out(vty, "interface %s\r\n", iface->name);
+        if (iface->config.ipv4_addr.s_addr) {
+            vty_out(vty, " ip address %s ", inet_ntoa(iface->config.ipv4_addr));
+            vty_out(vty, "%s\r\n", inet_ntoa(iface->config.ipv4_mask));
+        }
+        if (iface->config.nat_inside)
+            vty_out(vty, " ip nat inside\r\n");
+        if (iface->config.nat_outside)
+            vty_out(vty, " ip nat outside\r\n");
+        if (iface->state == IF_STATE_ADMIN_DOWN)
+            vty_out(vty, " shutdown\r\n");
+        vty_out(vty, "!\r\n");
+    }
+
+    /* NAT configuration */
+    if (g_nat_config.enabled) {
+        vty_out(vty, "ip nat inside source list 1 pool CGNAT overload\r\n");
+        for (int j = 0; j < g_nat_config.num_pools; j++) {
+            struct nat_pool *pool = &g_nat_config.pools[j];
+            if (pool->start_ip) {
+                struct in_addr start, end;
+                start.s_addr = htonl(pool->start_ip);
+                end.s_addr = htonl(pool->end_ip);
+                vty_out(vty, "ip nat pool %s %s ",
+                        pool->name[0] ? pool->name : "CGNAT",
+                        inet_ntoa(start));
+                vty_out(vty, "%s netmask 255.255.255.255\r\n", inet_ntoa(end));
+            }
+        }
+        vty_out(vty, "!\r\n");
+    }
+
+    /* Default route */
+    if (g_default_gateway) {
+        struct in_addr gw;
+        gw.s_addr = htonl(g_default_gateway);
+        vty_out(vty, "ip route 0.0.0.0 0.0.0.0 %s\r\n", inet_ntoa(gw));
+        vty_out(vty, "!\r\n");
+    }
+
     vty_out(vty, "end\r\n");
     return CMD_SUCCESS;
 }
@@ -205,8 +256,81 @@ DEFUN(cmd_write_memory,
       "Write running configuration to memory\n"
       "Write to NVRAM\n")
 {
+    FILE *f = fopen("/etc/yesrouter/startup.json", "w");
+    if (!f) {
+        vty_out(vty, "%% Failed to open startup.json for writing\r\n");
+        return CMD_SUCCESS;
+    }
+
     vty_out(vty, "Building configuration...\r\n");
-    /* TODO: Save config to startup.json */
+
+    /* Write JSON config from running state */
+    fprintf(f, "{\n");
+    fprintf(f, "  \"_comment\": \"YESRouter Cisco-Style CLI Configuration (Runtime)\",\n");
+
+    /* Interfaces */
+    fprintf(f, "  \"interfaces\": {\n");
+    extern struct interface_manager g_if_mgr;
+    int iface_count = 0;
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (!iface) continue;
+
+        if (iface_count > 0) fprintf(f, ",\n");
+        fprintf(f, "    \"%s\": {\n", iface->name);
+        if (iface->config.ipv4_addr.s_addr) {
+            fprintf(f, "      \"ipv4_address\": \"%s\",\n", inet_ntoa(iface->config.ipv4_addr));
+            fprintf(f, "      \"ipv4_mask\": \"%s\",\n", inet_ntoa(iface->config.ipv4_mask));
+        }
+        fprintf(f, "      \"nat_inside\": %s,\n", iface->config.nat_inside ? "true" : "false");
+        fprintf(f, "      \"nat_outside\": %s\n", iface->config.nat_outside ? "true" : "false");
+        fprintf(f, "    }");
+        iface_count++;
+    }
+    fprintf(f, "\n  },\n");
+
+    /* NAT config */
+    extern struct nat_config g_nat_config;
+    fprintf(f, "  \"nat44\": {\n");
+    fprintf(f, "    \"enabled\": %s,\n", g_nat_config.enabled ? "true" : "false");
+    fprintf(f, "    \"hairpin\": %s,\n", g_nat_config.hairpinning_enabled ? "true" : "false");
+    fprintf(f, "    \"pools\": [\n");
+    for (int i = 0; i < g_nat_config.num_pools; i++) {
+        struct nat_pool *pool = &g_nat_config.pools[i];
+        if (!pool->active && pool->start_ip == 0) continue;
+
+        struct in_addr start, end;
+        start.s_addr = htonl(pool->start_ip);
+        end.s_addr = htonl(pool->end_ip);
+
+        if (i > 0) fprintf(f, ",\n");
+        fprintf(f, "      {\n");
+        fprintf(f, "        \"name\": \"%s\",\n", pool->name);
+        fprintf(f, "        \"start_ip\": \"%s\",\n", inet_ntoa(start));
+        fprintf(f, "        \"end_ip\": \"%s\"\n", inet_ntoa(end));
+        fprintf(f, "      }");
+    }
+    fprintf(f, "\n    ]\n");
+    fprintf(f, "  },\n");
+
+    /* Routing - default gateway */
+    extern uint32_t g_default_gateway;
+    fprintf(f, "  \"routing\": {\n");
+    fprintf(f, "    \"static_routes\": [\n");
+    if (g_default_gateway) {
+        struct in_addr gw;
+        gw.s_addr = htonl(g_default_gateway);
+        fprintf(f, "      {\n");
+        fprintf(f, "        \"prefix\": \"0.0.0.0/0\",\n");
+        fprintf(f, "        \"next_hop\": \"%s\"\n", inet_ntoa(gw));
+        fprintf(f, "      }\n");
+    }
+    fprintf(f, "    ]\n");
+    fprintf(f, "  }\n");
+
+    fprintf(f, "}\n");
+    fclose(f);
+
     vty_out(vty, "[OK]\r\n");
     return CMD_SUCCESS;
 }
@@ -344,8 +468,11 @@ DEFUN(cmd_terminal_width,
 
 void cli_system_init(void)
 {
+    printf("[CLI] cli_system_init: Registering system commands\n");
+
     /* View mode */
     install_element(VIEW_NODE, &cmd_show_clock_cmd);
+    printf("[CLI] Registered: show clock\n");
     install_element(VIEW_NODE, &cmd_show_uptime_cmd);
     install_element(VIEW_NODE, &cmd_show_memory_cmd);
     install_element(VIEW_NODE, &cmd_show_cpu_cmd);

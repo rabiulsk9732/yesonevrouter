@@ -124,16 +124,53 @@ static int cmd_match_word(const char *cmd_word, const char *input)
 }
 
 /**
+ * Check if a command token is a keyword (not a variable like WORD, A.B.C.D, etc)
+ */
+static int is_keyword_token(const char *token)
+{
+    if (!token || !*token)
+        return 0;
+    /* Variable tokens: WORD, LINE, A.B.C.D, <range>, [optional] */
+    if (strcmp(token, "WORD") == 0 || strcmp(token, "LINE") == 0)
+        return 0;
+    if (strcmp(token, "A.B.C.D") == 0 || strcmp(token, "A.B.C.D/M") == 0)
+        return 0;
+    if (token[0] == '<' || token[0] == '[')
+        return 0;
+    /* All uppercase words are usually variables */
+    int all_upper = 1;
+    for (const char *p = token; *p; p++) {
+        if (*p >= 'a' && *p <= 'z') {
+            all_upper = 0;
+            break;
+        }
+    }
+    if (all_upper && strlen(token) > 1)
+        return 0;
+    return 1;
+}
+
+/**
  * Find matching command
+ * Priority: 1) Exact token count match, 2) More keyword matches, 3) More total matches
  */
 static struct cmd_element *cmd_find_match(struct cmd_node *node, int argc,
                                           const char *argv[], int *match_argc)
 {
     struct cmd_element *best_match = NULL;
     int best_match_count = 0;
+    int best_keyword_count = 0;
+    int best_exact = 0;
 
     if (!node || !node->cmds)
         return NULL;
+
+    /* CRITICAL: Copy argv values to local storage because cmd_parse_line uses static buffer */
+    char argv_copy[CMD_MAX_ARGC][128];
+    for (int i = 0; i < argc && i < CMD_MAX_ARGC; i++) {
+        strncpy(argv_copy[i], argv[i], 127);
+        argv_copy[i][127] = '\0';
+    }
 
     for (int i = 0; i < node->cmd_count; i++) {
         struct cmd_element *cmd = node->cmds[i];
@@ -143,24 +180,48 @@ static struct cmd_element *cmd_find_match(struct cmd_node *node, int argc,
         /* Parse command string */
         cmd_argc = cmd_parse_line(cmd->string, cmd_argv, CMD_MAX_ARGC);
 
-        /* Try to match */
+        /* Try to match all input tokens against command tokens */
         int matched = 0;
-        int j;
-        for (j = 0; j < argc && j < cmd_argc; j++) {
-            int m = cmd_match_word(cmd_argv[j], argv[j]);
+        int keyword_matches = 0;
+        for (int j = 0; j < argc && j < cmd_argc; j++) {
+            int m = cmd_match_word(cmd_argv[j], argv_copy[j]);
             if (m == 0)
                 break;
             matched++;
+            /* Count keyword matches (non-variable matches) */
+            if (is_keyword_token(cmd_argv[j])) {
+                keyword_matches++;
+            }
         }
 
-        /* Check if this is a better match */
-        if (matched > best_match_count) {
-            /* Must match all input tokens */
-            if (matched == argc) {
-                best_match = cmd;
-                best_match_count = matched;
-                *match_argc = matched;
+        /* Must match all input tokens */
+        if (matched != argc)
+            continue;
+
+        /* Check if command length matches (exact) or has more tokens (partial) */
+        int is_exact = (argc == cmd_argc);
+
+        /* Scoring: prefer exact > more keywords > more matches */
+        int is_better = 0;
+        if (best_match == NULL) {
+            is_better = 1;
+        } else if (is_exact && !best_exact) {
+            is_better = 1;
+        } else if (is_exact == best_exact) {
+            /* Same exactness - prefer more keyword matches */
+            if (keyword_matches > best_keyword_count) {
+                is_better = 1;
+            } else if (keyword_matches == best_keyword_count && matched > best_match_count) {
+                is_better = 1;
             }
+        }
+
+        if (is_better) {
+            best_match = cmd;
+            best_match_count = matched;
+            best_keyword_count = keyword_matches;
+            best_exact = is_exact;
+            *match_argc = matched;
         }
     }
 
@@ -221,13 +282,58 @@ int cmd_execute(struct vty *vty, const char *line)
 }
 
 /**
- * Describe available commands (for ? help)
+ * Get the Nth help string from a multi-line doc string
+ * Returns pointer to static buffer
+ */
+static const char *get_token_help(const char *doc, int token_idx)
+{
+    static char help_buf[256];
+    const char *p = doc;
+    int idx = 0;
+
+    if (!doc)
+        return "";
+
+    /* Skip to the Nth line (each token's help is on a separate line) */
+    while (p && *p && idx < token_idx) {
+        p = strchr(p, '\n');
+        if (p) p++;
+        idx++;
+    }
+
+    if (!p || !*p)
+        return "";
+
+    /* Copy until newline or end */
+    int i = 0;
+    while (*p && *p != '\n' && i < (int)sizeof(help_buf) - 1) {
+        help_buf[i++] = *p++;
+    }
+    help_buf[i] = '\0';
+
+    return help_buf;
+}
+
+/**
+ * Describe available commands (for ? help) - Cisco IOS style
+ * 
+ * Key behavior:
+ * - "sho?" shows tokens that START WITH "sho" (i.e., "show")
+ * - "show ?" shows tokens that come AFTER "show"
  */
 void cmd_describe(struct vty *vty, const char *line)
 {
     char *argv[CMD_MAX_ARGC];
     int argc;
     struct cmd_node *node;
+    
+    /* Track unique tokens */
+    struct {
+        char token[64];
+        char help[128];
+    } tokens[128];
+    int token_count = 0;
+    int has_cr = 0;
 
     argc = cmd_parse_line(line, argv, CMD_MAX_ARGC);
     node = cmd_nodes[vty->node];
@@ -237,8 +343,27 @@ void cmd_describe(struct vty *vty, const char *line)
         return;
     }
 
-    vty_out(vty, "\r\n");
+    /* Determine if we're completing a partial word or starting a new one */
+    int line_len = line ? strlen(line) : 0;
+    int completing_new_word = (line_len == 0) || 
+                              (line[line_len - 1] == ' ') || 
+                              (line[line_len - 1] == '\t');
+    
+    char partial[128] = "";  /* Local buffer - cmd_parse_line uses static buffer! */
+    int partial_len = 0;
+    int match_argc = argc;  /* Number of COMPLETE tokens to match exactly */
+    
+    if (!completing_new_word && argc > 0) {
+        /* Last word is partial - we want to show what matches it */
+        /* CRITICAL: Copy to local buffer because cmd_parse_line uses static buffer */
+        strncpy(partial, argv[argc - 1], sizeof(partial) - 1);
+        partial[sizeof(partial) - 1] = '\0';
+        partial_len = strlen(partial);
+        match_argc = argc - 1;
+    }
+    
 
+    /* Collect matching completions */
     for (int i = 0; i < node->cmd_count; i++) {
         struct cmd_element *cmd = node->cmds[i];
         char *cmd_argv[CMD_MAX_ARGC];
@@ -249,24 +374,78 @@ void cmd_describe(struct vty *vty, const char *line)
 
         cmd_argc = cmd_parse_line(cmd->string, cmd_argv, CMD_MAX_ARGC);
 
-        /* Check if command matches current input */
+        /* Check if all COMPLETE tokens match exactly */
         int matched = 1;
-        for (int j = 0; j < argc && j < cmd_argc; j++) {
-            if (cmd_match_word(cmd_argv[j], argv[j]) == 0) {
+        for (int j = 0; j < match_argc && j < cmd_argc; j++) {
+            int m = cmd_match_word(cmd_argv[j], argv[j]);
+            if (m == 0) {
                 matched = 0;
                 break;
             }
         }
 
-        if (matched) {
-            /* Show next possible token */
-            if (argc < cmd_argc) {
-                vty_out(vty, "  %-20s %s\r\n", cmd_argv[argc],
-                        cmd->doc ? cmd->doc : "");
-            } else if (argc == cmd_argc) {
-                vty_out(vty, "  <cr>\r\n");
+        if (!matched)
+            continue;
+        
+        /* Need at least as many tokens */
+        if (match_argc > cmd_argc)
+            continue;
+
+        /* Get the token at position match_argc */
+        if (match_argc < cmd_argc) {
+            const char *next_token = cmd_argv[match_argc];
+            
+            /* Check if it matches partial (prefix match) */
+            if (partial_len == 0 || strncasecmp(next_token, partial, partial_len) == 0) {
+                const char *help = get_token_help(cmd->doc, match_argc);
+
+                /* Check if already seen */
+                int found = 0;
+                for (int k = 0; k < token_count; k++) {
+                    if (strcasecmp(tokens[k].token, next_token) == 0) {
+                        found = 1;
+                        break;
+                    }
+                }
+
+                if (!found && token_count < 128) {
+                    strncpy(tokens[token_count].token, next_token, 63);
+                    tokens[token_count].token[63] = '\0';
+                    strncpy(tokens[token_count].help, help, 127);
+                    tokens[token_count].help[127] = '\0';
+                    token_count++;
+                }
+            }
+        } else if (match_argc == cmd_argc && partial_len == 0) {
+            /* Command is complete and no partial - can execute */
+            has_cr = 1;
+        }
+    }
+
+    /* Sort tokens alphabetically */
+    for (int i = 0; i < token_count - 1; i++) {
+        for (int j = i + 1; j < token_count; j++) {
+            if (strcasecmp(tokens[i].token, tokens[j].token) > 0) {
+                char tmp_tok[64], tmp_help[128];
+                strcpy(tmp_tok, tokens[i].token);
+                strcpy(tmp_help, tokens[i].help);
+                strcpy(tokens[i].token, tokens[j].token);
+                strcpy(tokens[i].help, tokens[j].help);
+                strcpy(tokens[j].token, tmp_tok);
+                strcpy(tokens[j].help, tmp_help);
             }
         }
+    }
+
+    /* Output */
+    vty_out(vty, "\r\n");
+
+    if (has_cr) {
+        vty_out(vty, "  <cr>\r\n");
+    }
+
+    for (int i = 0; i < token_count; i++) {
+        vty_out(vty, "  %-18s  %s\r\n", tokens[i].token, tokens[i].help);
     }
 }
 
@@ -514,4 +693,120 @@ void cmd_terminate(void)
             cmd_nodes[i]->cmd_alloc = 0;
         }
     }
+}
+
+/**
+ * Complete command (for tab completion) - Cisco IOS style
+ * Returns array of possible completions
+ */
+char **cmd_complete(struct vty *vty, const char *line, int *count)
+{
+    char *argv[CMD_MAX_ARGC];
+    int argc;
+    struct cmd_node *node;
+    char **completions = NULL;
+    int num_completions = 0;
+    int alloc_size = 32;
+    
+    /* Parse the input line */
+    char line_copy[1024];
+    strncpy(line_copy, line ? line : "", sizeof(line_copy) - 1);
+    line_copy[sizeof(line_copy) - 1] = '\0';
+    
+    argc = cmd_parse_line(line_copy, argv, CMD_MAX_ARGC);
+    node = cmd_nodes[vty->node];
+
+    if (!node || !node->cmds) {
+        *count = 0;
+        return NULL;
+    }
+
+    completions = malloc(alloc_size * sizeof(char *));
+    if (!completions) {
+        *count = 0;
+        return NULL;
+    }
+
+    /* Determine if we're completing a partial word or starting a new one */
+    char partial[128] = "";  /* Local buffer - cmd_parse_line uses static buffer! */
+    int partial_len = 0;
+    int match_argc = argc;  /* Number of complete tokens to match */
+    
+    /* Check if line ends with space (completing new word) */
+    int line_len = line ? strlen(line) : 0;
+    int completing_new_word = (line_len == 0) || 
+                              (line[line_len - 1] == ' ') || 
+                              (line[line_len - 1] == '\t');
+    
+    if (!completing_new_word && argc > 0) {
+        /* User is typing a partial word - match it */
+        strncpy(partial, argv[argc - 1], sizeof(partial) - 1);
+        partial[sizeof(partial) - 1] = '\0';
+        partial_len = strlen(partial);
+        match_argc = argc - 1;  /* Don't match the partial as complete */
+    }
+
+    /* Collect matching completions */
+    for (int i = 0; i < node->cmd_count; i++) {
+        struct cmd_element *cmd = node->cmds[i];
+        char *cmd_argv[CMD_MAX_ARGC];
+        int cmd_argc;
+
+        if (cmd->hidden)
+            continue;
+
+        cmd_argc = cmd_parse_line(cmd->string, cmd_argv, CMD_MAX_ARGC);
+
+        /* Check if command matches all complete tokens */
+        int matched = 1;
+        for (int j = 0; j < match_argc && j < cmd_argc; j++) {
+            if (cmd_match_word(cmd_argv[j], argv[j]) == 0) {
+                matched = 0;
+                break;
+            }
+        }
+
+        if (!matched)
+            continue;
+
+        /* Also need enough tokens in command */
+        if (match_argc > cmd_argc)
+            continue;
+
+        /* Get the next token to complete */
+        if (match_argc < cmd_argc) {
+            const char *next_token = cmd_argv[match_argc];
+            
+            /* Check if it matches partial (case-insensitive prefix match) */
+            if (partial_len == 0 || strncasecmp(next_token, partial, partial_len) == 0) {
+                /* Check if we already have this completion */
+                int found = 0;
+                for (int k = 0; k < num_completions; k++) {
+                    if (strcasecmp(completions[k], next_token) == 0) {
+                        found = 1;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    if (num_completions >= alloc_size) {
+                        alloc_size *= 2;
+                        char **new_completions = realloc(completions, alloc_size * sizeof(char *));
+                        if (!new_completions) {
+                            for (int k = 0; k < num_completions; k++)
+                                free(completions[k]);
+                            free(completions);
+                            *count = 0;
+                            return NULL;
+                        }
+                        completions = new_completions;
+                    }
+                    completions[num_completions++] = strdup(next_token);
+                }
+            }
+        }
+    }
+
+    *count = num_completions;
+    return completions;
 }

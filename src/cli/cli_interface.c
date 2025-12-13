@@ -6,13 +6,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "command.h"
 #include "vty.h"
+#include "interface.h"
 
 /* ============================================================================
  * Show Commands
  * ============================================================================ */
+
+/* Helper: Convert mask to CIDR */
+static int mask_to_cidr(struct in_addr mask)
+{
+    uint32_t m = ntohl(mask.s_addr);
+    int bits = 0;
+    while (m & 0x80000000) {
+        bits++;
+        m <<= 1;
+    }
+    return bits;
+}
 
 DEFUN(cmd_show_interfaces,
       cmd_show_interfaces_cmd,
@@ -25,15 +39,34 @@ DEFUN(cmd_show_interfaces,
     vty_out(vty, "================\r\n");
     vty_out(vty, "\r\n");
 
-    /* TODO: Get interface list from interface module */
-    vty_out(vty, "GigabitEthernet0/0 is up, line protocol is up\r\n");
-    vty_out(vty, "  Hardware is DPDK virtio, address is 00:00:00:00:00:01\r\n");
-    vty_out(vty, "  Internet address is 192.168.1.1/24\r\n");
-    vty_out(vty, "\r\n");
-    vty_out(vty, "GigabitEthernet0/1 is up, line protocol is up\r\n");
-    vty_out(vty, "  Hardware is DPDK virtio, address is 00:00:00:00:00:02\r\n");
-    vty_out(vty, "  PPPoE enabled\r\n");
-    vty_out(vty, "\r\n");
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (!iface) continue;
+
+        const char *state = (iface->state == IF_STATE_UP) ? "up" : "down";
+        const char *link = (iface->link == LINK_STATE_UP) ? "up" : "down";
+
+        vty_out(vty, "%s is %s, line protocol is %s\r\n", iface->name, state, link);
+        vty_out(vty, "  Hardware is %s, address is %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                interface_type_to_str(iface->type),
+                iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
+                iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5]);
+
+        if (iface->config.ipv4_addr.s_addr) {
+            int prefix = mask_to_cidr(iface->config.ipv4_mask);
+            vty_out(vty, "  Internet address is %s/%d\r\n",
+                    inet_ntoa(iface->config.ipv4_addr), prefix);
+        } else {
+            vty_out(vty, "  Internet address is unassigned\r\n");
+        }
+
+        vty_out(vty, "  MTU %u bytes\r\n", iface->config.mtu ? iface->config.mtu : 1500);
+        if (iface->config.nat_inside)
+            vty_out(vty, "  NAT inside\r\n");
+        if (iface->config.nat_outside)
+            vty_out(vty, "  NAT outside\r\n");
+        vty_out(vty, "\r\n");
+    }
 
     return CMD_SUCCESS;
 }
@@ -51,11 +84,23 @@ DEFUN(cmd_show_interfaces_brief,
     vty_out(vty, "%-24s %-16s %-10s %-10s\r\n",
             "-----------------------", "---------------", "---------", "---------");
 
-    /* TODO: Get interface list from interface module */
-    vty_out(vty, "%-24s %-16s %-10s %-10s\r\n",
-            "GigabitEthernet0/0", "192.168.1.1", "up", "up");
-    vty_out(vty, "%-24s %-16s %-10s %-10s\r\n",
-            "GigabitEthernet0/1", "unassigned", "up", "up");
+    for (uint32_t i = 0; i < g_if_mgr.num_interfaces; i++) {
+        struct interface *iface = g_if_mgr.interfaces[i];
+        if (!iface) continue;
+
+        char ip_str[32];
+        if (iface->config.ipv4_addr.s_addr) {
+            snprintf(ip_str, sizeof(ip_str), "%s", inet_ntoa(iface->config.ipv4_addr));
+        } else {
+            snprintf(ip_str, sizeof(ip_str), "unassigned");
+        }
+
+        const char *state = (iface->state == IF_STATE_UP) ? "up" : "down";
+        const char *link = (iface->link == LINK_STATE_UP) ? "up" : "down";
+
+        vty_out(vty, "%-24s %-16s %-10s %-10s\r\n",
+                iface->name, ip_str, state, link);
+    }
 
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;
@@ -74,15 +119,40 @@ DEFUN(cmd_show_interface,
     }
 
     const char *ifname = argv[2];
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    const char *state = (iface->state == IF_STATE_UP) ? "up" : "down";
+    const char *link = (iface->link == LINK_STATE_UP) ? "up" : "down";
 
     vty_out(vty, "\r\n");
-    vty_out(vty, "%s is up, line protocol is up\r\n", ifname);
-    vty_out(vty, "  Hardware is DPDK virtio\r\n");
-    vty_out(vty, "  Description: \r\n");
-    vty_out(vty, "  Internet address is unassigned\r\n");
-    vty_out(vty, "  MTU 1500 bytes\r\n");
-    vty_out(vty, "  Input packets: 0, bytes: 0\r\n");
-    vty_out(vty, "  Output packets: 0, bytes: 0\r\n");
+    vty_out(vty, "%s is %s, line protocol is %s\r\n", iface->name, state, link);
+    vty_out(vty, "  Hardware is %s\r\n", interface_type_to_str(iface->type));
+    vty_out(vty, "  MAC address: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+            iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
+            iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5]);
+
+    if (iface->config.ipv4_addr.s_addr) {
+        int prefix = mask_to_cidr(iface->config.ipv4_mask);
+        vty_out(vty, "  Internet address is %s/%d\r\n",
+                inet_ntoa(iface->config.ipv4_addr), prefix);
+    } else {
+        vty_out(vty, "  Internet address is unassigned\r\n");
+    }
+
+    vty_out(vty, "  MTU %u bytes\r\n", iface->config.mtu ? iface->config.mtu : 1500);
+    vty_out(vty, "  Input packets: %lu, bytes: %lu\r\n",
+            iface->stats.rx_packets, iface->stats.rx_bytes);
+    vty_out(vty, "  Output packets: %lu, bytes: %lu\r\n",
+            iface->stats.tx_packets, iface->stats.tx_bytes);
+    if (iface->config.nat_inside)
+        vty_out(vty, "  NAT inside\r\n");
+    if (iface->config.nat_outside)
+        vty_out(vty, "  NAT outside\r\n");
     vty_out(vty, "\r\n");
 
     return CMD_SUCCESS;
@@ -138,8 +208,29 @@ DEFUN(cmd_if_ip_address,
         return CMD_ERR_INCOMPLETE;
     }
 
-    vty_out(vty, "IP address %s %s set on %s\r\n", argv[2], argv[3], vty->context);
-    /* TODO: Set IP address on interface */
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    struct in_addr addr, mask;
+    if (inet_pton(AF_INET, argv[2], &addr) != 1) {
+        vty_out(vty, "%% Invalid IP address: %s\r\n", argv[2]);
+        return CMD_ERR_INCOMPLETE;
+    }
+    if (inet_pton(AF_INET, argv[3], &mask) != 1) {
+        vty_out(vty, "%% Invalid subnet mask: %s\r\n", argv[3]);
+        return CMD_ERR_INCOMPLETE;
+    }
+
+    /* Apply to running config */
+    iface->config.ipv4_addr = addr;
+    iface->config.ipv4_mask = mask;
+
+    vty_out(vty, "IP address %s %s configured on %s\r\n", argv[2], argv[3], ifname);
     return CMD_SUCCESS;
 }
 
@@ -150,8 +241,18 @@ DEFUN(cmd_if_no_ip_address,
       "IP configuration\n"
       "Remove IP address\n")
 {
-    vty_out(vty, "IP address removed from %s\r\n", vty->context);
-    /* TODO: Remove IP address from interface */
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->config.ipv4_addr.s_addr = 0;
+    iface->config.ipv4_mask.s_addr = 0;
+
+    vty_out(vty, "IP address removed from %s\r\n", ifname);
     return CMD_SUCCESS;
 }
 
@@ -160,8 +261,17 @@ DEFUN(cmd_if_shutdown,
       "shutdown",
       "Shutdown the interface\n")
 {
-    vty_out(vty, "Interface %s shutdown\r\n", vty->context);
-    /* TODO: Shutdown interface */
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->state = IF_STATE_ADMIN_DOWN;
+
+    vty_out(vty, "Interface %s administratively down\r\n", ifname);
     return CMD_SUCCESS;
 }
 
@@ -171,8 +281,17 @@ DEFUN(cmd_if_no_shutdown,
       NO_STR
       "Bring up the interface\n")
 {
-    vty_out(vty, "Interface %s enabled\r\n", vty->context);
-    /* TODO: Enable interface */
+    const char *ifname = vty->context;
+    struct interface *iface = interface_find_by_name(ifname);
+
+    if (!iface) {
+        vty_out(vty, "%% Interface %s not found\r\n", ifname);
+        return CMD_ERR_NO_MATCH;
+    }
+
+    iface->state = IF_STATE_UP;
+
+    vty_out(vty, "Interface %s enabled\r\n", ifname);
     return CMD_SUCCESS;
 }
 
