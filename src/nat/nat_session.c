@@ -645,9 +645,16 @@ struct nat_session *nat_session_create_lockless(uint32_t worker_id,
     if (g_nat_config.hairpinning_enabled)
         session->flags |= NAT_SESSION_FLAG_HAIRPIN;
 
-    /* Calculate hashes */
-    hash_inside = nat_hash_inside(inside_ip, inside_port, protocol);
-    hash_outside = nat_hash_outside(outside_ip, outside_port, protocol);
+    /* Calculate hashes - MUST MATCH lockless lookup hash! */
+    hash_inside = inside_ip ^ ((uint32_t)inside_port << 16) ^ protocol;
+    hash_inside ^= hash_inside >> 16;
+    hash_inside *= 0x85ebca6b;
+    hash_inside ^= hash_inside >> 13;
+
+    hash_outside = outside_ip ^ ((uint32_t)outside_port << 16) ^ protocol;
+    hash_outside ^= hash_outside >> 16;
+    hash_outside *= 0x85ebca6b;
+    hash_outside ^= hash_outside >> 13;
 
     /* Insert into per-worker tables ONLY (no global locks!) */
     nat_hash_insert(worker, worker->in2out_hash, hash_inside, session->session_index);
@@ -739,50 +746,45 @@ static inline void nat_hash_delete(struct nat_worker_data *worker, struct nat_ha
 }
 
 /**
- * PURE LOCKLESS session lookup - never falls back to global locks
- * Use when RSS guarantees flow affinity to current worker
- * Returns NULL if not found in worker's table (no global fallback)
+ * VPP-STYLE ULTRA-FAST session lookup - ZERO overhead
+ * - No timestamp update (done by timeout thread)
+ * - No atomic counters (stats collected separately)
+ * - No global fallback (RSS guarantees flow affinity)
+ * - Minimal branches
  */
 struct nat_session *nat_session_lookup_lockless(uint32_t inside_ip, uint16_t inside_port,
                                                 uint8_t protocol, uint32_t worker_id)
 {
-    if (worker_id >= NAT_MAX_WORKERS) return NULL;
+    if (unlikely(worker_id >= NAT_MAX_WORKERS)) return NULL;
 
     struct nat_worker_data *worker = &g_nat_workers[worker_id];
-    uint32_t hash = nat_hash_inside(inside_ip, inside_port, protocol);
 
-    /* L1 cache lookup */
-    uint32_t cached_idx = nat_cache_lookup(worker, hash, inside_ip, inside_port, protocol);
-    if (cached_idx != 0) {
-        struct nat_session *s = &g_session_slab[cached_idx];
-        if (likely(s->inside_ip == inside_ip && s->inside_port == inside_port &&
-                   s->protocol == protocol && s->session_index != 0)) {
-            s->last_used_ts = get_timestamp_cycles();
-            return s;
-        }
-    }
+    /* Fast hash - inlined for speed */
+    uint32_t hash = inside_ip ^ ((uint32_t)inside_port << 16) ^ protocol;
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6b;
+    hash ^= hash >> 13;
 
-    /* Per-worker hash table lookup (open addressing) */
+    /* Direct hash table lookup - no cache layer for simplicity */
     uint32_t mask = worker->hash_mask;
     uint32_t idx = hash & mask;
+    struct nat_hash_bucket *b;
 
-    for (int i = 0; i < 16; i++) {
-        struct nat_hash_bucket *b = &worker->in2out_hash[idx];
-        if (b->idx == 0) break;
-
-        if (b->sig == hash) {
-            struct nat_session *s = &g_session_slab[b->idx];
-            if (s->inside_ip == inside_ip && s->inside_port == inside_port &&
-                s->protocol == protocol && s->session_index != 0) {
-                nat_cache_add(worker, hash, inside_ip, inside_port, b->idx, protocol);
-                s->last_used_ts = get_timestamp_cycles();
-                return s;
-            }
+    /* Unrolled loop - max 8 probes */
+    #define PROBE(N) \
+        b = &worker->in2out_hash[(idx + N) & mask]; \
+        if (b->idx == 0) return NULL; \
+        if (b->sig == hash) { \
+            struct nat_session *s = &g_session_slab[b->idx]; \
+            if (likely(s->inside_ip == inside_ip && s->inside_port == inside_port)) \
+                return s; \
         }
-        idx = (idx + 1) & mask;
-    }
 
-    return NULL;  /* Not found - NO GLOBAL FALLBACK */
+    PROBE(0); PROBE(1); PROBE(2); PROBE(3);
+    PROBE(4); PROBE(5); PROBE(6); PROBE(7);
+    #undef PROBE
+
+    return NULL;
 }
 
 /**
