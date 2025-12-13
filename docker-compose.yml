@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  yesrouter-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yesrouter-dev
+    privileged: true
+    volumes:
+      - .:/workspace/yesrouter
+      - /dev/hugepages:/dev/hugepages
+    network_mode: host
+    working_dir: /workspace/yesrouter
+    command: /bin/bash
+    tty: true
+    stdin_open: true

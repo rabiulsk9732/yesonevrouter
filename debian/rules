@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p build
+	cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=OFF
+
+override_dh_auto_build:
+	cd build && make -j$(nproc)
+
+override_dh_auto_install:
+	install -D -m 755 build/yesrouter $(CURDIR)/debian/yesrouter/usr/bin/yesrouter
+	install -D -m 755 build/src/cli/vbng_cli $(CURDIR)/debian/yesrouter/usr/bin/yesrouter-cli
+	install -D -m 644 yesrouter.conf $(CURDIR)/debian/yesrouter/etc/yesrouter/yesrouter.conf
+	install -D -m 644 startup.json $(CURDIR)/debian/yesrouter/etc/yesrouter/startup.json
+	install -D -m 644 yesrouter.service $(CURDIR)/debian/yesrouter/lib/systemd/system/yesrouter.service
+	mkdir -p $(CURDIR)/debian/yesrouter/var/log/yesrouter
+	mkdir -p $(CURDIR)/debian/yesrouter/run/yesrouter

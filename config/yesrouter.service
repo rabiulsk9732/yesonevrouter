@@ -1,0 +1,65 @@
+[Unit]
+Description=YESRouter vBNG - High Performance Virtual BNG
+Documentation=https://github.com/yesrouter/yesrouter
+After=network.target network-online.target
+Wants=network-online.target
+Before=multi-user.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Pre-start: cleanup and preparation
+ExecStartPre=/bin/rm -rf /var/run/dpdk/vbng
+ExecStartPre=/bin/mkdir -p /var/run/yesrouter /var/log/yesrouter
+
+# Main executable with runner script
+ExecStart=/usr/local/bin/yesrouter-runner.sh
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy - carrier-grade reliability
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Resource limits for DPDK
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+
+# Memory and CPU
+MemoryMax=90%
+CPUWeight=1000
+
+# Capabilities for DPDK and raw network access
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_SYS_RAWIO CAP_SYS_ADMIN
+
+# Security settings (relaxed for DPDK)
+NoNewPrivileges=no
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
+
+# Working directory
+WorkingDirectory=/var/lib/yesrouter
+RuntimeDirectory=yesrouter
+RuntimeDirectoryMode=0755
+
+# Logging - use journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yesrouter
+SyslogFacility=daemon
+
+# Environment
+Environment="DPDK_DRIVER=uio_pci_generic"
+Environment="HOME=/root"
+
+[Install]
+WantedBy=multi-user.target

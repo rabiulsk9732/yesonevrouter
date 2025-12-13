@@ -1,0 +1,386 @@
+module yesrouter {
+    yang-version 1.1;
+    namespace "http://yesrouter.com/ns/yesrouter";
+    prefix "yr";
+
+    organization "YESRouter";
+    contact "support@yesrouter.com";
+    description
+        "YANG data model for YESRouter vBNG configuration";
+
+    revision 2024-01-01 {
+        description "Initial revision";
+    }
+
+    container yesrouter-config {
+        description "YESRouter main configuration container";
+
+        container system {
+            description "System configuration";
+
+            leaf hostname {
+                type string {
+                    length "1..63";
+                }
+                default "yesrouter";
+                description "System hostname";
+            }
+
+            leaf log-level {
+                type uint8 {
+                    range "0..7";
+                }
+                default 3;
+                description "Logging level (0=emergency, 7=debug)";
+            }
+
+            leaf daemonize {
+                type boolean;
+                default false;
+                description "Run as daemon";
+            }
+
+            leaf pid-file {
+                type string;
+                default "/var/run/yesrouter.pid";
+                description "PID file path";
+            }
+        }
+
+        container routing {
+            description "Routing configuration";
+
+            leaf local-as {
+                type uint32 {
+                    range "1..4294967295";
+                }
+                mandatory true;
+                description "Local BGP AS number";
+            }
+
+            leaf router-id {
+                type string {
+                    pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                }
+                description "BGP router ID (IPv4 address)";
+            }
+
+            list bgp-peer {
+                key "peer-ip";
+                description "BGP peer configuration";
+
+                leaf peer-ip {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    description "BGP peer IP address";
+                }
+
+                leaf remote-as {
+                    type uint32 {
+                        range "1..4294967295";
+                    }
+                    mandatory true;
+                    description "Remote BGP AS number";
+                }
+
+                leaf hold-time {
+                    type uint16 {
+                        range "3..65535";
+                    }
+                    default 180;
+                    description "BGP hold time in seconds";
+                }
+
+                leaf keepalive-interval {
+                    type uint16 {
+                        range "1..65535";
+                    }
+                    default 60;
+                    description "BGP keepalive interval in seconds";
+                }
+
+                leaf enabled {
+                    type boolean;
+                    default true;
+                    description "Enable BGP peer";
+                }
+
+                leaf description {
+                    type string;
+                    description "Peer description";
+                }
+            }
+        }
+
+        container bng {
+            description "Broadband Network Gateway configuration";
+
+            leaf pppoe-enabled {
+                type boolean;
+                default true;
+                description "Enable PPPoE support";
+            }
+
+            leaf ipoe-enabled {
+                type boolean;
+                default true;
+                description "Enable IPoE support";
+            }
+
+            leaf ac-name {
+                type string;
+                default "YESRouter-AC";
+                description "PPPoE Access Concentrator name";
+            }
+
+            leaf pppoe-mtu {
+                type uint16 {
+                    range "576..1500";
+                }
+                default 1492;
+                description "PPPoE MTU";
+            }
+
+            leaf session-timeout {
+                type uint32;
+                units "seconds";
+                default 86400;
+                description "Session timeout in seconds";
+            }
+
+            leaf max-sessions {
+                type uint32;
+                default 100000;
+                description "Maximum number of concurrent sessions";
+            }
+
+            list ip-pool {
+                key "name";
+                description "IP address pool configuration";
+
+                leaf name {
+                    type string;
+                    description "Pool name";
+                }
+
+                leaf start-ip {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    mandatory true;
+                    description "Pool start IP address";
+                }
+
+                leaf end-ip {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    mandatory true;
+                    description "Pool end IP address";
+                }
+
+                leaf netmask {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    mandatory true;
+                    description "Network mask";
+                }
+
+                leaf gateway {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    mandatory true;
+                    description "Gateway IP address";
+                }
+
+                leaf dns-primary {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    description "Primary DNS server";
+                }
+
+                leaf dns-secondary {
+                    type string {
+                        pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                    }
+                    description "Secondary DNS server";
+                }
+
+                leaf lease-time {
+                    type uint32;
+                    units "seconds";
+                    default 86400;
+                    description "IP lease time in seconds";
+                }
+            }
+        }
+
+        container cgnat {
+            description "Carrier-Grade NAT configuration";
+
+            leaf enabled {
+                type boolean;
+                default false;
+                description "Enable CGNAT";
+            }
+
+            leaf public-ip-start {
+                type string {
+                    pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                }
+                description "Public IP pool start address";
+            }
+
+            leaf public-ip-end {
+                type string {
+                    pattern '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+                }
+                description "Public IP pool end address";
+            }
+
+            leaf port-range-start {
+                type uint16 {
+                    range "1024..65535";
+                }
+                default 1024;
+                description "Port range start";
+            }
+
+            leaf port-range-end {
+                type uint16 {
+                    range "1024..65535";
+                }
+                default 65535;
+                description "Port range end";
+            }
+
+            leaf session-timeout {
+                type uint32;
+                units "seconds";
+                default 300;
+                description "NAT session timeout in seconds";
+            }
+
+            leaf logging-enabled {
+                type boolean;
+                default true;
+                description "Enable NAT session logging";
+            }
+
+            leaf log-server {
+                type string;
+                description "NAT log server address";
+            }
+        }
+
+        container qos {
+            description "Quality of Service configuration";
+
+            leaf enabled {
+                type boolean;
+                default true;
+                description "Enable QoS";
+            }
+
+            leaf default-rate-limit-down {
+                type uint32;
+                units "kbps";
+                default 100000;
+                description "Default download rate limit in kbps";
+            }
+
+            leaf default-rate-limit-up {
+                type uint32;
+                units "kbps";
+                default 50000;
+                description "Default upload rate limit in kbps";
+            }
+
+            leaf burst-size {
+                type uint32;
+                units "bytes";
+                default 1500000;
+                description "Burst size in bytes";
+            }
+        }
+
+        container firewall {
+            description "Firewall configuration";
+
+            leaf enabled {
+                type boolean;
+                default true;
+                description "Enable firewall";
+            }
+
+            leaf stateful-enabled {
+                type boolean;
+                default true;
+                description "Enable stateful inspection";
+            }
+
+            leaf connection-timeout {
+                type uint32;
+                units "seconds";
+                default 300;
+                description "Connection timeout in seconds";
+            }
+
+            leaf max-connections {
+                type uint32;
+                default 1000000;
+                description "Maximum number of tracked connections";
+            }
+        }
+
+        container management {
+            description "Management interface configuration";
+
+            container rest-api {
+                description "REST API configuration";
+
+                leaf enabled {
+                    type boolean;
+                    default true;
+                    description "Enable REST API";
+                }
+
+                leaf port {
+                    type uint16 {
+                        range "1..65535";
+                    }
+                    default 8080;
+                    description "REST API port";
+                }
+
+                leaf bind {
+                    type string;
+                    default "0.0.0.0";
+                    description "REST API bind address";
+                }
+            }
+
+            container cli {
+                description "CLI configuration";
+
+                leaf enabled {
+                    type boolean;
+                    default true;
+                    description "Enable CLI";
+                }
+
+                leaf port {
+                    type uint16 {
+                        range "1..65535";
+                    }
+                    default 22;
+                    description "CLI port";
+                }
+            }
+        }
+    }
+}

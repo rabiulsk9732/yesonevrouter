@@ -1,0 +1,23 @@
+Source: yesrouter
+Section: net
+Priority: optional
+Maintainer: YesOneVRouter Team <support@yesonevrouter.io>
+Build-Depends: debhelper (>= 11), cmake, libdpdk-dev, libssl-dev, libreadline-dev
+Standards-Version: 4.5.0
+Homepage: https://yesonevrouter.io
+
+Package: yesrouter
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, dpdk (>= 20.11)
+Description: YESRouter - High-Performance vBNG/CGNAT Solution
+ YESRouter is a carrier-grade virtual Broadband Network Gateway (vBNG)
+ with integrated CGNAT, supporting PPPoE, IPoE, and advanced subscriber
+ management. Designed for 100Gbps+ throughput with DPDK acceleration.
+ .
+ Features:
+  - PPPoE/IPoE subscriber termination
+  - CGNAT with deterministic NAT44
+  - IPFIX/NetFlow v9 logging
+  - RADIUS AAA integration
+  - High availability (active-standby)
+  - REST API and CLI management

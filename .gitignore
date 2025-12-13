@@ -1,0 +1,58 @@
+# Build directories
+build/
+builddir/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Meson
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug
+*.dSYM/
+*.su
+*.core
+vgcore.*
+
+# Testing
+Testing/
+CTestTestfile.cmake
+
+# Logs
+*.log
+
+# Binaries
+yesrouter
+*.elf
+
+# DPDK
+.dpdk/
+
+# Temporary files
+*.tmp
+*.temp
+*.out
+*.backup
+*.bak
+nohup.out
+*.gate
+*.deb

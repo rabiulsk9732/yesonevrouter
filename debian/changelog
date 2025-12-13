@@ -1,0 +1,11 @@
+yesrouter (1.0.0-1) stable; urgency=medium
+
+  * Initial production release
+  * Full CLI with IOS-style command hierarchy
+  * PPPoE and IPoE subscriber termination
+  * CGNAT with deterministic NAT44
+  * IPFIX/NetFlow v9 session logging
+  * JSON-based configuration persistence
+  * 24/24 CLI unit tests passing
+
+ -- YesOneVRouter Team <support@yesonevrouter.io>  Sun, 08 Dec 2024 10:30:00 +0000
