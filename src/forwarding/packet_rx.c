@@ -1131,25 +1131,12 @@ static void *rx_thread_func(void *arg)
                             src_port = rte_be_to_cpu_16(ports[0]);
                         }
 
-                        /* Determine which worker owns this flow */
-                        uint32_t target_worker = get_nat_worker_id(src_ip, src_port);
-
-                        if (target_worker == (uint32_t)worker_id || g_num_nat_workers <= 1) {
-                            /* Process locally */
-                            local_pkts[local_count++] = pkt;
-                        } else {
-                            /* Handoff to target worker's ring */
-                            if (g_worker_rings[target_worker]) {
-                                if (rte_ring_enqueue(g_worker_rings[target_worker], pkt) != 0) {
-                                    /* Ring full, drop packet */
-                                    rte_pktmbuf_free(pkt);
-                                    total_drops++;
-                                }
-                            } else {
-                                /* No ring, process locally */
-                                local_pkts[local_count++] = pkt;
-                            }
-                        }
+                        /* PHASE 1 OPTIMIZATION: Process ALL packets locally
+                         * Each worker owns its own session table (lockless)
+                         * No handoff = no ring bottleneck = higher PPS
+                         */
+                        local_pkts[local_count++] = pkt;
+                        (void)get_nat_worker_id; /* Suppress unused warning */
                     } else {
                         /* Non-IPv4, process locally */
                         local_pkts[local_count++] = pkt;

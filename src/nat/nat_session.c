@@ -588,7 +588,7 @@ struct nat_session *nat_session_create_lockless(uint32_t worker_id,
     uint32_t hash_inside, hash_outside;
 
     /* Validate worker ID */
-    if (worker_id >= NAT_MAX_WORKERS || g_num_workers <= 1) {
+    if (worker_id >= NAT_MAX_WORKERS || g_num_workers < 1) {
         /* Fall back to locked path */
         return nat_session_create(inside_ip, inside_port, outside_ip, outside_port,
                                   protocol, dest_ip, dest_port);
