@@ -3,29 +3,31 @@
  * @brief PPP Link Control Protocol (LCP) Implementation
  */
 
+#include <rte_byteorder.h>
+#include <rte_ether.h>
+#include <rte_mbuf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <rte_byteorder.h>
-#include <rte_mbuf.h>
-#include <rte_ether.h>
 
+#include "interface.h"
+#include "log.h"
+#include "packet.h"
 #include "ppp_lcp.h"
 #include "pppoe.h"
 #include "pppoe_defs.h"
-#include "packet.h"
-#include "interface.h"
-#include "log.h"
 #include <time.h>
 
 /* Helper to send LCP packet */
-static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t identifier, const uint8_t *data, uint16_t len)
+static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t identifier,
+                        const uint8_t *data, uint16_t len)
 {
     struct pkt_buf *pkt = pkt_alloc();
-    if (!pkt) return -1;
+    if (!pkt)
+        return -1;
 
-    YLOG_INFO("LCP SEND: session=%u vlan_id=%u iface=%s",
-              session->session_id, session->vlan_id, session->iface->name);
+    YLOG_INFO("LCP SEND: session=%u vlan_id=%u iface=%s", session->session_id, session->vlan_id,
+              session->iface->name);
 
     struct rte_mbuf *m = pkt->mbuf;
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -39,7 +41,8 @@ static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t ide
     rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
     rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
 
-    /* PPPoE Session ethertype - VLAN tagging handled by VLAN interface if session->iface is a VLAN sub-interface */
+    /* PPPoE Session ethertype - VLAN tagging handled by VLAN interface if session->iface is a VLAN
+     * sub-interface */
     eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
     pppoe = (struct pppoe_hdr *)(eth + 1);
     hdr_len = sizeof(struct rte_ether_hdr);
@@ -107,7 +110,8 @@ static void ppp_lcp_send_conf_req(struct pppoe_session *session)
     opt = (struct lcp_opt_hdr *)(options + len);
     opt->type = LCP_OPT_AUTH_PROTO;
     opt->length = 5; /* Type(1) + Len(1) + Proto(2) + Algo(1) */
-    *(uint16_t *)(opt->data) = rte_cpu_to_be_16(PPP_PROTO_CHAP); session->auth_protocol = PPP_PROTO_CHAP;
+    *(uint16_t *)(opt->data) = rte_cpu_to_be_16(PPP_PROTO_CHAP);
+    session->auth_protocol = PPP_PROTO_CHAP;
     opt->data[2] = 0x05; /* MD5 */
     len += opt->length;
 
@@ -118,7 +122,8 @@ static void ppp_lcp_send_conf_req(struct pppoe_session *session)
 }
 
 /* Send Configure-Ack */
-static void ppp_lcp_send_conf_ack(struct pppoe_session *session, uint8_t identifier, const uint8_t *options, uint16_t len)
+static void ppp_lcp_send_conf_ack(struct pppoe_session *session, uint8_t identifier,
+                                  const uint8_t *options, uint16_t len)
 {
     ppp_lcp_send(session, LCP_CODE_CONF_ACK, identifier, options, len);
 
@@ -127,7 +132,7 @@ static void ppp_lcp_send_conf_ack(struct pppoe_session *session, uint8_t identif
         /* We already received their Ack, now we sent ours -> OPENED */
         session->lcp_state = LCP_STATE_OPENED;
         YLOG_INFO("LCP Session %u Opened", session->session_id);
-        ppp_auth_start(session);  /* Start authentication ONCE here */
+        ppp_auth_start(session); /* Start authentication ONCE here */
     } else {
         /* We sent Ack but haven't received theirs yet */
         session->lcp_state = LCP_STATE_ACK_SENT;
@@ -135,18 +140,19 @@ static void ppp_lcp_send_conf_ack(struct pppoe_session *session, uint8_t identif
 }
 
 /* Send Configure-Reject */
-static void ppp_lcp_send_conf_rej(struct pppoe_session *session, uint8_t identifier, const uint8_t *options, uint16_t len) __attribute__((unused));
-static void ppp_lcp_send_conf_rej(struct pppoe_session *session, uint8_t identifier, const uint8_t *options, uint16_t len)
+static void ppp_lcp_send_conf_rej(struct pppoe_session *session, uint8_t identifier,
+                                  const uint8_t *options, uint16_t len) __attribute__((unused));
+static void ppp_lcp_send_conf_rej(struct pppoe_session *session, uint8_t identifier,
+                                  const uint8_t *options, uint16_t len)
 {
     ppp_lcp_send(session, LCP_CODE_CONF_REJ, identifier, options, len);
 }
 
-static void ppp_lcp_send_conf_nak(struct pppoe_session *session, uint8_t identifier, const uint8_t *options, uint16_t len)
+static void ppp_lcp_send_conf_nak(struct pppoe_session *session, uint8_t identifier,
+                                  const uint8_t *options, uint16_t len)
 {
     ppp_lcp_send(session, LCP_CODE_CONF_NAK, identifier, options, len);
 }
-
-
 
 /* Send Echo-Request */
 void ppp_lcp_send_echo_request(struct pppoe_session *session)
@@ -178,10 +184,12 @@ void ppp_lcp_close(struct pppoe_session *session)
 int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet, uint16_t len)
 {
     const struct lcp_hdr *lcp = (const struct lcp_hdr *)packet;
-    if (len < sizeof(struct lcp_hdr)) return -1;
+    if (len < sizeof(struct lcp_hdr))
+        return -1;
 
     uint16_t lcp_len = rte_be_to_cpu_16(lcp->length);
-    if (lcp_len > len) return -1;
+    if (lcp_len > len)
+        return -1;
 
     const uint8_t *data = lcp->data;
     uint16_t data_len = lcp_len - sizeof(struct lcp_hdr);
@@ -189,7 +197,8 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
     YLOG_DEBUG("LCP: code=%u state=%d", lcp->code, session->lcp_state);
     switch (lcp->code) {
     case LCP_CODE_CONF_REQ: {
-        YLOG_INFO("LCP: Received Configure-Request (State=%u, Retry=%u)", session->lcp_state, session->conf_req_retries);
+        YLOG_INFO("LCP: Received Configure-Request (State=%u, Retry=%u)", session->lcp_state,
+                  session->conf_req_retries);
 
         uint8_t ack_options[1500];
         uint16_t ack_len = 0;
@@ -202,50 +211,50 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
         while (offset < data_len) {
             struct lcp_opt_hdr *opt = (struct lcp_opt_hdr *)(data + offset);
             /* Validate option length */
-            if (offset + sizeof(struct lcp_opt_hdr) > data_len ||
-                opt->length < 2 || offset + opt->length > data_len) {
+            if (offset + sizeof(struct lcp_opt_hdr) > data_len || opt->length < 2 ||
+                offset + opt->length > data_len) {
                 break;
             }
 
             bool handled = false;
 
             switch (opt->type) {
-                case LCP_OPT_MRU:
-                    if (opt->length == 4) {
-                        uint16_t mru = rte_be_to_cpu_16(*(uint16_t *)opt->data);
-                        session->peer_mru = mru;
+            case LCP_OPT_MRU:
+                if (opt->length == 4) {
+                    uint16_t mru = rte_be_to_cpu_16(*(uint16_t *)opt->data);
+                    session->peer_mru = mru;
+                    memcpy(ack_options + ack_len, opt, opt->length);
+                    ack_len += opt->length;
+                    handled = true;
+                }
+                break;
+
+            case LCP_OPT_AUTH_PROTO:
+                /* Server does not authenticate to Client */
+                memcpy(rej_options + rej_len, opt, opt->length);
+                rej_len += opt->length;
+                handled = true;
+                break;
+
+            case LCP_OPT_MAGIC_NUM:
+                if (opt->length == 6) {
+                    uint32_t magic = rte_be_to_cpu_32(*(uint32_t *)opt->data);
+                    if (magic == session->magic_number) {
+                        /* Loop detected - NAK with different value */
+                        uint32_t sugg = ~magic;
+                        struct lcp_opt_hdr *nak_opt = (struct lcp_opt_hdr *)(nak_options + nak_len);
+                        nak_opt->type = LCP_OPT_MAGIC_NUM;
+                        nak_opt->length = 6;
+                        *(uint32_t *)nak_opt->data = rte_cpu_to_be_32(sugg);
+                        nak_len += 6;
+                    } else {
+                        session->peer_magic_number = magic;
                         memcpy(ack_options + ack_len, opt, opt->length);
                         ack_len += opt->length;
-                        handled = true;
                     }
-                    break;
-
-                case LCP_OPT_AUTH_PROTO:
-                    /* Server does not authenticate to Client */
-                    memcpy(rej_options + rej_len, opt, opt->length);
-                    rej_len += opt->length;
                     handled = true;
-                    break;
-
-                case LCP_OPT_MAGIC_NUM:
-                    if (opt->length == 6) {
-                        uint32_t magic = rte_be_to_cpu_32(*(uint32_t *)opt->data);
-                        if (magic == session->magic_number) {
-                            /* Loop detected - NAK with different value */
-                            uint32_t sugg = ~magic;
-                            struct lcp_opt_hdr *nak_opt = (struct lcp_opt_hdr *)(nak_options + nak_len);
-                            nak_opt->type = LCP_OPT_MAGIC_NUM;
-                            nak_opt->length = 6;
-                            *(uint32_t *)nak_opt->data = rte_cpu_to_be_32(sugg);
-                            nak_len += 6;
-                        } else {
-                            session->peer_magic_number = magic;
-                            memcpy(ack_options + ack_len, opt, opt->length);
-                            ack_len += opt->length;
-                        }
-                        handled = true;
-                    }
-                    break;
+                }
+                break;
             }
 
             if (!handled) {
@@ -267,12 +276,17 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
         } else {
             /* All options acceptable */
             YLOG_INFO("LCP: Sending Config-Ack (len=%u)", ack_len);
+
+            /* CRITICAL: Save state BEFORE ppp_lcp_send_conf_ack changes it */
+            int saved_state = session->lcp_state;
+
             ppp_lcp_send_conf_ack(session, lcp->identifier, ack_options, ack_len);
 
-            /* RFC 1661 State Machine Transitions after sending Conf-Ack */
-            /* Note: ppp_lcp_send_conf_ack() already handles state transition and auth start */
-            if (session->lcp_state == LCP_STATE_INITIAL || session->lcp_state == LCP_STATE_STARTING) {
-                /* We need to send our own Conf-Req too */
+            /* RFC 1661 State Machine: Send our own ConfReq if we haven't completed negotiation */
+            /* Use saved_state since ppp_lcp_send_conf_ack changes session->lcp_state */
+            if (saved_state == LCP_STATE_INITIAL || saved_state == LCP_STATE_STARTING ||
+                saved_state == LCP_STATE_REQ_SENT) {
+                /* We need to send our own Conf-Req too (or resend if lost) */
                 ppp_lcp_send_conf_req(session);
             }
         }
@@ -288,7 +302,7 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
             /* We already sent Ack (to their Req), now received Ack -> OPENED */
             session->lcp_state = LCP_STATE_OPENED;
             YLOG_INFO("LCP Session %u Opened", session->session_id);
-            ppp_auth_start(session);  /* Start authentication ONCE here */
+            ppp_auth_start(session); /* Start authentication ONCE here */
         }
         break;
 
@@ -319,7 +333,8 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
             opt = (struct lcp_opt_hdr *)(options + len);
             opt->type = LCP_OPT_AUTH_PROTO;
             opt->length = 4;
-            *(uint16_t *)(opt->data) = rte_cpu_to_be_16(PPP_PROTO_PAP); session->auth_protocol = PPP_PROTO_PAP;
+            *(uint16_t *)(opt->data) = rte_cpu_to_be_16(PPP_PROTO_PAP);
+            session->auth_protocol = PPP_PROTO_PAP;
             len += opt->length;
 
             ppp_lcp_send(session, LCP_CODE_CONF_REQ, ++session->next_lcp_identifier, options, len);
@@ -330,8 +345,6 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
         YLOG_INFO("LCP: Received Configure-Reject");
         /* TODO: Handle REJ (remove options and resend REQ) */
         break;
-
-
 
     case LCP_CODE_ECHO_REQ:
         YLOG_DEBUG("LCP: Received Echo-Request");
@@ -381,7 +394,8 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
         /* Send Code-Reject */
         /* Payload: LCP Packet that was rejected */
         /* Truncate if necessary to fit MTU */
-        ppp_lcp_send(session, LCP_CODE_CODE_REJ, ++session->next_lcp_identifier, (const uint8_t *)lcp, lcp_len);
+        ppp_lcp_send(session, LCP_CODE_CODE_REJ, ++session->next_lcp_identifier,
+                     (const uint8_t *)lcp, lcp_len);
         break;
     }
 
@@ -397,7 +411,8 @@ void ppp_lcp_check_timeouts(struct pppoe_session *session)
                 pppoe_terminate_session(session, "LCP Negotiation Timeout");
             } else {
                 session->conf_req_retries++;
-                YLOG_INFO("LCP: Retransmitting Configure-Request (Attempt %u)", session->conf_req_retries);
+                YLOG_INFO("LCP: Retransmitting Configure-Request (Attempt %u)",
+                          session->conf_req_retries);
                 ppp_lcp_send_conf_req(session);
             }
         }
