@@ -7,17 +7,17 @@
  * software tagging for virtio/paravirt NICs).
  */
 
+#include <rte_byteorder.h>
+#include <rte_ethdev.h>
+#include <rte_ether.h>
+#include <rte_mbuf.h>
 #include <stdio.h>
 #include <string.h>
-#include <rte_ethdev.h>
-#include <rte_mbuf.h>
-#include <rte_ether.h>
-#include <rte_byteorder.h>
 
-#include "pppoe_tx.h"
-#include "pppoe_defs.h"
 #include "dpdk_init.h"
 #include "log.h"
+#include "pppoe_defs.h"
+#include "pppoe_tx.h"
 
 /* Global NIC capability flags (per-port) */
 static bool g_port_vlan_insert[RTE_MAX_ETHPORTS] = {false};
@@ -48,21 +48,34 @@ int pppoe_tx_init(void)
         int ret = rte_eth_dev_info_get(port, &dev_info);
 
         if (ret != 0) {
-            YLOG_ERROR("[PPPoE-TX] Failed to get device info for port %u: %s",
-                      port, rte_strerror(-ret));
+            YLOG_ERROR("[PPPoE-TX] Failed to get device info for port %u: %s", port,
+                       rte_strerror(-ret));
             continue;
         }
 
         /* Check VLAN insertion offload capability */
-        if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_VLAN_INSERT) {
+        bool has_hw_vlan = (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0;
+
+        /* Force SW tagging for NICs that commonly misreport or have broken HW offload */
+        bool force_sw_tag = false;
+        const char *drv = dev_info.driver_name ? dev_info.driver_name : "unknown";
+        if (strstr(drv, "virtio") || strstr(drv, "vhost") || strstr(drv, "tap") ||
+            strstr(drv, "netvsc") || strstr(drv, "vmxnet") || strstr(drv, "e1000")) {
+            force_sw_tag = true;
+            YLOG_WARNING(
+                "[PPPoE-TX] Port %u (%s): Forcing SW VLAN tagging (known problematic driver)", port,
+                drv);
+        }
+
+        if (has_hw_vlan && !force_sw_tag) {
             g_port_vlan_insert[port] = true;
-            YLOG_INFO("[PPPoE-TX] Port %u (%s): HW VLAN insert AVAILABLE",
-                     port, dev_info.driver_name ? dev_info.driver_name : "unknown");
+            YLOG_INFO("[PPPoE-TX] Port %u (%s): HW VLAN insert AVAILABLE", port, drv);
         } else {
             /* Virtio/paravirt NICs typically don't support this */
             g_port_vlan_insert[port] = false;
-            YLOG_WARNING("[PPPoE-TX] Port %u (%s): HW VLAN insert NOT available (will use SW tagging)",
-                        port, dev_info.driver_name ? dev_info.driver_name : "unknown");
+            YLOG_WARNING(
+                "[PPPoE-TX] Port %u (%s): HW VLAN insert NOT available (will use SW tagging)", port,
+                drv);
         }
     }
 
@@ -87,11 +100,8 @@ int pppoe_tx_init(void)
  * @return 0 on success, -1 on error
  */
 int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
-                            const struct rte_ether_addr *dst_mac,
-                            const uint8_t *src_mac,
-                            uint16_t vlan_id,
-                            const uint8_t *pppoe_payload,
-                            uint16_t payload_len)
+                            const struct rte_ether_addr *dst_mac, const uint8_t *src_mac,
+                            uint16_t vlan_id, const uint8_t *pppoe_payload, uint16_t payload_len)
 {
     /* Get mempool for mbuf allocation */
     struct rte_mempool *mp = dpdk_get_mempool();
@@ -129,8 +139,8 @@ int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
 
         frame_len = sizeof(struct rte_ether_hdr) + payload_len;
 
-        YLOG_DEBUG("[PPPoE-TX] HW offload: port=%u queue=%u vlan=%u len=%u",
-                  port_id, queue_id, vlan_id, frame_len);
+        YLOG_DEBUG("[PPPoE-TX] HW offload: port=%u queue=%u vlan=%u len=%u", port_id, queue_id,
+                   vlan_id, frame_len);
 
     } else if (vlan_id > 0) {
         /* SOFTWARE VLAN TAGGING (Virtio, tap, etc.) */
@@ -142,16 +152,16 @@ int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
         vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
 
         /* Copy PPPoE payload after VLAN header */
-        memcpy(pkt + sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr),
-               pppoe_payload, payload_len);
+        memcpy(pkt + sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr), pppoe_payload,
+               payload_len);
 
         /* NO hardware offload flags */
         m->ol_flags &= ~RTE_MBUF_F_TX_VLAN;
 
         frame_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) + payload_len;
 
-        YLOG_DEBUG("[PPPoE-TX] SW tagging: port=%u queue=%u vlan=%u len=%u",
-                  port_id, queue_id, vlan_id, frame_len);
+        YLOG_DEBUG("[PPPoE-TX] SW tagging: port=%u queue=%u vlan=%u len=%u", port_id, queue_id,
+                   vlan_id, frame_len);
 
     } else {
         /* UNTAGGED */
@@ -159,8 +169,7 @@ int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
         memcpy(pkt + sizeof(struct rte_ether_hdr), pppoe_payload, payload_len);
         frame_len = sizeof(struct rte_ether_hdr) + payload_len;
 
-        YLOG_DEBUG("[PPPoE-TX] Untagged: port=%u queue=%u len=%u",
-                  port_id, queue_id, frame_len);
+        YLOG_DEBUG("[PPPoE-TX] Untagged: port=%u queue=%u len=%u", port_id, queue_id, frame_len);
     }
 
     /* Enforce minimum Ethernet frame size (60 bytes without FCS) */
@@ -172,14 +181,14 @@ int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
     /* Set mbuf lengths */
     m->data_len = frame_len;
     m->pkt_len = frame_len;
-    m->port = port_id;  /* Set egress port for TX */
+    m->port = port_id; /* Set egress port for TX */
 
     /* Send packet using DPDK TX burst */
     uint16_t sent = rte_eth_tx_burst(port_id, queue_id, &m, 1);
 
     if (sent == 0) {
         YLOG_WARNING("[PPPoE-TX] Failed to send packet on port %u queue %u (TX queue full?)",
-                    port_id, queue_id);
+                     port_id, queue_id);
         rte_pktmbuf_free(m);
         return -1;
     }
