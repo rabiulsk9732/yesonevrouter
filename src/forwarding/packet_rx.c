@@ -8,13 +8,14 @@
  */
 
 #include "packet_rx.h"
-#include "dpdk_init.h"
-#include "hqos.h"
 #include "arp.h"
 #include "arp_queue.h"
 #include "cpu_scheduler.h"
+#include "dpdk_init.h"
 #include "fragmentation.h"
+#include "hqos.h"
 #include "interface.h"
+#include "ipv6/ipv6.h"
 #include "log.h"
 #include "nat.h"
 #include "packet.h"
@@ -22,7 +23,6 @@
 #include "radius.h"
 #include "reassembly.h"
 #include "routing_table.h"
-#include "ipv6/ipv6.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -62,7 +62,8 @@ static struct rte_ring *g_worker_rings[MAX_WORKERS] = {NULL};
 static uint32_t g_num_nat_workers = 1;
 
 /* Deterministic hash for worker selection (VPP-style) */
-static inline uint32_t nat_worker_hash(uint32_t src_ip, uint16_t src_port) {
+static inline uint32_t nat_worker_hash(uint32_t src_ip, uint16_t src_port)
+{
     /* Simple but effective hash - same flow always goes to same worker */
     uint32_t hash = src_ip ^ ((uint32_t)src_port << 16) ^ src_port;
     hash ^= hash >> 16;
@@ -71,20 +72,23 @@ static inline uint32_t nat_worker_hash(uint32_t src_ip, uint16_t src_port) {
     return hash;
 }
 
-static inline uint32_t get_nat_worker_id(uint32_t src_ip, uint16_t src_port) {
-    if (g_num_nat_workers <= 1) return 0;
+static inline uint32_t get_nat_worker_id(uint32_t src_ip, uint16_t src_port)
+{
+    if (g_num_nat_workers <= 1)
+        return 0;
     return nat_worker_hash(src_ip, src_port) % g_num_nat_workers;
 }
 
 /* Initialize worker handoff rings */
-static int init_worker_handoff_rings(uint32_t num_workers) {
+static int init_worker_handoff_rings(uint32_t num_workers)
+{
     char ring_name[32];
     g_num_nat_workers = num_workers > MAX_WORKERS ? MAX_WORKERS : num_workers;
 
     for (uint32_t i = 0; i < g_num_nat_workers; i++) {
         snprintf(ring_name, sizeof(ring_name), "nat_worker_%u", i);
-        g_worker_rings[i] = rte_ring_create(ring_name, HANDOFF_RING_SIZE,
-                                            rte_socket_id(), RING_F_SC_DEQ);
+        g_worker_rings[i] =
+            rte_ring_create(ring_name, HANDOFF_RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
         if (!g_worker_rings[i]) {
             YLOG_ERROR("Failed to create worker ring %u", i);
             return -1;
@@ -103,10 +107,12 @@ static __thread struct {
     uint16_t queue_id;
 } tl_tx_buf = {0};
 
-static inline void tx_flush(void) {
-    if (tl_tx_buf.count == 0) return;
-    uint16_t sent = rte_eth_tx_burst(tl_tx_buf.port_id, tl_tx_buf.queue_id,
-                                      tl_tx_buf.pkts, tl_tx_buf.count);
+static inline void tx_flush(void)
+{
+    if (tl_tx_buf.count == 0)
+        return;
+    uint16_t sent =
+        rte_eth_tx_burst(tl_tx_buf.port_id, tl_tx_buf.queue_id, tl_tx_buf.pkts, tl_tx_buf.count);
     /* Free unsent packets */
     for (uint16_t i = sent; i < tl_tx_buf.count; i++) {
         rte_pktmbuf_free(tl_tx_buf.pkts[i]);
@@ -114,7 +120,8 @@ static inline void tx_flush(void) {
     tl_tx_buf.count = 0;
 }
 
-static inline void tx_enqueue(uint16_t port, uint16_t queue, struct rte_mbuf *m) {
+static inline void tx_enqueue(uint16_t port, uint16_t queue, struct rte_mbuf *m)
+{
     tl_tx_buf.port_id = port;
     tl_tx_buf.queue_id = queue;
     tl_tx_buf.pkts[tl_tx_buf.count++] = m;
@@ -709,7 +716,8 @@ static void process_ipv6(struct pkt_buf *pkt)
             uint16_t *cksum_ptr = (uint16_t *)(icmp_data + 2);
             uint32_t cksum = ntohs(*cksum_ptr);
             cksum += (ICMPV6_ECHO_REQUEST - ICMPV6_ECHO_REPLY);
-            if (cksum > 0xFFFF) cksum -= 0xFFFF;
+            if (cksum > 0xFFFF)
+                cksum -= 0xFFFF;
             *cksum_ptr = htons((uint16_t)cksum);
 
             /* Send back on same interface */
@@ -795,12 +803,12 @@ static void process_ipv4(struct pkt_buf *pkt)
                 /* BATCHED HAIRPIN: Enqueue to per-thread TX buffer (CARRIER-GRADE) */
                 struct rte_mbuf *m = pkt->mbuf;
                 if (m) {
-                    uint16_t tx_port = m->port;  /* Use ingress port for egress */
+                    uint16_t tx_port = m->port; /* Use ingress port for egress */
                     uint16_t tx_queue = g_thread_queue_id % env_get_tx_queues();
                     tx_enqueue(tx_port, tx_queue, m);
                     g_fwd_stats.packets_forwarded++;
                     g_fwd_stats.bytes_forwarded += pkt->len;
-                    pkt->mbuf = NULL;  /* Mbuf ownership transferred to TX buffer */
+                    pkt->mbuf = NULL; /* Mbuf ownership transferred to TX buffer */
                     return;
                 }
                 /* No mbuf, fall through to drop */
@@ -944,8 +952,9 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
     /* TRACE LOG - CONFIRM PACKET ARRIVAL */
     struct rte_ether_hdr *eth_trace = (struct rte_ether_hdr *)pkt->data;
     uint16_t eth_type_trace = rte_be_to_cpu_16(eth_trace->ether_type);
-    YLOG_INFO("RX ENTRY: iface=%u len=%u eth_type=0x%04x",
-              pkt->meta.ingress_ifindex, pkt->len, eth_type_trace);
+    /* PERFORMANCE: Changed from YLOG_INFO to avoid latency */
+    /* YLOG_DEBUG("RX ENTRY: iface=%u len=%u eth_type=0x%04x",
+              pkt->meta.ingress_ifindex, pkt->len, eth_type_trace); */
 
     /* Extract metadata (parse headers) */
     if (pkt_extract_metadata(pkt) != 0) {
@@ -964,7 +973,7 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
     }
 
     if (eth_type == 0x8863) { /* PPPoE DISC */
-        YLOG_INFO("RX PPPoE DISC");
+        /* YLOG_DEBUG("RX PPPoE DISC"); */
         struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
         pppoe_process_discovery(pkt, iface);
         return;
@@ -979,7 +988,7 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
     /* Dispatch based on L3 type */
     switch (pkt->meta.l3_type) {
     case PKT_L3_ARP:
-        YLOG_INFO("RX L3 ARP matched");
+        /* YLOG_DEBUG("RX L3 ARP matched"); */
         process_arp(pkt);
         break;
     case PKT_L3_IPV4:
@@ -989,7 +998,7 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
         process_ipv6(pkt);
         break;
     default:
-        YLOG_INFO("RX UNKNOWN L3 TYPE: %d (eth_type=0x%04x)", pkt->meta.l3_type, eth_type);
+        /* YLOG_DEBUG("RX UNKNOWN L3 TYPE: %d (eth_type=0x%04x)", pkt->meta.l3_type, eth_type); */
         /* Debug: print first bytes */
         /* YLOG_HEX("Packet Dump", pkt->data, 32); */
     }
@@ -1025,7 +1034,8 @@ static void *rx_thread_func(void *arg)
     /* Initialize flow cache for this core/thread */
     extern int flow_cache_init(unsigned int lcore_id);
     if (flow_cache_init(core_id) != 0) {
-        YLOG_WARNING("Failed to initialize flow cache for RX thread %d (core %d)", worker_id, core_id);
+        YLOG_WARNING("Failed to initialize flow cache for RX thread %d (core %d)", worker_id,
+                     core_id);
     } else {
         YLOG_DEBUG("Flow cache initialized for RX thread %d (core %d)", worker_id, core_id);
     }
@@ -1040,8 +1050,8 @@ static void *rx_thread_func(void *arg)
 #ifdef HAVE_DPDK
     /* Initialize per-worker NAT port pool for LOCKLESS allocation */
     /* Use actual NAT pool IP from config (first active pool) */
-    extern void nat_worker_port_pool_init(uint32_t worker_id, uint32_t nat_ip,
-                                          uint16_t port_min, uint16_t port_max);
+    extern void nat_worker_port_pool_init(uint32_t worker_id, uint32_t nat_ip, uint16_t port_min,
+                                          uint16_t port_max);
     extern struct nat_config g_nat_config;
     uint32_t nat_ip = 0;
     /* Get IP from first active NAT pool */
@@ -1058,14 +1068,13 @@ static void *rx_thread_func(void *arg)
         }
     }
     nat_worker_port_pool_init(worker_id, nat_ip, 1024, 65535);
-    YLOG_INFO("[NAT] Worker %d: NAT IP pool initialized (IP=%u.%u.%u.%u)",
-              worker_id, (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF,
-              (nat_ip >> 8) & 0xFF, nat_ip & 0xFF);
+    YLOG_INFO("[NAT] Worker %d: NAT IP pool initialized (IP=%u.%u.%u.%u)", worker_id,
+              (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF, (nat_ip >> 8) & 0xFF, nat_ip & 0xFF);
 #endif
 
     /* Main loop - DPDK DIRECT FAST PATH */
-    printf("[FAST-PATH-DEBUG] Worker %d entering loop, queue=%d, HAVE_DPDK=%d\n",
-           worker_id, queue_id, 1);
+    printf("[FAST-PATH-DEBUG] Worker %d entering loop, queue=%d, HAVE_DPDK=%d\n", worker_id,
+           queue_id, 1);
     fflush(stdout);
 
     while (g_rx_running) {
@@ -1083,7 +1092,7 @@ static void *rx_thread_func(void *arg)
          * DEBUG: Comprehensive logging to find where packets are lost
          * ============================================================ */
         {
-            #define FAST_BURST_SIZE 128  /* Increased for higher throughput */
+#define FAST_BURST_SIZE 128 /* Increased for higher throughput */
             static __thread struct rte_mbuf *rx_pkts[FAST_BURST_SIZE];
             static __thread uint64_t total_rx = 0, total_tx = 0, total_drops = 0;
             static __thread uint64_t total_rx_bytes = 0, total_tx_bytes = 0;
@@ -1096,7 +1105,7 @@ static void *rx_thread_func(void *arg)
             /* Log once at start */
             if (!logged_start) {
                 YLOG_INFO("[DPDK-DEBUG] Worker started: queue=%d worker=%d (polling both ports)",
-                         queue_id, worker_id);
+                          queue_id, worker_id);
                 logged_start = 1;
             }
 
@@ -1106,9 +1115,11 @@ static void *rx_thread_func(void *arg)
             uint16_t nb_rx = 0;
             uint16_t num_ports = rte_eth_dev_count_avail();
             for (uint16_t port_id = 0; port_id < num_ports; port_id++) {
-                uint16_t rx_count = rte_eth_rx_burst(port_id, queue_id, rx_pkts + nb_rx, FAST_BURST_SIZE - nb_rx);
+                uint16_t rx_count =
+                    rte_eth_rx_burst(port_id, queue_id, rx_pkts + nb_rx, FAST_BURST_SIZE - nb_rx);
                 nb_rx += rx_count;
-                if (nb_rx >= FAST_BURST_SIZE) break;
+                if (nb_rx >= FAST_BURST_SIZE)
+                    break;
             }
 
             if (nb_rx > 0) {
@@ -1124,7 +1135,8 @@ static void *rx_thread_func(void *arg)
                  * 3. If packet belongs to another worker, enqueue to their ring
                  * 4. Also dequeue and process packets from our own ring
                  */
-                extern uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t worker_id);
+                extern uint16_t nat_process_burst_dpdk(struct rte_mbuf * *pkts, uint16_t nb_rx,
+                                                       uint32_t worker_id);
 
                 /* Separate packets by destination worker */
                 struct rte_mbuf *local_pkts[FAST_BURST_SIZE];
@@ -1144,7 +1156,7 @@ static void *rx_thread_func(void *arg)
                     }
 
                     /* PPPoE Discovery (PADI/PADO/PADR/PADS/PADT) - route to PPPoE handler */
-                    if (eth_type == 0x8863) {  /* ETH_P_PPPOE_DISC */
+                    if (eth_type == 0x8863) { /* ETH_P_PPPOE_DISC */
                         struct pkt_buf *pbuf = pkt_alloc();
                         if (pbuf) {
                             pbuf->mbuf = pkt;
@@ -1152,19 +1164,20 @@ static void *rx_thread_func(void *arg)
                             pbuf->len = rte_pktmbuf_pkt_len(pkt);
                             pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
                             pbuf->meta.vlan_id = vlan_id;
-                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
-                            YLOG_INFO("PPPoE: Discovery on port %u vlan %u (iface %s)",
-                                      pkt->port, vlan_id, iface ? iface->name : "?");
+                            struct interface *iface =
+                                interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            YLOG_INFO("PPPoE: Discovery on port %u vlan %u (iface %s)", pkt->port,
+                                      vlan_id, iface ? iface->name : "?");
                             pppoe_process_discovery(pbuf, iface);
                             pkt_free(pbuf);
                         } else {
                             rte_pktmbuf_free(pkt);
                         }
-                        continue;  /* Skip NAT for this packet */
+                        continue; /* Skip NAT for this packet */
                     }
 
                     /* PPPoE Session (LCP/IPCP/Data) - route to PPPoE session handler */
-                    if (eth_type == 0x8864) {  /* ETH_P_PPPOE_SESS */
+                    if (eth_type == 0x8864) { /* ETH_P_PPPOE_SESS */
                         struct pkt_buf *pbuf = pkt_alloc();
                         if (pbuf) {
                             pbuf->mbuf = pkt;
@@ -1172,13 +1185,14 @@ static void *rx_thread_func(void *arg)
                             pbuf->len = rte_pktmbuf_pkt_len(pkt);
                             pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
                             pbuf->meta.vlan_id = vlan_id;
-                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            struct interface *iface =
+                                interface_find_by_index(pbuf->meta.ingress_ifindex);
                             pppoe_process_session(pbuf, iface);
                             pkt_free(pbuf);
                         } else {
                             rte_pktmbuf_free(pkt);
                         }
-                        continue;  /* Skip NAT for this packet */
+                        continue; /* Skip NAT for this packet */
                     }
 
                     /* Handle ARP */
@@ -1197,14 +1211,15 @@ static void *rx_thread_func(void *arg)
                             packet_rx_process_packet(pbuf);
 
                             /* mbuf ownership is tricky.
-                               If packet_rx_process_packet -> process_arp -> consumes data, it doesn't free mbuf.
-                               We need to ensure mbuf is freed if not forwarded.
+                               If packet_rx_process_packet -> process_arp -> consumes data, it
+                               doesn't free mbuf. We need to ensure mbuf is freed if not forwarded.
                                process_arp doesn't forward mbuf, it replies with NEW packet.
                                So we should free mbuf?
                                pkt_free(pbuf) doesn't free mbuf usually.
                             */
-                            rte_pktmbuf_free(pkt); /* Free original ARP request mbuf after processing */
-                            pkt_free(pbuf);        /* Free wrapper */
+                            rte_pktmbuf_free(
+                                pkt);       /* Free original ARP request mbuf after processing */
+                            pkt_free(pbuf); /* Free wrapper */
                         } else {
                             rte_pktmbuf_free(pkt);
                         }
@@ -1250,7 +1265,8 @@ static void *rx_thread_func(void *arg)
                             }
                         }
                         if (port_count > 0) {
-                            uint16_t tx_sent = rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            uint16_t tx_sent =
+                                rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
                             sent += tx_sent;
                         }
                     }
@@ -1284,8 +1300,9 @@ static void *rx_thread_func(void *arg)
                 double tx_gbps = (delta_tx_bytes * 8.0) / (2.0 * 1000000000.0);
 
                 if (delta_rx > 0 || delta_tx > 0) {
-                    YLOG_INFO("[STATS] W%d: RX %.0f pps (%.2f Gbps) | TX %.0f pps (%.2f Gbps) | Drops %lu",
-                             worker_id, rx_pps, rx_gbps, tx_pps, tx_gbps, total_drops);
+                    YLOG_INFO("[STATS] W%d: RX %.0f pps (%.2f Gbps) | TX %.0f pps (%.2f Gbps) | "
+                              "Drops %lu",
+                              worker_id, rx_pps, rx_gbps, tx_pps, tx_gbps, total_drops);
                 }
                 last_rx = total_rx;
                 last_tx = total_tx;
@@ -1297,14 +1314,16 @@ static void *rx_thread_func(void *arg)
             /* VPP-STYLE: Also process packets from our handoff ring */
             if (g_worker_rings[worker_id]) {
                 struct rte_mbuf *ring_pkts[FAST_BURST_SIZE];
-                unsigned int ring_count = rte_ring_dequeue_burst(g_worker_rings[worker_id],
-                                                                  (void **)ring_pkts, FAST_BURST_SIZE, NULL);
+                unsigned int ring_count = rte_ring_dequeue_burst(
+                    g_worker_rings[worker_id], (void **)ring_pkts, FAST_BURST_SIZE, NULL);
                 if (ring_count > 0) {
                     static __thread uint64_t ring_debug = 0;
                     if (ring_debug++ < 10) {
-                        YLOG_INFO("[RING-RX] worker=%d dequeued %u pkts from ring", worker_id, ring_count);
+                        YLOG_INFO("[RING-RX] worker=%d dequeued %u pkts from ring", worker_id,
+                                  ring_count);
                     }
-                    extern uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t worker_id);
+                    extern uint16_t nat_process_burst_dpdk(struct rte_mbuf * *pkts, uint16_t nb_rx,
+                                                           uint32_t worker_id);
                     uint16_t nb_tx = nat_process_burst_dpdk(ring_pkts, ring_count, worker_id);
                     if (ring_debug < 15) {
                         YLOG_INFO("[RING-TX] worker=%d nb_tx=%u from NAT", worker_id, nb_tx);
@@ -1351,15 +1370,16 @@ static void *rx_thread_func(void *arg)
             uint64_t now_log = rte_rdtsc();
             if (now_log - last_log > rte_get_tsc_hz() * 5) {
                 struct rte_eth_stats eth_stats;
-                rte_eth_stats_get(0, &eth_stats);  /* Stats from port 0 */
+                rte_eth_stats_get(0, &eth_stats); /* Stats from port 0 */
 
                 FILE *f = fopen("/tmp/dpdk_debug.log", "a");
                 if (f) {
-                    fprintf(f, "[DPDK] Q%d polls=%lu empty=%lu rx=%lu tx=%lu drops=%lu\n",
-                           queue_id, poll_count, empty_polls, total_rx, total_tx, total_drops);
-                    fprintf(f, "[NIC] ipkts=%lu opkts=%lu ierr=%lu oerr=%lu missed=%lu nombuf=%lu\n",
-                           eth_stats.ipackets, eth_stats.opackets, eth_stats.ierrors,
-                           eth_stats.oerrors, eth_stats.imissed, eth_stats.rx_nombuf);
+                    fprintf(f, "[DPDK] Q%d polls=%lu empty=%lu rx=%lu tx=%lu drops=%lu\n", queue_id,
+                            poll_count, empty_polls, total_rx, total_tx, total_drops);
+                    fprintf(f,
+                            "[NIC] ipkts=%lu opkts=%lu ierr=%lu oerr=%lu missed=%lu nombuf=%lu\n",
+                            eth_stats.ipackets, eth_stats.opackets, eth_stats.ierrors,
+                            eth_stats.oerrors, eth_stats.imissed, eth_stats.rx_nombuf);
                     fclose(f);
                 }
                 last_log = now;
@@ -1423,8 +1443,7 @@ static void *rx_thread_func(void *arg)
 
             /* Debug: Log which interfaces we're polling (once) */
             if (!iface_debug_done && worker_id == 0) {
-                YLOG_INFO("RX polling interface %d: %s (state=%d)",
-                          i, iface->name, iface->state);
+                YLOG_INFO("RX polling interface %d: %s (state=%d)", i, iface->name, iface->state);
                 iface_debug_done = 1;
             }
 
@@ -1436,16 +1455,18 @@ static void *rx_thread_func(void *arg)
             radius_poll();
 
             /* Process burst of packets from this interface */
-            int quota = 64;  /* Increased burst for better throughput */
+            int quota = 64; /* Increased burst for better throughput */
             while (quota > 0) {
                 int ret = interface_recv(iface, &pkt);
 
                 if (ret > 0 && pkt) {
                     pkt->meta.ingress_ifindex = iface->ifindex;
 
-                    /* Flow Cache Update - Note: For DPDK packets, this is done in physical_recv() */
+                    /* Flow Cache Update - Note: For DPDK packets, this is done in physical_recv()
+                     */
                     /* For kernel packets (non-DPDK), we need to track them separately if needed */
-                    /* Currently, DPDK packets are tracked in physical_recv() before mbuf is freed */
+                    /* Currently, DPDK packets are tracked in physical_recv() before mbuf is freed
+                     */
 
                     packet_rx_process_packet(pkt);
                     pkt_free(pkt);
@@ -1553,7 +1574,6 @@ void packet_rx_stop(void)
     /* We detached threads, so we can't join them easily.
        They will exit when they see g_rx_running == false. */
     sleep(1); /* Give them time to stop */
-
 }
 
 /**
