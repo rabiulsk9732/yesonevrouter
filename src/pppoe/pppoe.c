@@ -3,39 +3,70 @@
  * @brief PPPoE Server Implementation
  */
 
+#include <rte_byteorder.h>
+#include <rte_ether.h>
+#include <rte_hash.h>
+#include <rte_ip.h>
+#include <rte_malloc.h>
+#include <rte_mbuf.h>
+#include <rte_tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <rte_malloc.h>
-#include <rte_mbuf.h>
-#include <rte_ether.h>
-#include <rte_byteorder.h>
-#include <rte_hash.h>
-#include <rte_ip.h>
-#include <rte_tcp.h>
 
 /* Hash Key: MAC (6) + SessionID (2) = 8 bytes */
 struct session_key_id {
     struct rte_ether_addr mac;
     uint16_t session_id;
 };
-#include <rte_jhash.h>
 #include <rte_bitmap.h>
+#include <rte_jhash.h>
 
-#include "pppoe.h"
-#include "ppp_lcp.h"
 #include "ppp_ipcp.h"
+#include "ppp_lcp.h"
+#include "pppoe.h"
 
 extern void ppp_lcp_check_timeouts(struct pppoe_session *session);
-#include "ppp_auth.h"
-#include "packet.h"
-#include "packet_rx.h"
 #include "interface.h"
 #include "log.h"
+#include "packet.h"
+#include "packet_rx.h"
+#include "ppp_auth.h"
+#include "pppoe_defs.h"
+#include "pppoe_tx.h"
+
+/* Forward declarations */
+static void log_packet_hex(const char *type, struct pkt_buf *pkt);
+static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_uniq,
+                           uint16_t host_uniq_len, const uint8_t *svc_name_req,
+                           uint16_t svc_name_len);
 #include "dpdk_init.h"
+
+/* Helper to get DPDK port ID from interface */
+static inline uint16_t interface_get_dpdk_port(struct interface *iface)
+{
+    if (!iface)
+        return 0;
+
+    /* For physical interfaces, extract port_id from flags */
+    /* High bit (0x80000000) indicates DPDK port, lower bits are port_id */
+    if (iface->flags & 0x80000000) {
+        return (uint16_t)(iface->flags & 0x7FFFFFFF);
+    }
+
+    /* For VLAN sub-interfaces, get port from parent */
+    if (iface->type == IF_TYPE_VLAN && iface->config.parent_ifindex > 0) {
+        struct interface *parent = interface_find_by_index(iface->config.parent_ifindex);
+        if (parent && (parent->flags & 0x80000000)) {
+            return (uint16_t)(parent->flags & 0x7FFFFFFF);
+        }
+    }
+
+    return 0; /* Fallback */
+}
+#include "ha.h"
 #include "qos.h"
 #include "radius.h"
-#include "ha.h"
 
 /* Global PPPoE configuration/state */
 struct pppoe_session *g_pppoe_session_slab = NULL;
@@ -80,17 +111,18 @@ static const char *pppoe_get_profile_pool(const char *iface_name, uint16_t vlan_
 
 void pppoe_add_profile(const char *iface_name, uint16_t vlan_id, const char *pool_name)
 {
-    if (g_num_profiles >= MAX_PROFILES) return;
+    if (g_num_profiles >= MAX_PROFILES)
+        return;
     struct profile_entry *p = &g_profiles[g_num_profiles++];
-    strncpy(p->iface_name, iface_name, sizeof(p->iface_name)-1);
+    strncpy(p->iface_name, iface_name, sizeof(p->iface_name) - 1);
     p->vlan_id = vlan_id;
-    strncpy(p->pool_name, pool_name, sizeof(p->pool_name)-1);
+    strncpy(p->pool_name, pool_name, sizeof(p->pool_name) - 1);
     YLOG_INFO("Added Profile: Iface %s VLAN %u -> Pool %s", iface_name, vlan_id, pool_name);
 }
 
 static struct {
-    struct rte_hash *session_id_hash; /* Map {MAC, ID} -> Session Index */
-    struct rte_hash *session_ip_hash; /* Map {IP} -> Session Index */
+    struct rte_hash *session_id_hash;  /* Map {MAC, ID} -> Session Index */
+    struct rte_hash *session_ip_hash;  /* Map {IP} -> Session Index */
     struct rte_bitmap *session_bitmap; /* Allocation bitmap */
     uint8_t *bitmap_mem;
 
@@ -100,60 +132,68 @@ static struct {
 } g_pppoe_ctx;
 
 /* Global PPP Settings with defaults */
-static struct pppoe_global_settings g_pppoe_settings = {
-    .mtu = 1492,
-    .mru = 1492,
-    .lcp_echo_interval = 30,
-    .lcp_echo_failure = 3,
-    .idle_timeout = 0,
-    .session_timeout = 0,
-    .ac_name = "yesrouter",
-    .service_name = "yesrouter-pppoe"
-};
+static struct pppoe_global_settings g_pppoe_settings = {.mtu = 1492,
+                                                        .mru = 1492,
+                                                        .lcp_echo_interval = 30,
+                                                        .lcp_echo_failure = 3,
+                                                        .idle_timeout = 0,
+                                                        .session_timeout = 0,
+                                                        .ac_name = "yesrouter",
+                                                        .service_name = "yesrouter-pppoe"};
 
 /* Global settings accessor */
-struct pppoe_global_settings *pppoe_get_settings(void) {
+struct pppoe_global_settings *pppoe_get_settings(void)
+{
     return &g_pppoe_settings;
 }
 
 /* Global settings setters */
-void pppoe_set_mtu(uint16_t mtu) {
+void pppoe_set_mtu(uint16_t mtu)
+{
     g_pppoe_settings.mtu = mtu;
     YLOG_INFO("PPPoE MTU set to %u", mtu);
 }
 
-void pppoe_set_mru(uint16_t mru) {
+void pppoe_set_mru(uint16_t mru)
+{
     g_pppoe_settings.mru = mru;
     YLOG_INFO("PPPoE MRU set to %u", mru);
 }
 
-void pppoe_set_lcp_echo_interval(uint16_t seconds) {
+void pppoe_set_lcp_echo_interval(uint16_t seconds)
+{
     g_pppoe_settings.lcp_echo_interval = seconds;
     YLOG_INFO("PPPoE LCP Echo Interval set to %u seconds", seconds);
 }
 
-void pppoe_set_lcp_echo_failure(uint8_t count) {
+void pppoe_set_lcp_echo_failure(uint8_t count)
+{
     g_pppoe_settings.lcp_echo_failure = count;
     YLOG_INFO("PPPoE LCP Echo Failure set to %u", count);
 }
 
-void pppoe_set_idle_timeout(uint32_t seconds) {
+void pppoe_set_idle_timeout(uint32_t seconds)
+{
     g_pppoe_settings.idle_timeout = seconds;
     YLOG_INFO("PPPoE Idle Timeout set to %u seconds", seconds);
 }
 
-void pppoe_set_session_timeout(uint32_t seconds) {
+void pppoe_set_session_timeout(uint32_t seconds)
+{
     g_pppoe_settings.session_timeout = seconds;
     YLOG_INFO("PPPoE Session Timeout set to %u seconds", seconds);
 }
 
-void pppoe_set_pado_delay(uint16_t delay_ms) {
-    if (delay_ms > 2000) delay_ms = 2000;  /* Max 2 seconds */
+void pppoe_set_pado_delay(uint16_t delay_ms)
+{
+    if (delay_ms > 2000)
+        delay_ms = 2000; /* Max 2 seconds */
     g_pppoe_settings.pado_delay_ms = delay_ms;
     YLOG_INFO("PPPoE PADO delay set to %u ms", delay_ms);
 }
 
-void pppoe_set_padi_rate_limit(uint32_t rate_per_sec) {
+void pppoe_set_padi_rate_limit(uint32_t rate_per_sec)
+{
     g_pppoe_settings.padi_rate_limit = rate_per_sec;
     YLOG_INFO("PPPoE PADI rate limit set to %u/sec (0=unlimited)", rate_per_sec);
 }
@@ -176,7 +216,8 @@ int pppoe_init(void)
 
     /* 1. Allocate Session Slab (Hugepages) */
     YLOG_INFO("Allocating PPPoE Session Slab for %u sessions...", MAX_SESSIONS);
-    g_pppoe_session_slab = rte_zmalloc("pppoe_slab", sizeof(struct pppoe_session) * MAX_SESSIONS, 64);
+    g_pppoe_session_slab =
+        rte_zmalloc("pppoe_slab", sizeof(struct pppoe_session) * MAX_SESSIONS, 64);
     if (!g_pppoe_session_slab) {
         YLOG_ERROR("Failed to allocate PPPoE session slab");
         return -1;
@@ -226,17 +267,19 @@ int pppoe_init(void)
     /* Alloc PADI Nodes */
     g_padi_nodes = rte_zmalloc("padi_nodes", sizeof(struct padi_node) * MAX_PADI_TRACKERS, 64);
     if (!g_padi_hash || !g_padi_nodes) {
-         YLOG_ERROR("Failed to init PADI tracking");
-         return -1;
+        YLOG_ERROR("Failed to init PADI tracking");
+        return -1;
     }
 
     /* 4. Initialize Bitmap Allocator */
     uint32_t bmp_bytes = rte_bitmap_get_memory_footprint(MAX_SESSIONS);
     g_pppoe_ctx.bitmap_mem = rte_zmalloc("pppoe_bmp", bmp_bytes, RTE_CACHE_LINE_SIZE);
-    if (!g_pppoe_ctx.bitmap_mem) return -1;
+    if (!g_pppoe_ctx.bitmap_mem)
+        return -1;
 
     g_pppoe_ctx.session_bitmap = rte_bitmap_init(MAX_SESSIONS, g_pppoe_ctx.bitmap_mem, bmp_bytes);
-    if (!g_pppoe_ctx.session_bitmap) return -1;
+    if (!g_pppoe_ctx.session_bitmap)
+        return -1;
 
     /* Clear bitmap */
     rte_bitmap_reset(g_pppoe_ctx.session_bitmap);
@@ -261,9 +304,12 @@ void pppoe_cleanup(void)
         rte_free(g_pppoe_session_slab);
         g_pppoe_session_slab = NULL;
     }
-    if (g_pppoe_ctx.session_id_hash) rte_hash_free(g_pppoe_ctx.session_id_hash);
-    if (g_pppoe_ctx.session_ip_hash) rte_hash_free(g_pppoe_ctx.session_ip_hash);
-    if (g_pppoe_ctx.bitmap_mem) rte_free(g_pppoe_ctx.bitmap_mem);
+    if (g_pppoe_ctx.session_id_hash)
+        rte_hash_free(g_pppoe_ctx.session_id_hash);
+    if (g_pppoe_ctx.session_ip_hash)
+        rte_hash_free(g_pppoe_ctx.session_ip_hash);
+    if (g_pppoe_ctx.bitmap_mem)
+        rte_free(g_pppoe_ctx.bitmap_mem);
 }
 
 void pppoe_set_ac_name(const char *name)
@@ -279,7 +325,8 @@ void pppoe_set_service_name(const char *name)
 {
     if (name) {
         strncpy(g_pppoe_ctx.service_name, name, sizeof(g_pppoe_ctx.service_name) - 1);
-        g_pppoe_ctx.service_name[sizeof(g_pppoe_ctx.service_name) - 1] = '\0'; // Ensure null termination
+        g_pppoe_ctx.service_name[sizeof(g_pppoe_ctx.service_name) - 1] =
+            '\0'; // Ensure null termination
         YLOG_INFO("PPPoE Service-Name set to '%s'", g_pppoe_ctx.service_name);
     }
 }
@@ -287,12 +334,15 @@ void pppoe_set_service_name(const char *name)
 /**
  * Find session by ID and MAC (O(1))
  */
-static struct pppoe_session *pppoe_find_session(uint16_t session_id, const struct rte_ether_addr *mac);
-static struct pppoe_session *pppoe_find_session(uint16_t session_id, const struct rte_ether_addr *mac)
+static struct pppoe_session *pppoe_find_session(uint16_t session_id,
+                                                const struct rte_ether_addr *mac);
+static struct pppoe_session *pppoe_find_session(uint16_t session_id,
+                                                const struct rte_ether_addr *mac)
 {
     /* If MAC is NULL, do a linear search by session_id (slower but works for callbacks) */
     if (mac == NULL) {
-        if (session_id == 0) return NULL;
+        if (session_id == 0)
+            return NULL;
         /* Linear search through session slab */
         for (uint32_t i = 0; i < MAX_SESSIONS; i++) {
             if (g_pppoe_session_slab[i].session_id == session_id &&
@@ -331,7 +381,8 @@ struct pppoe_session *pppoe_find_session_by_ip(uint32_t ip)
 /**
  * Create new session
  */
-static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *mac, struct interface *iface, uint16_t vlan_id)
+static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *mac,
+                                                  struct interface *iface, uint16_t vlan_id)
 {
     /* 1. Allocate ID (Find free slot) */
     uint16_t id = g_pppoe_ctx.next_session_id;
@@ -340,7 +391,8 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
     /* Loop until we find a free bit (0) */
     while (rte_bitmap_get(g_pppoe_ctx.session_bitmap, id)) {
         id++;
-        if (id >= MAX_SESSIONS) id = 1;
+        if (id >= MAX_SESSIONS)
+            id = 1;
         attempts++;
         if (attempts >= MAX_SESSIONS) {
             YLOG_ERROR("PPPoE: Max sessions reached (%u)", MAX_SESSIONS);
@@ -351,7 +403,8 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
     /* Mark as used */
     rte_bitmap_set(g_pppoe_ctx.session_bitmap, id);
     g_pppoe_ctx.next_session_id = id + 1;
-    if (g_pppoe_ctx.next_session_id >= MAX_SESSIONS) g_pppoe_ctx.next_session_id = 1;
+    if (g_pppoe_ctx.next_session_id >= MAX_SESSIONS)
+        g_pppoe_ctx.next_session_id = 1;
 
     /* 2. Init Slot */
     struct pppoe_session *session = &g_pppoe_session_slab[id];
@@ -374,8 +427,8 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
         } else {
             /* Fallback to physical interface if VLAN interface not found */
             session->iface = iface;
-            YLOG_WARNING("PPPoE session %u: VLAN interface %s not found, using %s",
-                        id, vlan_iface_name, iface->name);
+            YLOG_WARNING("PPPoE session %u: VLAN interface %s not found, using %s", id,
+                         vlan_iface_name, iface->name);
         }
     } else {
         session->iface = iface;
@@ -384,7 +437,7 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
     /* Profile Lookup */
     const char *pool = pppoe_get_profile_pool(iface->name, vlan_id);
     if (pool) {
-        strncpy(session->pool_name, pool, sizeof(session->pool_name)-1);
+        strncpy(session->pool_name, pool, sizeof(session->pool_name) - 1);
     }
 
     session->state = PPPOE_STATE_INITIAL;
@@ -412,44 +465,25 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
     qos_tb_init(&session->downlink_tb, 10 * 1000 * 1000 / 8, 1024 * 1024);
 
     /* HA Sync */
-    ha_send_sync(HA_MSG_SESSION_ADD, session->session_id, session->client_mac.addr_bytes, 0, session->state);
+    ha_send_sync(HA_MSG_SESSION_ADD, session->session_id, session->client_mac.addr_bytes, 0,
+                 session->state);
 
     return session;
 }
 
 /**
  * Send PADO (Offer) packet
+ * FIXED: Uses pppoe_tx_send_discovery() to avoid double VLAN tagging bug
  */
-static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr *dst_mac, const uint8_t *host_uniq, uint16_t host_uniq_len, uint16_t vlan_id)
+static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr *dst_mac,
+                           const uint8_t *host_uniq, uint16_t host_uniq_len,
+                           const uint8_t *svc_name_req, uint16_t svc_name_len, uint16_t vlan_id)
 {
-    struct pkt_buf *pkt = pkt_alloc();
-    if (!pkt) return -1;
-
-    struct rte_mbuf *m = pkt->mbuf;
-    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    struct pppoe_hdr *pppoe;
-    uint8_t *payload;
+    /* Build PPPoE header + tags in temporary buffer */
+    uint8_t pppoe_buf[1500];
+    struct pppoe_hdr *pppoe = (struct pppoe_hdr *)pppoe_buf;
+    uint8_t *payload = pppoe_buf + sizeof(struct pppoe_hdr);
     uint16_t payload_len = 0;
-    uint16_t hdr_len;
-
-    /* Ethernet Header */
-    rte_ether_addr_copy(dst_mac, &eth->dst_addr);
-    rte_ether_addr_copy((const struct rte_ether_addr *)iface->mac_addr, &eth->src_addr);
-
-    /* Add VLAN tag if needed */
-    if (vlan_id > 0) {
-        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
-        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
-        vlan->vlan_tci = rte_cpu_to_be_16(vlan_id);
-        vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
-        pppoe = (struct pppoe_hdr *)(vlan + 1);
-        hdr_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr);
-    } else {
-        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
-        pppoe = (struct pppoe_hdr *)(eth + 1);
-        hdr_len = sizeof(struct rte_ether_hdr);
-    }
-    payload = (uint8_t *)(pppoe + 1);
 
     /* PPPoE Header */
     pppoe->ver = 1;
@@ -465,16 +499,26 @@ static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr 
     payload += sizeof(struct pppoe_tag) + strlen(g_pppoe_ctx.ac_name);
     payload_len += sizeof(struct pppoe_tag) + strlen(g_pppoe_ctx.ac_name);
 
-
-    /* Add Service-Name Tag (use global service_name or AC-Name as fallback) */
+    /* Add Service-Name Tag */
     tag = (struct pppoe_tag *)payload;
     tag->type = rte_cpu_to_be_16(PPPOE_TAG_SERVICE_NAME);
-    const char *svc_name = (g_pppoe_ctx.service_name[0]) ? g_pppoe_ctx.service_name : g_pppoe_ctx.ac_name;
-    uint16_t svc_len = strlen(svc_name);
-    tag->length = rte_cpu_to_be_16(svc_len);
-    memcpy(tag->value, svc_name, svc_len);
-    payload += sizeof(struct pppoe_tag) + svc_len;
-    payload_len += sizeof(struct pppoe_tag) + svc_len;
+
+    if (svc_name_len > 0 && svc_name_req) {
+        /* Echo requested service name */
+        tag->length = rte_cpu_to_be_16(svc_name_len);
+        memcpy(tag->value, svc_name_req, svc_name_len);
+        payload += sizeof(struct pppoe_tag) + svc_name_len;
+        payload_len += sizeof(struct pppoe_tag) + svc_name_len;
+    } else {
+        /* Default Service Name */
+        const char *def_svc =
+            (g_pppoe_ctx.service_name[0]) ? g_pppoe_ctx.service_name : g_pppoe_ctx.ac_name;
+        uint16_t def_len = strlen(def_svc);
+        tag->length = rte_cpu_to_be_16(def_len);
+        memcpy(tag->value, def_svc, def_len);
+        payload += sizeof(struct pppoe_tag) + def_len;
+        payload_len += sizeof(struct pppoe_tag) + def_len;
+    }
 
     /* Add Host-Uniq Tag if present in PADI */
     if (host_uniq && host_uniq_len > 0) {
@@ -486,88 +530,83 @@ static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr 
         payload_len += sizeof(struct pppoe_tag) + host_uniq_len;
     }
 
+    /* Add AC-Cookie Tag (required by RFC 2516 for stateless discovery) */
+    {
+#define COOKIE_LENGTH 24
+        uint8_t cookie[COOKIE_LENGTH];
+        uint32_t ts = (uint32_t)time(NULL);
+
+        /* Simple hash: XOR MAC bytes with interface name and timestamp */
+        memset(cookie, 0, COOKIE_LENGTH);
+        for (int i = 0; i < 6; i++) {
+            cookie[i] = dst_mac->addr_bytes[i] ^ ((ts >> (i * 4)) & 0xFF);
+            cookie[i + 6] = dst_mac->addr_bytes[i] ^ iface->mac_addr[i];
+        }
+        cookie[12] = (ts >> 24) & 0xFF;
+        cookie[13] = (ts >> 16) & 0xFF;
+        cookie[14] = (ts >> 8) & 0xFF;
+        cookie[15] = ts & 0xFF;
+        cookie[16] = (vlan_id >> 8) & 0xFF;
+        cookie[17] = vlan_id & 0xFF;
+        cookie[18] = iface->ifindex & 0xFF;
+        cookie[19] = (iface->ifindex >> 8) & 0xFF;
+        cookie[20] = 'Y';
+        cookie[21] = 'R';
+        cookie[22] = 'C';
+        cookie[23] = 'K';
+
+        tag = (struct pppoe_tag *)payload;
+        tag->type = rte_cpu_to_be_16(PPPOE_TAG_AC_COOKIE);
+        tag->length = rte_cpu_to_be_16(COOKIE_LENGTH);
+        memcpy(tag->value, cookie, COOKIE_LENGTH);
+        payload += sizeof(struct pppoe_tag) + COOKIE_LENGTH;
+        payload_len += sizeof(struct pppoe_tag) + COOKIE_LENGTH;
+#undef COOKIE_LENGTH
+    }
+
     pppoe->length = rte_cpu_to_be_16(payload_len);
 
-    /* Set packet length - enforce minimum Ethernet frame size (60 bytes without FCS) */
-    uint16_t frame_len = hdr_len + sizeof(struct pppoe_hdr) + payload_len;
-    if (frame_len < 60) {
-        /* Pad with zeros to minimum size */
-        memset((uint8_t *)eth + frame_len, 0, 60 - frame_len);
-        frame_len = 60;
+    /* Get DPDK port and queue from interface */
+    uint16_t port_id = interface_get_dpdk_port(iface);
+    uint16_t queue_id = 0; /* Use queue 0 for control plane */
+
+    YLOG_INFO("[PADO_TX] Sending on port=%u queue=%u vlan=%u (len=%u)", port_id, queue_id, vlan_id,
+              (uint16_t)(sizeof(struct pppoe_hdr) + payload_len));
+
+    /* Send using capability-aware TX function (fixes double VLAN tagging bug) */
+    return pppoe_tx_send_discovery(port_id, queue_id, dst_mac, iface->mac_addr, vlan_id, pppoe_buf,
+                                   sizeof(struct pppoe_hdr) + payload_len);
+}
+
+/* Helper to dump packet hex */
+static void log_packet_hex(const char *type, struct pkt_buf *pkt)
+{
+    if (!pkt || !pkt->mbuf)
+        return;
+    char buf[1024];
+    char *ptr = buf;
+    uint8_t *data = rte_pktmbuf_mtod(pkt->mbuf, uint8_t *);
+    uint16_t len = pkt->len > 64 ? 64 : pkt->len; /* Log first 64 bytes */
+    ptr += sprintf(ptr, "PPPoE %s (%u bytes): ", type, pkt->len);
+    for (int i = 0; i < len; i++) {
+        ptr += sprintf(ptr, "%02x ", data[i]);
     }
-    m->data_len = frame_len;
-    m->pkt_len = frame_len;
-    pkt->len = frame_len;
-
-    /* Direct DPDK TX for PPPoE control packets (bypass HQoS for reliability) */
-    /* Get DPDK port from interface */
-    uint16_t port_id = (iface->ifindex == 1) ? 0 : 1;  /* Gi0/1 = port 0, Gi0/2 = port 1 */
-
-    /* Allocate new mbuf and copy data (pkt->mbuf may be internal pool) */
-    extern struct dpdk_config g_dpdk_config;
-    struct rte_mempool *mp = (g_dpdk_config.pkt_mempool && g_dpdk_config.pkt_mempool->pool) ?
-                             (struct rte_mempool *)g_dpdk_config.pkt_mempool->pool : NULL;
-    if (!mp) {
-        YLOG_ERROR("PPPoE: No mempool for PADO TX");
-        pkt_free(pkt);
-        return -1;
-    }
-
-    struct rte_mbuf *tx_mbuf = rte_pktmbuf_alloc(mp);
-    if (!tx_mbuf) {
-        YLOG_ERROR("PPPoE: Failed to allocate TX mbuf for PADO");
-        pkt_free(pkt);
-        return -1;
-    }
-
-    void *tx_data = rte_pktmbuf_append(tx_mbuf, frame_len);
-    if (!tx_data) {
-        rte_pktmbuf_free(tx_mbuf);
-        pkt_free(pkt);
-        return -1;
-    }
-    rte_memcpy(tx_data, pkt->data, frame_len);
-
-    /* Send directly via rte_eth_tx_burst (lockless, bypasses HQoS) */
-    uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &tx_mbuf, 1);
-
-    YLOG_INFO("PPPoE: PADO TX to port %u: %s (nb_tx=%u)", port_id,
-              nb_tx == 1 ? "SUCCESS" : "FAILED", nb_tx);
-
-    if (nb_tx == 0) {
-        rte_pktmbuf_free(tx_mbuf);
-        pkt_free(pkt);
-        return -1;
-    }
-
-    pkt_free(pkt);
-    return 0;
+    YLOG_INFO("%s", buf);
 }
 
 /**
- * Send PADS (Session Confirmation) packet - with VLAN support
+ * Send PADS (Session Confirmation) packet
+ * FIXED: Uses pppoe_tx_send_discovery() to avoid double VLAN tagging bug
  */
-static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_uniq, uint16_t host_uniq_len)
+static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_uniq,
+                           uint16_t host_uniq_len, const uint8_t *svc_name_req,
+                           uint16_t svc_name_len)
 {
-    struct pkt_buf *pkt = pkt_alloc();
-    if (!pkt) return -1;
-
-    struct rte_mbuf *m = pkt->mbuf;
-    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    struct pppoe_hdr *pppoe;
-    uint8_t *payload;
+    /* Build PPPoE header + tags in temporary buffer */
+    uint8_t pppoe_buf[1500];
+    struct pppoe_hdr *pppoe = (struct pppoe_hdr *)pppoe_buf;
+    uint8_t *payload = pppoe_buf + sizeof(struct pppoe_hdr);
     uint16_t payload_len = 0;
-    uint16_t hdr_len;
-
-    /* Ethernet Header */
-    rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
-    rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
-
-    /* PPPoE Discovery - VLAN tagging handled by VLAN interface */
-    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
-    pppoe = (struct pppoe_hdr *)(eth + 1);
-    hdr_len = sizeof(struct rte_ether_hdr);
-    payload = (uint8_t *)(pppoe + 1);
 
     /* PPPoE Header */
     pppoe->ver = 1;
@@ -579,21 +618,28 @@ static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_un
     struct pppoe_tag *tag = (struct pppoe_tag *)payload;
     tag->type = rte_cpu_to_be_16(PPPOE_TAG_SERVICE_NAME);
 
-    /* Use configured Service-Name (or AC-Name as fallback) */
-    const char *svc_name = g_pppoe_ctx.service_name[0] ? g_pppoe_ctx.service_name :
-                          (g_pppoe_ctx.ac_name[0] ? g_pppoe_ctx.ac_name : NULL);
-
-    if (svc_name) {
-        size_t slen = strlen(svc_name);
-        tag->length = rte_cpu_to_be_16(slen);
-        memcpy(tag->value, svc_name, slen);
-        payload += sizeof(struct pppoe_tag) + slen;
-        payload_len += sizeof(struct pppoe_tag) + slen;
+    if (svc_name_len > 0 && svc_name_req) {
+        /* Echo requested service name from PADR */
+        tag->length = rte_cpu_to_be_16(svc_name_len);
+        memcpy(tag->value, svc_name_req, svc_name_len);
+        payload += sizeof(struct pppoe_tag) + svc_name_len;
+        payload_len += sizeof(struct pppoe_tag) + svc_name_len;
     } else {
-        /* Empty Service-Name if none configured */
-        tag->length = 0;
-        payload += sizeof(struct pppoe_tag);
-        payload_len += sizeof(struct pppoe_tag);
+        /* Default/Empty Service-Name */
+        const char *def_svc = (g_pppoe_ctx.service_name[0])
+                                  ? g_pppoe_ctx.service_name
+                                  : (g_pppoe_ctx.ac_name[0] ? g_pppoe_ctx.ac_name : NULL);
+        if (def_svc) {
+            size_t slen = strlen(def_svc);
+            tag->length = rte_cpu_to_be_16(slen);
+            memcpy(tag->value, def_svc, slen);
+            payload += sizeof(struct pppoe_tag) + slen;
+            payload_len += sizeof(struct pppoe_tag) + slen;
+        } else {
+            tag->length = 0;
+            payload += sizeof(struct pppoe_tag);
+            payload_len += sizeof(struct pppoe_tag);
+        }
     }
 
     /* Add Host-Uniq Tag if present */
@@ -608,64 +654,51 @@ static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_un
 
     pppoe->length = rte_cpu_to_be_16(payload_len);
 
-    /* Set packet length - enforce minimum Ethernet frame size (60 bytes without FCS) */
-    uint16_t frame_len = hdr_len + sizeof(struct pppoe_hdr) + payload_len;
-    if (frame_len < 60) {
-        memset((uint8_t *)eth + frame_len, 0, 60 - frame_len);
-        frame_len = 60;
-    }
-    m->data_len = frame_len;
-    m->pkt_len = frame_len;
-    pkt->len = frame_len;
+    /* Get DPDK port and queue from interface */
+    uint16_t port_id = interface_get_dpdk_port(session->iface);
+    uint16_t queue_id = 0; /* Use queue 0 for control plane */
 
-    /* Send packet via HQoS (immediate drain configured in physical.c) */
-    return interface_send(session->iface, pkt);
+    YLOG_INFO("[PADS_TX] Sending session=%u on port=%u queue=%u vlan=%u (len=%u)",
+              session->session_id, port_id, queue_id, session->vlan_id,
+              (uint16_t)(sizeof(struct pppoe_hdr) + payload_len));
+
+    /* Send using capability-aware TX function (fixes double VLAN tagging bug) */
+    return pppoe_tx_send_discovery(port_id, queue_id, &session->client_mac,
+                                   session->iface->mac_addr, session->vlan_id, pppoe_buf,
+                                   sizeof(struct pppoe_hdr) + payload_len);
 }
 
 /**
  * Send PADT (Terminate Session) packet
+ * FIXED: Uses pppoe_tx_send_discovery() to avoid double VLAN tagging bug
  */
 int pppoe_send_padt(struct pppoe_session *session)
 {
-    if (!session || !session->iface) return -1;
+    if (!session || !session->iface)
+        return -1;
 
-    struct pkt_buf *pkt = pkt_alloc();
-    if (!pkt) return -1;
-
-    struct rte_mbuf *m = pkt->mbuf;
-    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    struct pppoe_hdr *pppoe = (struct pppoe_hdr *)(eth + 1);
-
-    /* Ethernet Header */
-    rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
-    rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
-    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
+    /* Build PPPoE header (no payload for PADT) */
+    uint8_t pppoe_buf[sizeof(struct pppoe_hdr)];
+    struct pppoe_hdr *pppoe = (struct pppoe_hdr *)pppoe_buf;
 
     /* PPPoE Header */
     pppoe->ver = 1;
     pppoe->type = 1;
     pppoe->code = PPPOE_CODE_PADT;
     pppoe->session_id = rte_cpu_to_be_16(session->session_id);
-    pppoe->length = 0;
+    pppoe->length = 0; /* No tags for PADT */
 
-    /* Set packet length - enforce minimum Ethernet frame size (60 bytes without FCS) */
-    uint16_t frame_len = sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr);
-    if (frame_len < 60) {
-        memset((uint8_t *)eth + frame_len, 0, 60 - frame_len);
-        frame_len = 60;
-    }
-    m->data_len = frame_len;
-    m->pkt_len = frame_len;
-    pkt->len = frame_len;
+    /* Get DPDK port and queue from interface */
+    uint16_t port_id = interface_get_dpdk_port(session->iface);
+    uint16_t queue_id = 0; /* Use queue 0 for control plane */
 
-    YLOG_INFO("Sending PADT for session %u", session->session_id);
+    YLOG_INFO("[PADT_TX] Sending session=%u on port=%u queue=%u vlan=%u", session->session_id,
+              port_id, queue_id, session->vlan_id);
 
-    /* Send packet */
-    int ret = interface_send(session->iface, pkt);
-    if (ret != 0) {
-        pkt_free(pkt);
-    }
-    return ret;
+    /* Send using capability-aware TX function (fixes double VLAN tagging bug) */
+    return pppoe_tx_send_discovery(port_id, queue_id, &session->client_mac,
+                                   session->iface->mac_addr, session->vlan_id, pppoe_buf,
+                                   sizeof(struct pppoe_hdr));
 }
 
 int pppoe_send_session_packet(struct pppoe_session *session, struct pkt_buf *pkt)
@@ -722,7 +755,8 @@ int pppoe_send_session_packet(struct pppoe_session *session, struct pkt_buf *pkt
     /* Note: forward_ipv4_packet already set src/dst MACs, but for Ethernet forwarding */
     /* We need to fix them for PPPoE */
     rte_ether_addr_copy(&session->client_mac, &new_eth->dst_addr);
-    rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &new_eth->src_addr);
+    rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr,
+                        &new_eth->src_addr);
     new_eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
 
     /* Fill PPPoE Header */
@@ -764,101 +798,125 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
         struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
         vlan_id = rte_be_to_cpu_16(vlan->vlan_tci) & 0xFFF;
         pppoe = (struct pppoe_hdr *)(vlan + 1);
-        if (m->data_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) + sizeof(struct pppoe_hdr)) return -1;
+        if (m->data_len <
+            sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) + sizeof(struct pppoe_hdr))
+            return -1;
     } else {
         pppoe = (struct pppoe_hdr *)(eth + 1);
-        if (m->data_len < sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr)) return -1;
+        if (m->data_len < sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr))
+            return -1;
     }
 
     if (pppoe->ver != 1 || pppoe->type != 1) {
         return -1;
     }
 
-    /* Parse Tags to find Host-Uniq */
+    /* DEBUG: Log all PPPoE codes received */
+    YLOG_INFO("PPPoE RX: code=0x%02x vlan=%u from %02x:%02x:%02x:%02x:%02x:%02x", pppoe->code,
+              vlan_id, eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+              eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3], eth->src_addr.addr_bytes[4],
+              eth->src_addr.addr_bytes[5]);
+
+    /* Parse Tags to find Host-Uniq and Service-Name */
     uint8_t *payload = (uint8_t *)(pppoe + 1);
     uint16_t len = rte_be_to_cpu_16(pppoe->length);
     uint8_t *host_uniq = NULL;
     uint16_t host_uniq_len = 0;
+    uint8_t *svc_name_req = NULL;
+    uint16_t svc_name_len = 0;
 
     uint16_t offset = 0;
-    while (offset < len) {
+    while (offset + sizeof(struct pppoe_tag) <= len) {
         struct pppoe_tag *tag = (struct pppoe_tag *)(payload + offset);
         uint16_t tag_type = rte_be_to_cpu_16(tag->type);
         uint16_t tag_len = rte_be_to_cpu_16(tag->length);
 
+        /* Bounds check: ensure tag value doesn't exceed packet */
+        if (offset + sizeof(struct pppoe_tag) + tag_len > len) {
+            YLOG_WARNING("PPPoE: Malformed tag (type=0x%04x len=%u exceeds packet bounds)",
+                         tag_type, tag_len);
+            break;
+        }
+
         if (tag_type == PPPOE_TAG_HOST_UNIQ) {
             host_uniq = tag->value;
             host_uniq_len = tag_len;
+        } else if (tag_type == PPPOE_TAG_SERVICE_NAME) {
+            svc_name_req = tag->value;
+            svc_name_len = tag_len;
+            YLOG_INFO("PPPoE: PADI requested Service-Name: '%.*s'", svc_name_len, svc_name_req);
         }
 
         offset += sizeof(struct pppoe_tag) + tag_len;
     }
 
     switch (pppoe->code) {
-    case PPPOE_CODE_PADI:
-        {
-            /* Per-MAC Rate Limiter */
-            struct padi_node *node = NULL;
-            int ret = rte_hash_lookup_data(g_padi_hash, &eth->src_addr, (void **)&node);
+    case PPPOE_CODE_PADI: {
+        /* Per-MAC Rate Limiter */
+        struct padi_node *node = NULL;
+        int ret = rte_hash_lookup_data(g_padi_hash, &eth->src_addr, (void **)&node);
 
-            if (ret < 0) {
-                /* Alloc new node */
-                /* Simple linear search for free/old slot (Optimized: use ring in production) */
-                int free_idx = -1;
-                /* Try specific range based on clock to avoid full scan? Or just scan 100 slots? */
-                /* For now: Scan 32 slots starting from LRU clock */
-                for (int i = 0; i < 32; i++) {
-                     int idx = (g_padi_lru_clock + i) % MAX_PADI_TRACKERS;
-                     if (!g_padi_nodes[idx].used || (time(NULL) - g_padi_nodes[idx].last_seen > 10)) {
-                         free_idx = idx;
-                         /* If used, remove old hash entry */
-                         if (g_padi_nodes[idx].used) {
-                             rte_hash_del_key(g_padi_hash, &g_padi_nodes[idx].mac);
-                         }
-                         break;
-                     }
-                }
-                g_padi_lru_clock = (g_padi_lru_clock + 1) % MAX_PADI_TRACKERS;
-
-                if (free_idx >= 0) {
-                    node = &g_padi_nodes[free_idx];
-                    memset(node, 0, sizeof(*node));
-                    rte_ether_addr_copy(&eth->src_addr, &node->mac);
-                    node->used = true;
-                    // Limit: 100 PADI/sec per MAC, Burst 20 (production-grade for 50k+ subs)
-                    qos_tb_init(&node->tb, 100, 20);
-                    rte_hash_add_key_data(g_padi_hash, &node->mac, node);
-                } else {
-                    /* Table full and no expired entries found in scan window */
-                    YLOG_WARNING("PPPoE: PADI Table Full, dropping packet from new MAC");
-                    return 0;
+        if (ret < 0) {
+            /* Alloc new node */
+            /* Simple linear search for free/old slot (Optimized: use ring in production) */
+            int free_idx = -1;
+            /* Try specific range based on clock to avoid full scan? Or just scan 100 slots? */
+            /* For now: Scan 32 slots starting from LRU clock */
+            for (int i = 0; i < 32; i++) {
+                int idx = (g_padi_lru_clock + i) % MAX_PADI_TRACKERS;
+                if (!g_padi_nodes[idx].used || (time(NULL) - g_padi_nodes[idx].last_seen > 10)) {
+                    free_idx = idx;
+                    /* If used, remove old hash entry */
+                    if (g_padi_nodes[idx].used) {
+                        rte_hash_del_key(g_padi_hash, &g_padi_nodes[idx].mac);
+                    }
+                    break;
                 }
             }
+            g_padi_lru_clock = (g_padi_lru_clock + 1) % MAX_PADI_TRACKERS;
 
-            node->last_seen = time(NULL);
-            if (!qos_tb_conform(&node->tb, 1)) {
-                static time_t last_log = 0;
-                if (time(NULL) > last_log) {
-                    YLOG_WARNING("PPPoE: PADI Rate Limited for MAC %02x:%02x:...", eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1]);
-                    last_log = time(NULL);
-                }
+            if (free_idx >= 0) {
+                node = &g_padi_nodes[free_idx];
+                memset(node, 0, sizeof(*node));
+                rte_ether_addr_copy(&eth->src_addr, &node->mac);
+                node->used = true;
+                // Limit: 100 PADI/sec per MAC, Burst 20 (production-grade for 50k+ subs)
+                qos_tb_init(&node->tb, 100, 20);
+                rte_hash_add_key_data(g_padi_hash, &node->mac, node);
+            } else {
+                /* Table full and no expired entries found in scan window */
+                YLOG_WARNING("PPPoE: PADI Table Full, dropping packet from new MAC");
                 return 0;
             }
-
-            YLOG_INFO("PPPoE: Received PADI from %02x:%02x:%02x:%02x:%02x:%02x",
-                      eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
-                      eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
-                      eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
-
-            /* Send PADO with VLAN tag if received on VLAN */
-            YLOG_INFO("PPPoE: Sending PADO to %02x:%02x:%02x:%02x:%02x:%02x vlan=%u",
-                      eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
-                      eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
-                      eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5], vlan_id);
-            int pado_ret = pppoe_send_pado(iface, &eth->src_addr, host_uniq, host_uniq_len, vlan_id);
-            YLOG_INFO("PPPoE: PADO send result: %d", pado_ret);
         }
-        break;
+
+        node->last_seen = time(NULL);
+        if (!qos_tb_conform(&node->tb, 1)) {
+            static time_t last_log = 0;
+            if (time(NULL) > last_log) {
+                YLOG_WARNING("PPPoE: PADI Rate Limited for MAC %02x:%02x:...",
+                             eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1]);
+                last_log = time(NULL);
+            }
+            return 0;
+        }
+
+        YLOG_INFO("PPPoE: Received PADI from %02x:%02x:%02x:%02x:%02x:%02x",
+                  eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+                  eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
+                  eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
+
+        /* Send PADO with VLAN tag if received on VLAN */
+        YLOG_INFO("PPPoE: Sending PADO to %02x:%02x:%02x:%02x:%02x:%02x vlan=%u",
+                  eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+                  eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
+                  eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5], vlan_id);
+        int pado_ret = pppoe_send_pado(iface, &eth->src_addr, host_uniq, host_uniq_len,
+                                       svc_name_req, svc_name_len, vlan_id);
+        /* Debug: Log PADO result */
+        if (pado_ret < 0)
+            YLOG_ERROR("PPPoE: Failed to send PADO");
+    } break;
 
     case PPPOE_CODE_PADR:
         YLOG_INFO("PPPoE: Received PADR from %02x:%02x:%02x:%02x:%02x:%02x",
@@ -866,14 +924,98 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
                   eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
                   eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
 
+        /* Parse Tags for PADR (Host-Uniq + Service-Name + AC-Cookie) */
+        payload = (uint8_t *)(pppoe + 1);
+        len = rte_be_to_cpu_16(pppoe->length);
+        host_uniq = NULL;
+        host_uniq_len = 0;
+        svc_name_req = NULL;
+        svc_name_len = 0;
+        uint8_t *ac_cookie = NULL;
+        uint16_t ac_cookie_len = 0;
+        offset = 0;
+
+        /* Bounds-checked tag parsing */
+        while (offset + sizeof(struct pppoe_tag) <= len) {
+            struct pppoe_tag *tag = (struct pppoe_tag *)(payload + offset);
+            uint16_t tag_type = rte_be_to_cpu_16(tag->type);
+            uint16_t tag_len = rte_be_to_cpu_16(tag->length);
+
+            /* Bounds check: ensure tag value doesn't exceed packet */
+            if (offset + sizeof(struct pppoe_tag) + tag_len > len) {
+                YLOG_WARNING("PPPoE: PADR malformed tag (type=0x%04x len=%u exceeds packet)",
+                             tag_type, tag_len);
+                break;
+            }
+
+            if (tag_type == PPPOE_TAG_HOST_UNIQ) {
+                host_uniq = tag->value;
+                host_uniq_len = tag_len;
+            } else if (tag_type == PPPOE_TAG_SERVICE_NAME) {
+                svc_name_req = tag->value;
+                svc_name_len = tag_len;
+            } else if (tag_type == PPPOE_TAG_AC_COOKIE) {
+                ac_cookie = tag->value;
+                ac_cookie_len = tag_len;
+            }
+            offset += sizeof(struct pppoe_tag) + tag_len;
+        }
+
+/* Validate AC-Cookie (24 bytes, contains MAC+timestamp+signature) */
+#define PPPOE_COOKIE_LENGTH 24
+#define PPPOE_COOKIE_TIMEOUT 60
+        if (!ac_cookie || ac_cookie_len != PPPOE_COOKIE_LENGTH) {
+            YLOG_WARNING("PPPoE: PADR missing or invalid AC-Cookie (len=%u)", ac_cookie_len);
+            break; /* Drop silently - DoS protection */
+        }
+
+        /* Validate cookie contents */
+        {
+            /* Extract timestamp from cookie bytes [12-15] */
+            uint32_t cookie_ts = ((uint32_t)ac_cookie[12] << 24) | ((uint32_t)ac_cookie[13] << 16) |
+                                 ((uint32_t)ac_cookie[14] << 8) | ac_cookie[15];
+            uint32_t now = (uint32_t)time(NULL);
+
+            /* Cookie expiry check */
+            if (now - cookie_ts > PPPOE_COOKIE_TIMEOUT) {
+                YLOG_WARNING("PPPoE: PADR cookie expired (age=%u sec)", now - cookie_ts);
+                break;
+            }
+
+            /* Verify VLAN ID matches */
+            uint16_t cookie_vlan = ((uint16_t)ac_cookie[16] << 8) | ac_cookie[17];
+            if (cookie_vlan != vlan_id) {
+                YLOG_WARNING("PPPoE: PADR cookie VLAN mismatch (%u vs %u)", cookie_vlan, vlan_id);
+                break;
+            }
+
+            /* Verify ifindex matches */
+            uint16_t cookie_ifindex = ac_cookie[18] | ((uint16_t)ac_cookie[19] << 8);
+            if (cookie_ifindex != (iface->ifindex & 0xFFFF)) {
+                YLOG_WARNING("PPPoE: PADR cookie ifindex mismatch");
+                break;
+            }
+
+            /* Verify magic signature */
+            if (ac_cookie[20] != 'Y' || ac_cookie[21] != 'R' || ac_cookie[22] != 'C' ||
+                ac_cookie[23] != 'K') {
+                YLOG_WARNING("PPPoE: PADR cookie signature invalid");
+                break;
+            }
+
+            YLOG_DEBUG("PPPoE: PADR cookie validated (age=%u sec)", now - cookie_ts);
+        }
+#undef PPPOE_COOKIE_LENGTH
+#undef PPPOE_COOKIE_TIMEOUT
+
         /* Create Session */
         struct pppoe_session *session = pppoe_create_session(&eth->src_addr, iface, vlan_id);
         if (session) {
-            session->state = PPPOE_STATE_PADR_RCVD;  /* Will transition to ESTABLISHED after auth */
-            YLOG_INFO("PPPoE: Session %u established", session->session_id);
+            session->state = PPPOE_STATE_PADR_RCVD;
+            YLOG_INFO("PPPoE: Session %u established. Sending PADS.", session->session_id);
 
-            /* Send PADS */
-            pppoe_send_pads(session, host_uniq, host_uniq_len);
+            /* Send PADS (Echo Service-Name) */
+            pppoe_send_pads(session, host_uniq, host_uniq_len, svc_name_req, svc_name_len);
 
             /* Start LCP Negotiation */
             ppp_lcp_open(session);
@@ -885,13 +1027,15 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
         /* Terminate session */
         /* Find session by MAC */
         {
-            struct pppoe_session *sess = pppoe_find_session(0, &eth->src_addr); /* ID 0 matches any? No, PADT has Session ID */
+            struct pppoe_session *sess = pppoe_find_session(
+                0, &eth->src_addr); /* ID 0 matches any? No, PADT has Session ID */
             /* PADT has Session ID in header */
             uint16_t sid = rte_be_to_cpu_16(pppoe->session_id);
             sess = pppoe_find_session(sid, &eth->src_addr);
             if (sess) {
                 sess->state = PPPOE_STATE_TERMINATED;
-                ha_send_sync(HA_MSG_SESSION_DEL, sess->session_id, sess->client_mac.addr_bytes, 0, sess->state);
+                ha_send_sync(HA_MSG_SESSION_DEL, sess->session_id, sess->client_mac.addr_bytes, 0,
+                             sess->state);
             }
         }
         break;
@@ -919,7 +1063,8 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
     if (ether_type == RTE_ETHER_TYPE_VLAN) {
         struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
         pppoe = (struct pppoe_hdr *)(vlan + 1);
-        if (m->data_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) + sizeof(struct pppoe_hdr) + 2) {
+        if (m->data_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) +
+                              sizeof(struct pppoe_hdr) + 2) {
             return -1;
         }
     } else {
@@ -939,11 +1084,11 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
     struct pppoe_session *session = pppoe_find_session(session_id, &eth->src_addr);
 
     if (!session) {
-        YLOG_INFO("PPPoE: Dropped packet for unknown session ID %u from %02x:%02x:%02x:%02x:%02x:%02x",
-                  session_id,
-                  eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
-                  eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
-                  eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
+        YLOG_INFO(
+            "PPPoE: Dropped packet for unknown session ID %u from %02x:%02x:%02x:%02x:%02x:%02x",
+            session_id, eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+            eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3], eth->src_addr.addr_bytes[4],
+            eth->src_addr.addr_bytes[5]);
         return -1;
     }
 
@@ -982,19 +1127,26 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
                     uint32_t i = 0;
                     while (i < opt_len) {
                         uint8_t kind = opts[i];
-                        if (kind == 0) break; /* End */
-                        if (kind == 1) { i++; continue; } /* NOP */
+                        if (kind == 0)
+                            break; /* End */
+                        if (kind == 1) {
+                            i++;
+                            continue;
+                        } /* NOP */
 
-                        if (i + 1 >= opt_len) break;
-                        uint8_t len = opts[i+1];
-                        if (len < 2 || i + len > opt_len) break;
+                        if (i + 1 >= opt_len)
+                            break;
+                        uint8_t len = opts[i + 1];
+                        if (len < 2 || i + len > opt_len)
+                            break;
 
                         if (kind == 2 && len == 4) { /* MSS */
-                            uint16_t mss = (opts[i+2] << 8) | opts[i+3];
+                            uint16_t mss = (opts[i + 2] << 8) | opts[i + 3];
                             if (mss > 1452) {
-                                YLOG_INFO("PPPoE: Clamping MSS from %u to 1452 for Session %u", mss, session->session_id);
-                                opts[i+2] = (1452 >> 8) & 0xFF;
-                                opts[i+3] = 1452 & 0xFF;
+                                YLOG_INFO("PPPoE: Clamping MSS from %u to 1452 for Session %u", mss,
+                                          session->session_id);
+                                opts[i + 2] = (1452 >> 8) & 0xFF;
+                                opts[i + 3] = 1452 & 0xFF;
                                 /* Recalculate Checksum */
                                 tcp->cksum = 0;
                                 tcp->cksum = rte_ipv4_udptcp_cksum(ipv4, tcp);
@@ -1040,10 +1192,12 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
 
 void pppoe_terminate_session(struct pppoe_session *session, const char *reason)
 {
-    if (!session) return;
+    if (!session)
+        return;
     (void)reason;
 
-    YLOG_INFO("PPPoE: Terminating session %u (reason: %s)", session->session_id, reason ? reason : "unknown");
+    YLOG_INFO("PPPoE: Terminating session %u (reason: %s)", session->session_id,
+              reason ? reason : "unknown");
 
     /* Send PADT */
     pppoe_send_padt(session);
@@ -1054,10 +1208,11 @@ void pppoe_terminate_session(struct pppoe_session *session, const char *reason)
     }
 
     /* HA Sync */
-    ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0, session->state);
+    ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0,
+                 session->state);
 
     /* Remove from Hash Tables */
-    struct session_key_id key = { .session_id = session->session_id };
+    struct session_key_id key = {.session_id = session->session_id};
     rte_ether_addr_copy(&session->client_mac, &key.mac);
 
     rte_hash_del_key(g_pppoe_ctx.session_id_hash, &key);
@@ -1072,8 +1227,8 @@ void pppoe_terminate_session(struct pppoe_session *session, const char *reason)
     session->state = PPPOE_STATE_TERMINATED;
 }
 
-#define PPPOE_ECHO_INTERVAL    30  /* Send echo every 30 seconds */
-#define PPPOE_ECHO_MAX_FAILS    3  /* Max failures before terminate */
+#define PPPOE_ECHO_INTERVAL 30 /* Send echo every 30 seconds */
+#define PPPOE_ECHO_MAX_FAILS 3 /* Max failures before terminate */
 
 void pppoe_check_keepalives(void)
 {
@@ -1091,7 +1246,8 @@ void pppoe_check_keepalives(void)
                 if (curr->state == PPPOE_STATE_SESSION_ESTABLISHED) {
                     if (curr->lcp_state == LCP_STATE_OPENED) {
                         /* LCP Echo */
-                        if (curr->last_echo_ts == 0 || (now - curr->last_echo_ts) >= PPPOE_ECHO_INTERVAL) {
+                        if (curr->last_echo_ts == 0 ||
+                            (now - curr->last_echo_ts) >= PPPOE_ECHO_INTERVAL) {
                             if (curr->echo_failures >= PPPOE_ECHO_MAX_FAILS) {
                                 pppoe_terminate_session(curr, "Echo timeout");
                                 /* Continue to next bit? Session terminated. */
@@ -1115,7 +1271,8 @@ void pppoe_check_keepalives(void)
 
                     /* Idle Timeout */
                     if (curr->idle_timeout > 0) {
-                        uint64_t last = (curr->last_activity_ts > 0) ? curr->last_activity_ts : curr->start_ts;
+                        uint64_t last =
+                            (curr->last_activity_ts > 0) ? curr->last_activity_ts : curr->start_ts;
                         if (now - last >= curr->idle_timeout) {
                             pppoe_terminate_session(curr, "Idle timeout");
                         }
@@ -1139,9 +1296,11 @@ void pppoe_check_accounting(void)
             if (mask & (1ULL << i)) {
                 struct pppoe_session *curr = &g_pppoe_session_slab[pos + i];
 
-                if (curr->state == PPPOE_STATE_SESSION_ESTABLISHED && curr->acct_interim_interval > 0) {
+                if (curr->state == PPPOE_STATE_SESSION_ESTABLISHED &&
+                    curr->acct_interim_interval > 0) {
                     if (now - curr->last_acct_ts >= curr->acct_interim_interval) {
-                        radius_acct_request(RADIUS_ACCT_STATUS_INTERIM, curr->session_id, curr->username, curr->client_ip);
+                        radius_acct_request(RADIUS_ACCT_STATUS_INTERIM, curr->session_id,
+                                            curr->username, curr->client_ip);
                         curr->last_acct_ts = now;
                     }
                 }
@@ -1164,9 +1323,11 @@ void pppoe_update_qos(const uint8_t *mac, uint64_t rate_bps)
 
                 if (rte_is_same_ether_addr(&curr->client_mac, (const struct rte_ether_addr *)mac)) {
                     uint64_t burst = rate_bps / 8;
-                    if (burst < 1500) burst = 1500;
+                    if (burst < 1500)
+                        burst = 1500;
                     qos_tb_init(&curr->downlink_tb, rate_bps / 8, burst);
-                    YLOG_INFO("PPPoE: Updated QoS for logic %02x:%02x... to %lu bps", mac[0], mac[1], rate_bps);
+                    YLOG_INFO("PPPoE: Updated QoS for logic %02x:%02x... to %lu bps", mac[0],
+                              mac[1], rate_bps);
                     return;
                 }
             }
@@ -1179,7 +1340,6 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
 {
     struct pppoe_session *session = pppoe_find_session(session_id, NULL);
 
-
     if (!session) {
         YLOG_WARNING("PPPoE: Auth response for unknown session %u", session_id);
         return;
@@ -1187,7 +1347,9 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
 
     /* CRITICAL: Atomic CAS to prevent duplicate auth processing from multiple lcores */
     uint8_t expected_state = PPPOE_STATE_PADR_RCVD;
-    if (!__atomic_compare_exchange_n(&session->state, &expected_state, PPPOE_STATE_SESSION_ESTABLISHED, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    if (!__atomic_compare_exchange_n(&session->state, &expected_state,
+                                     PPPOE_STATE_SESSION_ESTABLISHED, 0, __ATOMIC_SEQ_CST,
+                                     __ATOMIC_SEQ_CST)) {
         return;
     }
 
@@ -1196,11 +1358,10 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
         uint32_t assigned_ip = (result->framed_ip != 0) ? result->framed_ip : session->client_ip;
 
         YLOG_INFO("PPPoE: Auth success for session %u, IP %u.%u.%u.%u (RADIUS: %u.%u.%u.%u)",
-                  session_id,
-                  (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
-                  (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF,
-                  (result->framed_ip >> 24) & 0xFF, (result->framed_ip >> 16) & 0xFF,
-                  (result->framed_ip >> 8) & 0xFF, result->framed_ip & 0xFF);
+                  session_id, (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
+                  (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF, (result->framed_ip >> 24) & 0xFF,
+                  (result->framed_ip >> 16) & 0xFF, (result->framed_ip >> 8) & 0xFF,
+                  result->framed_ip & 0xFF);
 
         /* Update session - keep pool IP if RADIUS didn't provide one */
         if (result->framed_ip != 0) {
@@ -1218,7 +1379,8 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
         /* Implementation specific... assuming we send success here */
 
         /* Send Accounting Start if configured */
-        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id, session->username, session->client_ip);
+        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id, session->username,
+                            session->client_ip);
         session->last_acct_ts = time(NULL);
 
         /* Set start timestamp */
@@ -1227,14 +1389,16 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
         /* Send Success Packet */
         const char *msg = "Login OK";
         if (session->lcp_state == LCP_STATE_OPENED) {
-             if (session->chap_challenge_len > 0) {
-                 ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_SUCCESS, session->next_lcp_identifier, (const uint8_t *)msg, strlen(msg));
-             } else {
-                 uint8_t reply_data[256];
-                 reply_data[0] = strlen(msg);
-                 memcpy(reply_data + 1, msg, strlen(msg));
-                 ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_ACK, session->next_lcp_identifier, reply_data, 1 + strlen(msg));
-             }
+            if (session->chap_challenge_len > 0) {
+                ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_SUCCESS,
+                              session->next_lcp_identifier, (const uint8_t *)msg, strlen(msg));
+            } else {
+                uint8_t reply_data[256];
+                reply_data[0] = strlen(msg);
+                memcpy(reply_data + 1, msg, strlen(msg));
+                ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_ACK,
+                              session->next_lcp_identifier, reply_data, 1 + strlen(msg));
+            }
         }
 
         /* State already transitioned by atomic CAS above */
@@ -1243,7 +1407,8 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
         ppp_ipcp_open(session);
 
         /* Send HA Sync */
-        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id, session->client_mac.addr_bytes, 0, session->state);
+        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id, session->client_mac.addr_bytes, 0,
+                     session->state);
 
     } else {
         YLOG_INFO("PPPoE: Session %u Auth Failure", session_id);
@@ -1251,17 +1416,20 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
         /* Send Failure Packet */
         const char *msg = "Auth Failed";
         if (session->chap_challenge_len > 0) {
-             ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE, session->next_lcp_identifier, (const uint8_t *)msg, strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE, session->next_lcp_identifier,
+                          (const uint8_t *)msg, strlen(msg));
         } else {
-             uint8_t reply_data[256];
-             reply_data[0] = strlen(msg);
-             memcpy(reply_data + 1, msg, strlen(msg));
-             ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK, session->next_lcp_identifier, reply_data, 1 + strlen(msg));
+            uint8_t reply_data[256];
+            reply_data[0] = strlen(msg);
+            memcpy(reply_data + 1, msg, strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK, session->next_lcp_identifier,
+                          reply_data, 1 + strlen(msg));
         }
 
         /* Terminate */
         session->state = PPPOE_STATE_TERMINATED;
-        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0, session->state);
+        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0,
+                     session->state);
     }
 }
 
@@ -1275,9 +1443,11 @@ void pppoe_print_sessions(void)
 
     /* Print Header */
     /* Cols: ID(5) User(15) CallID(17) MAC(17) IP(15) State(6) Rate(8) Tx(10) Rx(10) Up(8) */
-    printf("%-5s %-15s %-17s %-17s %-15s %-6s %-8s %-10s %-10s %-8s\n",
-           "ID", "Username", "Called-SID", "MAC Address", "IP Address", "State", "Rate", "TxBytes", "RxBytes", "Uptime");
-    printf("--------------------------------------------------------------------------------------------------------------------------\n");
+    printf("%-5s %-15s %-17s %-17s %-15s %-6s %-8s %-10s %-10s %-8s\n", "ID", "Username",
+           "Called-SID", "MAC Address", "IP Address", "State", "Rate", "TxBytes", "RxBytes",
+           "Uptime");
+    printf("---------------------------------------------------------------------------------------"
+           "-----------------------------------\n");
 
     uint32_t pos = 0;
     uint64_t mask = 0;
@@ -1298,34 +1468,50 @@ void pppoe_print_sessions(void)
 
                 char server_mac_str[18] = "N/A";
                 if (curr->iface && curr->iface->mac_addr) {
-                    const struct rte_ether_addr *smac = (const struct rte_ether_addr *)curr->iface->mac_addr;
-                    snprintf(server_mac_str, sizeof(server_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                             smac->addr_bytes[0], smac->addr_bytes[1],
-                             smac->addr_bytes[2], smac->addr_bytes[3],
+                    const struct rte_ether_addr *smac =
+                        (const struct rte_ether_addr *)curr->iface->mac_addr;
+                    snprintf(server_mac_str, sizeof(server_mac_str),
+                             "%02X:%02X:%02X:%02X:%02X:%02X", smac->addr_bytes[0],
+                             smac->addr_bytes[1], smac->addr_bytes[2], smac->addr_bytes[3],
                              smac->addr_bytes[4], smac->addr_bytes[5]);
                 }
 
                 uint32_t ip = curr->client_ip;
                 char ip_str[16];
-                if (ip == 0) strcpy(ip_str, "-");
-                else snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
-                        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+                if (ip == 0)
+                    strcpy(ip_str, "-");
+                else
+                    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", (ip >> 24) & 0xFF,
+                             (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
 
                 const char *state_str = "UNK";
                 switch (curr->state) {
-                    case PPPOE_STATE_INITIAL: state_str = "INIT"; break;
-                    case PPPOE_STATE_PADI_RCVD: state_str = "PADI"; break;
-                    case PPPOE_STATE_PADR_RCVD: state_str = "PADR"; break;
-                    case PPPOE_STATE_SESSION_ESTABLISHED: state_str = "ESTAB"; break;
-                    case PPPOE_STATE_TERMINATED: state_str = "TERM"; break;
+                case PPPOE_STATE_INITIAL:
+                    state_str = "INIT";
+                    break;
+                case PPPOE_STATE_PADI_RCVD:
+                    state_str = "PADI";
+                    break;
+                case PPPOE_STATE_PADR_RCVD:
+                    state_str = "PADR";
+                    break;
+                case PPPOE_STATE_SESSION_ESTABLISHED:
+                    state_str = "ESTAB";
+                    break;
+                case PPPOE_STATE_TERMINATED:
+                    state_str = "TERM";
+                    break;
                 }
 
                 /* Uptime */
                 uint64_t uptime = (curr->start_ts > 0) ? (now - curr->start_ts) : 0;
                 char uptime_str[32];
-                if (uptime < 60) snprintf(uptime_str, sizeof(uptime_str), "%lus", uptime);
-                else if (uptime < 3600) snprintf(uptime_str, sizeof(uptime_str), "%lum", uptime/60);
-                else snprintf(uptime_str, sizeof(uptime_str), "%luh", uptime/3600);
+                if (uptime < 60)
+                    snprintf(uptime_str, sizeof(uptime_str), "%lus", uptime);
+                else if (uptime < 3600)
+                    snprintf(uptime_str, sizeof(uptime_str), "%lum", uptime / 60);
+                else
+                    snprintf(uptime_str, sizeof(uptime_str), "%luh", uptime / 3600);
 
                 /* Truncate username */
                 char user_str[16];
@@ -1336,13 +1522,16 @@ void pppoe_print_sessions(void)
                 /* User asked for rate-limit. Raw bps is precise. */
                 /* Use readable? */
                 char rate_str[16];
-                if (curr->rate_bps == 0) strcpy(rate_str, "Unlim");
-                else if (curr->rate_bps >= 1000000) snprintf(rate_str, sizeof(rate_str), "%luM", curr->rate_bps/1000000);
-                else snprintf(rate_str, sizeof(rate_str), "%luK", curr->rate_bps/1000);
+                if (curr->rate_bps == 0)
+                    strcpy(rate_str, "Unlim");
+                else if (curr->rate_bps >= 1000000)
+                    snprintf(rate_str, sizeof(rate_str), "%luM", curr->rate_bps / 1000000);
+                else
+                    snprintf(rate_str, sizeof(rate_str), "%luK", curr->rate_bps / 1000);
 
                 printf("%-5u %-15s %-17s %-17s %-15s %-6s %-8s %-10lu %-10lu %-8s\n",
-                       curr->session_id, user_str, server_mac_str, mac_str, ip_str, state_str, rate_str,
-                       curr->bytes_in, curr->bytes_out, uptime_str);
+                       curr->session_id, user_str, server_mac_str, mac_str, ip_str, state_str,
+                       rate_str, curr->bytes_in, curr->bytes_out, uptime_str);
 
                 count++;
                 if (count >= 100) {
@@ -1374,7 +1563,6 @@ void pppoe_disconnect_callback(const char *session_str, const uint8_t *mac, uint
 {
     struct pppoe_session *session = NULL;
 
-
     if (session_str) {
         uint16_t sid = atoi(session_str);
         if (sid > 0) {
@@ -1396,7 +1584,8 @@ void pppoe_disconnect_callback(const char *session_str, const uint8_t *mac, uint
             for (int i = 0; i < 64; i++) {
                 if (mask & (1ULL << i)) {
                     struct pppoe_session *curr = &g_pppoe_session_slab[pos + i];
-                    if (rte_is_same_ether_addr(&curr->client_mac, (const struct rte_ether_addr *)mac)) {
+                    if (rte_is_same_ether_addr(&curr->client_mac,
+                                               (const struct rte_ether_addr *)mac)) {
                         session = curr;
                         goto found;
                     }

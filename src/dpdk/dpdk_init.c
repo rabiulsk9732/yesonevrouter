@@ -7,15 +7,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef HAVE_DPDK
 #include <rte_eal.h>
-#include <rte_mempool.h>
-#include <rte_mbuf.h>
-#include <rte_lcore.h>
 #include <rte_errno.h>
+#include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
 #endif
 
 /**
@@ -54,16 +54,25 @@ static int dpdk_bind_device(const char *pci_addr)
 
     /* Enable no-iommu mode */
     f = fopen("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "w");
-    if (f) { fprintf(f, "1"); fclose(f); }
+    if (f) {
+        fprintf(f, "1");
+        fclose(f);
+    }
 
     /* Use driver_override (safer method) */
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver_override", pci_addr);
     f = fopen(path, "w");
-    if (f) { fprintf(f, "vfio-pci"); fclose(f); }
+    if (f) {
+        fprintf(f, "vfio-pci");
+        fclose(f);
+    }
 
     /* Bind to vfio-pci */
     f = fopen("/sys/bus/pci/drivers/vfio-pci/bind", "w");
-    if (f) { fprintf(f, "%s", pci_addr); fclose(f); }
+    if (f) {
+        fprintf(f, "%s", pci_addr);
+        fclose(f);
+    }
 
     printf("[DPDK] %s bound to vfio-pci\n", pci_addr);
     return 0;
@@ -76,14 +85,16 @@ static void dpdk_auto_bind_nics(void)
 {
     /* Read PCI addresses from env file */
     FILE *f = fopen("/etc/yesrouter/yesrouter.env", "r");
-    if (!f) return;
+    if (!f)
+        return;
 
     char line[256];
     int in_pci_block = 0;
 
     while (fgets(line, sizeof(line), f)) {
         /* Skip comments */
-        if (line[0] == '#') continue;
+        if (line[0] == '#')
+            continue;
 
         /* Check for PCI=( start */
         if (strstr(line, "PCI=(")) {
@@ -110,13 +121,11 @@ static void dpdk_auto_bind_nics(void)
 }
 
 /* Global DPDK configuration */
-struct dpdk_config g_dpdk_config = {
-    .enabled = false,
-    .num_lcores = 0,
-    .socket_id = 0,
-    .num_mbufs = DPDK_NUM_MBUFS,
-    .pkt_mempool = NULL
-};
+struct dpdk_config g_dpdk_config = {.enabled = false,
+                                    .num_lcores = 0,
+                                    .socket_id = 0,
+                                    .num_mbufs = DPDK_NUM_MBUFS,
+                                    .pkt_mempool = NULL};
 
 int dpdk_init(int argc, char *argv[])
 {
@@ -138,8 +147,7 @@ int dpdk_init(int argc, char *argv[])
     /* Initialize DPDK EAL */
     ret = rte_eal_init(argc, argv);
     if (ret < 0) {
-        fprintf(stderr, "DPDK EAL initialization failed: %s\n",
-                rte_strerror(rte_errno));
+        fprintf(stderr, "DPDK EAL initialization failed: %s\n", rte_strerror(rte_errno));
         /* Don't fail completely - run without DPDK */
         g_dpdk_config.enabled = false;
         return 0;
@@ -155,11 +163,8 @@ int dpdk_init(int argc, char *argv[])
     printf("  Socket ID: %u\n", g_dpdk_config.socket_id);
 
     /* Create default packet memory pool */
-    g_dpdk_config.pkt_mempool = dpdk_mempool_create(
-        "PKT_MBUF_POOL",
-        g_dpdk_config.num_mbufs,
-        g_dpdk_config.socket_id
-    );
+    g_dpdk_config.pkt_mempool =
+        dpdk_mempool_create("PKT_MBUF_POOL", g_dpdk_config.num_mbufs, g_dpdk_config.socket_id);
 
     if (!g_dpdk_config.pkt_mempool) {
         fprintf(stderr, "Failed to create packet memory pool\n");
@@ -177,8 +182,7 @@ int dpdk_init(int argc, char *argv[])
 #endif
 }
 
-struct dpdk_mempool *dpdk_mempool_create(const char *name,
-                                         uint32_t num_elements,
+struct dpdk_mempool *dpdk_mempool_create(const char *name, uint32_t num_elements,
                                          uint32_t socket_id)
 {
 #ifdef HAVE_DPDK
@@ -192,18 +196,11 @@ struct dpdk_mempool *dpdk_mempool_create(const char *name,
     }
 
     /* Create DPDK mempool */
-    rte_mp = rte_pktmbuf_pool_create(
-        name,
-        num_elements,
-        DPDK_MBUF_CACHE_SIZE,
-        0,
-        RTE_MBUF_DEFAULT_BUF_SIZE,
-        socket_id
-    );
+    rte_mp = rte_pktmbuf_pool_create(name, num_elements, DPDK_MBUF_CACHE_SIZE, 0,
+                                     RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
 
     if (!rte_mp) {
-        fprintf(stderr, "Failed to create mempool: %s\n",
-                rte_strerror(rte_errno));
+        fprintf(stderr, "Failed to create mempool: %s\n", rte_strerror(rte_errno));
         free(mp);
         return NULL;
     }
@@ -298,4 +295,14 @@ void dpdk_cleanup(void)
 bool dpdk_is_enabled(void)
 {
     return g_dpdk_config.enabled;
+}
+
+struct rte_mempool *dpdk_get_mempool(void)
+{
+#ifdef HAVE_DPDK
+    if (g_dpdk_config.enabled && g_dpdk_config.pkt_mempool) {
+        return (struct rte_mempool *)g_dpdk_config.pkt_mempool->pool;
+    }
+#endif
+    return NULL;
 }

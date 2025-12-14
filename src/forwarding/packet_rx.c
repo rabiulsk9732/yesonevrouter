@@ -1211,8 +1211,12 @@ static void *rx_thread_func(void *arg)
                         continue;
                     }
 
-                    /* IPv4 - process through NAT fast path */
+                    /* IPv4 - process locally (each worker owns its sessions) */
                     if (eth_type == RTE_ETHER_TYPE_IPV4) {
+                        /* NO HANDOFF: Each worker processes packets it receives
+                         * and creates sessions in its own table. This is the
+                         * original lockless approach that achieved 1.65M PPS.
+                         */
                         local_pkts[local_count++] = pkt;
                     } else {
                         /* Non-IPv4/Non-PPPoE - drop */

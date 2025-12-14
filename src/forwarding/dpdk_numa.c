@@ -32,6 +32,9 @@
 static struct rte_mempool *g_pktmbuf_pool[MAX_NUMA_NODES];
 static int g_numa_count = 0;
 
+/* External symmetric RSS key (defined in interfaces/physical.c) */
+extern uint8_t symmetric_rss_key[52];
+
 /* Multi-queue configuration */
 static struct {
     uint16_t port_id;
@@ -127,6 +130,12 @@ int dpdk_multiqueue_configure_port(uint16_t port_id, uint16_t num_rx_queues,
         num_tx_queues = dev_info.max_tx_queues;
     }
 
+    /* Determine RSS key length based on device capability */
+    uint8_t rss_key_len = dev_info.hash_key_size;
+    if (rss_key_len == 0 || rss_key_len > 52) {
+        rss_key_len = 40;  /* Default for Intel ixgbe, i40e */
+    }
+
     struct rte_eth_conf port_conf = {
         .rxmode = {
             .mq_mode = RTE_ETH_MQ_RX_RSS,
@@ -137,7 +146,8 @@ int dpdk_multiqueue_configure_port(uint16_t port_id, uint16_t num_rx_queues,
         },
         .rx_adv_conf = {
             .rss_conf = {
-                .rss_key = NULL,
+                .rss_key = symmetric_rss_key,  /* CRITICAL: Enable symmetric RSS */
+                .rss_key_len = rss_key_len,
                 .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP,
             },
         },
@@ -146,10 +156,35 @@ int dpdk_multiqueue_configure_port(uint16_t port_id, uint16_t num_rx_queues,
     /* Adjust based on hardware */
     port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
 
+    YLOG_INFO("DPDK RSS: Applying symmetric key (len=%u) for port %u", rss_key_len, port_id);
+
     ret = rte_eth_dev_configure(port_id, num_rx_queues, num_tx_queues, &port_conf);
     if (ret != 0) {
         YLOG_ERROR("DPDK Multiqueue: Failed to configure port %u: %d", port_id, ret);
         return -1;
+    }
+
+    /* Configure RSS Redirection Table (RETA) for flow affinity */
+    if (num_rx_queues > 1 && dev_info.reta_size > 0) {
+        struct rte_eth_rss_reta_entry64 reta_conf[RTE_ETH_RSS_RETA_SIZE_512 / RTE_ETH_RETA_GROUP_SIZE];
+        memset(reta_conf, 0, sizeof(reta_conf));
+
+        /* Distribute hash values evenly across queues */
+        for (uint16_t i = 0; i < dev_info.reta_size; i++) {
+            uint16_t idx = i / RTE_ETH_RETA_GROUP_SIZE;
+            uint16_t shift = i % RTE_ETH_RETA_GROUP_SIZE;
+            reta_conf[idx].mask |= (1ULL << shift);
+            reta_conf[idx].reta[shift] = i % num_rx_queues;
+        }
+
+        ret = rte_eth_dev_rss_reta_update(port_id, reta_conf, dev_info.reta_size);
+        if (ret == 0) {
+            YLOG_INFO("DPDK RSS RETA: Configured %u entries across %u queues for port %u",
+                      dev_info.reta_size, num_rx_queues, port_id);
+        } else {
+            YLOG_WARNING("DPDK RSS RETA: Config failed for port %u (non-critical): %s",
+                         port_id, rte_strerror(-ret));
+        }
     }
 
     /* Setup RX queues */

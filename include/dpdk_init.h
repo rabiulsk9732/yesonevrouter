@@ -101,4 +101,10 @@ void dpdk_cleanup(void);
  */
 bool dpdk_is_enabled(void);
 
+/**
+ * Get the global packet memory pool for mbuf allocation
+ * @return rte_mempool pointer or NULL if DPDK not initialized
+ */
+struct rte_mempool *dpdk_get_mempool(void);
+
 #endif /* DPDK_INIT_H */

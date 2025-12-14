@@ -234,11 +234,12 @@ int startup_json_load(const char *path) {
                 if (inet_pton(AF_INET, start_ip, &start) == 1 &&
                     inet_pton(AF_INET, end_ip, &end) == 1) {
 
-                    /* Create NAT pool */
+                    YLOG_INFO("[STARTUP] Creating NAT pool: %s - %s", start_ip, end_ip);
                     int ret = nat_pool_create("CGNAT", ntohl(start.s_addr),
                                              ntohl(end.s_addr), 0xFFFFFF00);
                     if (ret == 0) {
-                        YLOG_INFO("[STARTUP] NAT pool created: %s - %s", start_ip, end_ip);
+                        YLOG_INFO("[STARTUP] NAT pool created: %s - %s (0x%08x - 0x%08x)",
+                                 start_ip, end_ip, ntohl(start.s_addr), ntohl(end.s_addr));
                     } else {
                         YLOG_ERROR("[STARTUP] Failed to create NAT pool");
                     }
@@ -252,7 +253,9 @@ int startup_json_load(const char *path) {
 
         if (strstr(nat_section, "\"enabled\": true") || strstr(nat_section, "\"enabled\":true")) {
             nat_enable(true);
-            YLOG_INFO("[STARTUP] NAT44 enabled");
+            YLOG_INFO("[STARTUP] NAT44 enabled - num_pools=%d", g_nat_config.num_pools);
+        } else {
+            YLOG_WARNING("[STARTUP] NAT44 not enabled in config");
         }
         if (strstr(nat_section, "\"hairpin\": true") || strstr(nat_section, "\"hairpin\":true")) {
             g_nat_config.hairpinning_enabled = true;
@@ -318,21 +321,33 @@ int startup_json_load(const char *path) {
                 service_profile_create(prof_name);
 
                 if (iface[0]) {
-                    uint16_t vlan_id = vlan_str[0] ? atoi(vlan_str) : 0;
+                    /* Parse VLAN from interface name (e.g., eth1.100 -> parent=eth1, vlan=100) */
+                    char parent_iface[32] = {0};
+                    uint16_t vlan_id = 0;
+                    char *dot = strchr(iface, '.');
+                    if (dot) {
+                        /* Interface has VLAN suffix: eth1.100 */
+                        strncpy(parent_iface, iface, dot - iface);
+                        parent_iface[dot - iface] = '\0';
+                        vlan_id = atoi(dot + 1);
+                    } else {
+                        /* No VLAN suffix, use explicit vlan_id field if present */
+                        strncpy(parent_iface, iface, sizeof(parent_iface) - 1);
+                        vlan_id = vlan_str[0] ? atoi(vlan_str) : 0;
+                    }
 
                     /* Create VLAN sub-interface if vlan_id specified */
                     if (vlan_id > 0) {
                         extern struct interface *interface_create_vlan(const char *parent_name, uint16_t vlan_id);
-                        struct interface *vlan_iface = interface_create_vlan(iface, vlan_id);
+                        struct interface *vlan_iface = interface_create_vlan(parent_iface, vlan_id);
                         if (vlan_iface) {
-                            /* Bring up the VLAN interface */
                             extern int interface_up(struct interface *iface);
                             interface_up(vlan_iface);
-                            YLOG_INFO("[STARTUP] Created VLAN interface %s.%u", iface, vlan_id);
+                            YLOG_INFO("[STARTUP] Created VLAN interface %s.%u", parent_iface, vlan_id);
                         }
                     }
 
-                    service_profile_set_interface(prof_name, iface, vlan_id);
+                    service_profile_set_interface(prof_name, parent_iface, vlan_id);
                 }
 
                 if (pool_name[0]) {
@@ -372,14 +387,25 @@ int startup_json_load(const char *path) {
 
                 /* Register profile with PPPoE for session pool lookup */
                 if (iface[0] && pool_name[0]) {
-                    uint16_t vlan_id = vlan_str[0] ? atoi(vlan_str) : 0;
+                    /* Re-parse VLAN from interface name for pppoe_add_profile */
+                    char pppoe_parent[32] = {0};
+                    uint16_t pppoe_vlan = 0;
+                    char *pdot = strchr(iface, '.');
+                    if (pdot) {
+                        strncpy(pppoe_parent, iface, pdot - iface);
+                        pppoe_parent[pdot - iface] = '\0';
+                        pppoe_vlan = atoi(pdot + 1);
+                    } else {
+                        strncpy(pppoe_parent, iface, sizeof(pppoe_parent) - 1);
+                        pppoe_vlan = vlan_str[0] ? atoi(vlan_str) : 0;
+                    }
                     extern void pppoe_add_profile(const char *iface_name, uint16_t vlan_id, const char *pool_name);
-                    pppoe_add_profile(iface, vlan_id, pool_name);
-                    YLOG_INFO("[STARTUP] PPPoE Profile: %s vlan %u -> pool %s", iface, vlan_id, pool_name);
+                    pppoe_add_profile(pppoe_parent, pppoe_vlan, pool_name);
+                    YLOG_INFO("[STARTUP] PPPoE Profile: %s vlan %u -> pool %s", pppoe_parent, pppoe_vlan, pool_name);
                 }
 
-                YLOG_INFO("[STARTUP] Service Profile '%s' -> iface=%s vlan=%s pool=%s",
-                          prof_name, iface[0] ? iface : "*", vlan_str[0] ? vlan_str : "0", pool_name);
+                YLOG_INFO("[STARTUP] Service Profile '%s' -> iface=%s pool=%s",
+                          prof_name, iface[0] ? iface : "*", pool_name);
             }
             prof_pos++;
         }
@@ -461,7 +487,10 @@ int startup_json_load(const char *path) {
                         YLOG_INFO("[STARTUP] Default gateway: %s (0x%08x)", next_hop, g_default_gateway);
 
                         /* Send ARP request to gateway to populate ARP table early */
-                        struct interface *wan_iface = interface_find_by_name("Gi0/1");
+                        /* Try multiple possible WAN interface names */
+                        struct interface *wan_iface = interface_find_by_name("eth0");
+                        if (!wan_iface) wan_iface = interface_find_by_name("Gi0/1");
+                        if (!wan_iface) wan_iface = interface_find_by_name("Gi0/0");
                         if (wan_iface && wan_iface->config.ipv4_addr.s_addr != 0) {
                             extern int arp_send_request(uint32_t target_ip, uint32_t source_ip,
                                                        const uint8_t *source_mac, uint32_t ifindex);

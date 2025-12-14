@@ -180,7 +180,11 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
     if (unlikely(!session)) {
         /* Slow path: Create new session */
         if (unlikely(g_nat_config.num_pools == 0)) {
-            printf("[SNAT FAIL] No pools configured\n");
+            static uint64_t no_pool_warnings = 0;
+            if (no_pool_warnings++ < 5) {
+                YLOG_ERROR("[SNAT] No pools configured (enabled=%d, pools=%d)",
+                       g_nat_config.enabled, g_nat_config.num_pools);
+            }
             g_nat_config.stats.no_ip_available++;
             return -1;
         }

@@ -200,6 +200,15 @@ struct interface *interface_create_vlan(const char *parent_name, uint16_t vlan_i
     /* Copy MTU from parent */
     vlan_iface->config.mtu = parent->config.mtu;
 
+    /* CRITICAL: Call configure to update private data with parent/vlan_id */
+    if (vlan_iface->ops && vlan_iface->ops->configure) {
+        if (vlan_iface->ops->configure(vlan_iface, &vlan_iface->config) < 0) {
+            printf("Error: Failed to configure VLAN interface '%s'\n", vlan_name);
+            interface_delete(vlan_iface);
+            return NULL;
+        }
+    }
+
     printf("Created VLAN interface %s (parent: %s, vlan: %u)\n",
            vlan_name, parent_name, vlan_id);
     return vlan_iface;

@@ -103,6 +103,8 @@ static int vlan_send(struct interface *iface, struct pkt_buf *pkt)
     }
 
     /* Add VLAN tag to packet */
+    fprintf(stderr, "[VLAN_SEND] %s: tagging with VLAN %u (parent=%s)\n",
+            iface->name, priv->vlan_id, priv->parent ? priv->parent->name : "NULL");
     if (vlan_tag_packet(pkt, priv->vlan_id, VLAN_PCP_BE) < 0) {
         fprintf(stderr, "Failed to tag packet with VLAN %u\n", priv->vlan_id);
         return -1;

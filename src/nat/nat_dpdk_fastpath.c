@@ -47,6 +47,17 @@ static inline void nat_init_iface_cache(void) {
         g_cached_iface[i] = interface_find_by_dpdk_port(i);
     }
     g_iface_cache_init = 1;
+
+    /* DEBUG: Log cached interface NAT flags */
+    extern __thread int g_thread_worker_id;
+    for (int i = 0; i < 4; i++) {
+        struct interface *iface = g_cached_iface[i];
+        if (iface) {
+            LOG_INFO("[NAT-CACHE] Worker %d: port %d -> %s (inside=%d outside=%d)",
+                     g_thread_worker_id, i, iface->name,
+                     iface->config.nat_inside, iface->config.nat_outside);
+        }
+    }
 }
 
 /* Check if port is NAT inside (LAN) - CACHED lookup */

@@ -222,58 +222,38 @@ static pthread_mutex_t session_id_lock = PTHREAD_MUTEX_INITIALIZER;
 extern struct nat_config g_nat_config;
 
 /**
- * Optimized hash function for session lookup
- * Uses fast XOR-based hash with mixing (faster than FNV-1a)
- * Based on MurmurHash3 finalizer for good distribution
+ * Unified symmetric hash function for NAT session lookup
+ * CRITICAL: Must produce identical hash for both inside and outside lookups
+ * This ensures sessions can be found in both directions (SNAT and DNAT)
+ * Uses MurmurHash3-style mixing for good distribution and performance
+ */
+static inline uint32_t nat_hash_5tuple(uint32_t ip, uint16_t port, uint8_t protocol)
+{
+    uint32_t hash = ip ^ ((uint32_t)port << 16) ^ protocol;
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6b;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35;
+    hash ^= hash >> 16;
+    return hash;
+}
+
+/**
+ * Hash function for inside (LAN→WAN) lookups
+ * Uses unified hash to ensure consistency with outside lookups
  */
 uint32_t nat_hash_inside(uint32_t ip, uint16_t port, uint8_t protocol)
 {
-    uint32_t hash = 2166136261u;
-
-    hash ^= (ip >> 24) & 0xFF;
-    hash *= 16777619;
-    hash ^= (ip >> 16) & 0xFF;
-    hash *= 16777619;
-    hash ^= (ip >> 8) & 0xFF;
-    hash *= 16777619;
-    hash ^= ip & 0xFF;
-    hash *= 16777619;
-
-    hash ^= (port >> 8) & 0xFF;
-    hash *= 16777619;
-    hash ^= port & 0xFF;
-    hash *= 16777619;
-
-    hash ^= protocol;
-    hash *= 16777619;
-
-    return hash & NAT_SESSION_HASH_MASK;
+    return nat_hash_5tuple(ip, port, protocol) & NAT_SESSION_HASH_MASK;
 }
 
+/**
+ * Hash function for outside (WAN→LAN) lookups
+ * MUST use same algorithm as inside to find sessions created in opposite direction
+ */
 static inline uint32_t nat_hash_outside(uint32_t ip, uint16_t port, uint8_t protocol)
 {
-    /* Use different seed for outside lookups to avoid collisions */
-    uint64_t combined = ((uint64_t)ip << 24) | ((uint64_t)port << 8) | protocol;
-
-    /* Different mixing constant for outside hash */
-    uint32_t hash = (uint32_t)combined;
-    hash ^= hash >> 15;
-    hash *= 0x2c1b3c6d;
-    hash ^= hash >> 12;
-    hash *= 0x297a2d39;
-    hash ^= hash >> 15;
-
-    /* Mix in IP */
-    hash ^= ip;
-    hash ^= hash >> 15;
-    hash *= 0x2c1b3c6d;
-    hash ^= hash >> 12;
-
-    /* Mix in port and protocol */
-    hash ^= (uint32_t)port << 16 | protocol;
-    hash ^= hash >> 15;
-
-    return hash & NAT_SESSION_HASH_MASK;
+    return nat_hash_5tuple(ip, port, protocol) & NAT_SESSION_HASH_MASK;
 }
 
 /**
@@ -486,6 +466,10 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
     hash_inside = nat_hash_inside(inside_ip, inside_port, protocol);
     hash_outside = nat_hash_outside(outside_ip, outside_port, protocol);
 
+    /* Store hashes in session for fast deletion and cross-worker lookup */
+    session->inside_hash = hash_inside;
+    session->outside_hash = hash_outside;
+
     part_in = get_partition_id(hash_inside);
     part_out = get_partition_id(hash_outside);
 
@@ -645,16 +629,13 @@ struct nat_session *nat_session_create_lockless(uint32_t worker_id,
     if (g_nat_config.hairpinning_enabled)
         session->flags |= NAT_SESSION_FLAG_HAIRPIN;
 
-    /* Calculate hashes - MUST MATCH lockless lookup hash! */
-    hash_inside = inside_ip ^ ((uint32_t)inside_port << 16) ^ protocol;
-    hash_inside ^= hash_inside >> 16;
-    hash_inside *= 0x85ebca6b;
-    hash_inside ^= hash_inside >> 13;
+    /* Calculate hashes using unified hash function */
+    hash_inside = nat_hash_inside(inside_ip, inside_port, protocol);
+    hash_outside = nat_hash_outside(outside_ip, outside_port, protocol);
 
-    hash_outside = outside_ip ^ ((uint32_t)outside_port << 16) ^ protocol;
-    hash_outside ^= hash_outside >> 16;
-    hash_outside *= 0x85ebca6b;
-    hash_outside ^= hash_outside >> 13;
+    /* Store hashes in session for fast deletion and cross-worker lookup */
+    session->inside_hash = hash_inside;
+    session->outside_hash = hash_outside;
 
     /* Insert into per-worker tables ONLY (no global locks!) */
     nat_hash_insert(worker, worker->in2out_hash, hash_inside, session->session_index);

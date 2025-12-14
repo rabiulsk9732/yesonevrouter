@@ -319,6 +319,19 @@ static int physical_up(struct interface *iface)
         txq_conf = dev_info.default_txconf;
         txq_conf.offloads = port_conf.txmode.offloads;
 
+        /* CRITICAL for virtio: Set TX thresholds to ensure descriptors are freed */
+        /* Without these, rte_eth_tx_burst succeeds but packets never transmit */
+        if (txq_conf.tx_rs_thresh == 0) {
+            txq_conf.tx_rs_thresh = 32;  /* Report status every 32 descriptors */
+        }
+        if (txq_conf.tx_free_thresh == 0) {
+            txq_conf.tx_free_thresh = 32;  /* Free descriptors when 32 pending */
+        }
+
+        printf("[TX_DIAG] Port %u TX config: tx_rs_thresh=%u tx_free_thresh=%u offloads=0x%lx\n",
+               priv->port_id, txq_conf.tx_rs_thresh, txq_conf.tx_free_thresh,
+               (unsigned long)txq_conf.offloads);
+
         for (int q = 0; q < num_tx_queues; q++) {
             ret = rte_eth_tx_queue_setup(priv->port_id, q, num_tx_desc,
                                          rte_eth_dev_socket_id(priv->port_id), &txq_conf);
@@ -551,6 +564,9 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             return -1;
         }
 
+        /* VPP-style: Reset mbuf to ensure clean state for TX */
+        rte_pktmbuf_reset(mbuf);
+
         /* Copy packet data to mbuf - enforce 60-byte minimum Ethernet frame */
         uint16_t final_len = (pkt->len < 60) ? 60 : pkt->len;
         void *data = rte_pktmbuf_append(mbuf, final_len);
@@ -565,7 +581,24 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             memset((uint8_t *)data + pkt->len, 0, final_len - pkt->len);
         }
 
-        /* Debug: Log PPPoE Session packet headers */
+        /* VPP-style: Explicitly set mbuf fields for TX */
+        mbuf->nb_segs = 1;
+        mbuf->pkt_len = final_len;
+        mbuf->data_len = final_len;
+        mbuf->ol_flags = 0;  /* No offloads for control packets */
+
+        /* Debug: Check mbuf state and lcore context */
+        {
+            struct rte_ether_hdr *chk_eth = (struct rte_ether_hdr *)data;
+            uint16_t chk_type = rte_be_to_cpu_16(chk_eth->ether_type);
+            if (chk_type == 0x8863 || (chk_type == RTE_ETHER_TYPE_VLAN)) {
+                unsigned lcore = rte_lcore_id();
+                YLOG_INFO("[MBUF_DBG] lcore=%u data_off=%u pkt_len=%u data_len=%u pool=%p",
+                          lcore, mbuf->data_off, mbuf->pkt_len, mbuf->data_len, (void*)mbuf->pool);
+            }
+        }
+
+        /* Check if PPPoE Discovery */
         {
             struct rte_ether_hdr *d_eth = (struct rte_ether_hdr *)data;
             uint16_t d_type = rte_be_to_cpu_16(d_eth->ether_type);
@@ -575,9 +608,36 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
                 vlan_id = rte_be_to_cpu_16(d_vlan->vlan_tci) & 0xFFF;
                 d_type = rte_be_to_cpu_16(d_vlan->eth_proto);
             }
+
+            /* PPPoE Discovery (0x8863) - use raw socket instead of DPDK TX */
+            /* This is a workaround for virtio DPDK TX not reaching wire */
+            if (d_type == 0x8863 && priv->rx_sock_fd >= 0) {
+                YLOG_INFO("[RAW_TX] PPPoE DISC: len=%u vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
+                          final_len, vlan_id,
+                          d_eth->dst_addr.addr_bytes[0], d_eth->dst_addr.addr_bytes[1],
+                          d_eth->dst_addr.addr_bytes[2], d_eth->dst_addr.addr_bytes[3],
+                          d_eth->dst_addr.addr_bytes[4], d_eth->dst_addr.addr_bytes[5]);
+
+                /* Send via raw socket */
+                ssize_t raw_sent = send(priv->rx_sock_fd, data, final_len, 0);
+                rte_pktmbuf_free(mbuf);
+
+                if (raw_sent > 0) {
+                    iface->stats.tx_packets++;
+                    iface->stats.tx_bytes += raw_sent;
+                    YLOG_INFO("[RAW_TX] PPPoE DISC sent: %zd bytes", raw_sent);
+                    return 0;
+                } else {
+                    YLOG_ERROR("[RAW_TX] PPPoE DISC failed: %s", strerror(errno));
+                    iface->stats.tx_errors++;
+                    return -1;
+                }
+            }
+
+            /* Log PPPoE Session (LCP/IPCP) - still use DPDK */
             if (d_type == 0x8864) {
-                YLOG_INFO("LCP TX: len=%u final=%u iface=%s vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
-                          pkt->len, final_len, iface->name, vlan_id,
+                YLOG_INFO("[PHYS_TX] PPPoE SESS: port=%u len=%u vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
+                          priv->port_id, final_len, vlan_id,
                           d_eth->dst_addr.addr_bytes[0], d_eth->dst_addr.addr_bytes[1],
                           d_eth->dst_addr.addr_bytes[2], d_eth->dst_addr.addr_bytes[3],
                           d_eth->dst_addr.addr_bytes[4], d_eth->dst_addr.addr_bytes[5]);
@@ -652,6 +712,25 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
         /* Assuming Worker 0 (which runs both RX and HQoS) is the only one sending on Queue 0 */
 
         sent = rte_eth_tx_burst(priv->port_id, queue_id, &mbuf, 1);
+
+        /* Force TX descriptor cleanup - critical for virtio to actually transmit */
+        /* This "kicks" the virtio ring to process pending TX */
+        rte_eth_tx_done_cleanup(priv->port_id, queue_id, 32);
+
+        /* Debug: Check ethertype for PPPoE Discovery logging */
+        {
+            struct rte_ether_hdr *tx_eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+            uint16_t tx_type = rte_be_to_cpu_16(tx_eth->ether_type);
+            if (tx_type == RTE_ETHER_TYPE_VLAN) {
+                struct rte_vlan_hdr *tx_vlan = (struct rte_vlan_hdr *)(tx_eth + 1);
+                tx_type = rte_be_to_cpu_16(tx_vlan->eth_proto);
+            }
+            if (tx_type == 0x8863) {
+                YLOG_INFO("[PHYS_TX_RESULT] PPPoE DISC: port=%u queue=%u sent=%zd",
+                          priv->port_id, queue_id, sent);
+            }
+        }
+
         if (sent > 0) {
             iface->stats.tx_packets++;
             iface->stats.tx_bytes += pkt->len;

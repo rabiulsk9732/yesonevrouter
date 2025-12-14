@@ -1,5 +1,6 @@
 set(PPPOE_SOURCES
     pppoe.c
+    pppoe_tx.c
     ppp_lcp.c
     ppp_ipcp.c
     ppp_auth.c

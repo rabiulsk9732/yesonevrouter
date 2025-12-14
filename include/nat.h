@@ -163,7 +163,10 @@ struct nat_session {
     uint32_t subscriber_id; /* 52 */
     uint16_t port_block_id; /* 54 */
     uint16_t _pad2;         /* 56 */
-    uint64_t _pad3;         /* 64: End of CL 0 */
+
+    /* Pre-computed hashes for fast deletion and cross-worker lookup */
+    uint32_t inside_hash;   /* 60: Hash for inside (LAN) lookup */
+    uint32_t outside_hash;  /* 64: Hash for outside (WAN) lookup - End of CL 0 */
 
     /* Cacheline 1: Cold / Stats / Management */
     uint64_t created_ts;

@@ -338,6 +338,13 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    /* Initialize PPPoE TX subsystem (NIC capability detection) */
+    extern int pppoe_tx_init(void);
+    if (pppoe_tx_init() != 0) {
+        YLOG_ERROR("Failed to initialize PPPoE TX");
+        return -1;
+    }
+
     /* Initialize Service Profiles for multi-profile PPPoE */
     if (service_profile_init() != 0) {
         YLOG_ERROR("Failed to initialize service profiles");
