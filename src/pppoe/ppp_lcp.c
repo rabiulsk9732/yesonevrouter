@@ -116,8 +116,14 @@ static void ppp_lcp_send_conf_req(struct pppoe_session *session)
     len += opt->length;
 
     ppp_lcp_send(session, LCP_CODE_CONF_REQ, ++session->next_lcp_identifier, options, len);
-    YLOG_INFO("LCP: Sent Configure-Request for session %u", session->session_id);
-    session->lcp_state = LCP_STATE_REQ_SENT;
+    YLOG_INFO("LCP: Sent Configure-Request for session %u (state=%d)", session->session_id,
+              session->lcp_state);
+
+    /* Only update state if we haven't already sent ConfAck (ACK_SENT) */
+    /* RFC 1661: If we're in ACK_SENT, we keep that state until we receive their ConfAck */
+    if (session->lcp_state != LCP_STATE_ACK_SENT) {
+        session->lcp_state = LCP_STATE_REQ_SENT;
+    }
     session->last_conf_req_ts = time(NULL);
 }
 
