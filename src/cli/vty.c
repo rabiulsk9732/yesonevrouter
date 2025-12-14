@@ -698,6 +698,7 @@ extern void cli_radius_init(void);
 extern void cli_ippool_init(void);
 extern void cli_route_init(void);
 extern void cli_nat_init(void);
+extern void cli_vlan_init(void);
 
 /**
  * Initialize CLI (called from main.c)
@@ -712,6 +713,7 @@ int cli_init(void)
     cli_ippool_init();
     cli_route_init();
     cli_nat_init();
+    cli_vlan_init();
     return 0;
 }
 

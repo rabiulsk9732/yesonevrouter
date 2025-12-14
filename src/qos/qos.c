@@ -70,7 +70,8 @@ int qos_tb_conform(struct token_bucket *tb, uint32_t pkt_len)
     tb->last_update = now;
 
     /* Refill tokens: (Bytes/sec * cycles) / cycles/sec */
-    uint64_t new_tokens = (tb->rate * elapsed) / get_hz();
+    /* Use 128-bit math to prevent overflow with high rates (e.g. virtual 100G+) */
+    uint64_t new_tokens = (uint64_t)( ((__uint128_t)tb->rate * elapsed) / get_hz() );
 
     tb->tokens += new_tokens;
     if (tb->tokens > tb->burst) {
@@ -92,7 +93,8 @@ int qos_tb_check(struct token_bucket *tb, uint32_t pkt_len)
     uint64_t elapsed = now - tb->last_update;
     /* Do not update last_update here */
 
-    uint64_t new_tokens = (tb->rate * elapsed) / get_hz();
+    /* Use 128-bit math here too */
+    uint64_t new_tokens = (uint64_t)( ((__uint128_t)tb->rate * elapsed) / get_hz() );
     uint64_t projected_tokens = tb->tokens + new_tokens;
     if (projected_tokens > tb->burst) projected_tokens = tb->burst;
 

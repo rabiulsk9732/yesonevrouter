@@ -53,19 +53,10 @@ static int ppp_ipcp_send(struct pppoe_session *session, uint8_t code, uint8_t id
     rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
     rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
 
-    /* Add VLAN tag if session has one */
-    if (session->vlan_id > 0) {
-        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
-        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
-        vlan->vlan_tci = rte_cpu_to_be_16(session->vlan_id);
-        vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
-        pppoe = (struct pppoe_hdr *)(vlan + 1);
-        hdr_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr);
-    } else {
-        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
-        pppoe = (struct pppoe_hdr *)(eth + 1);
-        hdr_len = sizeof(struct rte_ether_hdr);
-    }
+    /* PPPoE Session - VLAN tagging handled by VLAN interface */
+    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
+    pppoe = (struct pppoe_hdr *)(eth + 1);
+    hdr_len = sizeof(struct rte_ether_hdr);
 
     proto = (uint16_t *)(pppoe + 1);
     ipcp = (struct lcp_hdr *)(proto + 1);
@@ -98,6 +89,7 @@ static int ppp_ipcp_send(struct pppoe_session *session, uint8_t code, uint8_t id
     m->pkt_len = m->data_len;
     pkt->len = m->data_len;
 
+    /* Send via HQoS (hqos_run called immediately after enqueue) */
     int ret = interface_send(session->iface, pkt);
     if (ret != 0) {
         pkt_free(pkt);

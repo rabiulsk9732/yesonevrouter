@@ -6,9 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "command.h"
 #include "vty.h"
+#include "radius.h"
 
 /* ============================================================================
  * Show Commands
@@ -36,17 +38,33 @@ DEFUN(cmd_show_radius_server,
       "RADIUS information\n"
       "RADIUS server configuration\n")
 {
+    const struct radius_client_config *cfg = radius_client_get_config();
+
     vty_out(vty, "\r\n");
     vty_out(vty, "RADIUS Servers\r\n");
     vty_out(vty, "==============\r\n");
     vty_out(vty, "\r\n");
-    vty_out(vty, "%-20s %-10s %-10s %-10s\r\n",
-            "Server", "Auth Port", "Acct Port", "Status");
-    vty_out(vty, "%-20s %-10s %-10s %-10s\r\n",
-            "-------------------", "---------", "---------", "---------");
-    /* TODO: Get actual RADIUS server config */
-    vty_out(vty, "%-20s %-10d %-10d %-10s\r\n",
-            "127.0.0.1", 1812, 1813, "Active");
+    vty_out(vty, "%-20s %-10s %-10s %-10s %-10s\r\n",
+            "Server", "Auth Port", "Acct Port", "Priority", "Status");
+    vty_out(vty, "%-20s %-10s %-10s %-10s %-10s\r\n",
+            "-------------------", "---------", "---------", "--------", "---------");
+
+    if (cfg && cfg->num_servers > 0) {
+        for (int i = 0; i < cfg->num_servers; i++) {
+            struct in_addr addr;
+            addr.s_addr = htonl(cfg->servers[i].ip);
+            const char *status = (cfg->servers[i].status == RADIUS_SERVER_UP) ? "Active" : "Down";
+
+            vty_out(vty, "%-20s %-10d %-10d %-10d %-10s\r\n",
+                    inet_ntoa(addr),
+                    cfg->servers[i].auth_port,
+                    cfg->servers[i].acct_port,
+                    cfg->servers[i].priority,
+                    status);
+        }
+    } else {
+        vty_out(vty, "(no servers configured)\r\n");
+    }
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;
 }
@@ -58,21 +76,31 @@ DEFUN(cmd_show_radius_statistics,
       "RADIUS information\n"
       "RADIUS statistics\n")
 {
+    const struct radius_client_config *cfg = radius_client_get_config();
+
     vty_out(vty, "\r\n");
     vty_out(vty, "RADIUS Statistics\r\n");
     vty_out(vty, "=================\r\n");
     vty_out(vty, "\r\n");
-    vty_out(vty, "Authentication:\r\n");
-    vty_out(vty, "  Access-Request sent:     0\r\n");
-    vty_out(vty, "  Access-Accept received:  0\r\n");
-    vty_out(vty, "  Access-Reject received:  0\r\n");
-    vty_out(vty, "  Access-Challenge recv:   0\r\n");
-    vty_out(vty, "  Timeouts:                0\r\n");
-    vty_out(vty, "\r\n");
-    vty_out(vty, "Accounting:\r\n");
-    vty_out(vty, "  Acct-Request sent:       0\r\n");
-    vty_out(vty, "  Acct-Response received:  0\r\n");
-    vty_out(vty, "  Timeouts:                0\r\n");
+
+    if (cfg) {
+        vty_out(vty, "Authentication:\r\n");
+        vty_out(vty, "  Access-Request sent:     %lu\r\n", cfg->stats.total_auth_requests);
+        vty_out(vty, "  Access-Accept received:  %lu\r\n", cfg->stats.total_auth_accepts);
+        vty_out(vty, "  Access-Reject received:  %lu\r\n", cfg->stats.total_auth_rejects);
+        vty_out(vty, "  Timeouts:                %lu\r\n", cfg->stats.total_auth_timeouts);
+        vty_out(vty, "\r\n");
+        vty_out(vty, "Accounting:\r\n");
+        vty_out(vty, "  Acct-Request sent:       %lu\r\n", cfg->stats.total_acct_requests);
+        vty_out(vty, "  Acct-Response received:  %lu\r\n", cfg->stats.total_acct_responses);
+        vty_out(vty, "  Interim updates sent:    %lu\r\n", cfg->stats.total_interim_sent);
+        vty_out(vty, "\r\n");
+        vty_out(vty, "CoA/DM:\r\n");
+        vty_out(vty, "  CoA received:            %lu\r\n", cfg->stats.total_coa_received);
+        vty_out(vty, "  CoA applied:             %lu\r\n", cfg->stats.total_coa_applied);
+        vty_out(vty, "  DM received:             %lu\r\n", cfg->stats.total_dm_received);
+        vty_out(vty, "  DM applied:              %lu\r\n", cfg->stats.total_dm_applied);
+    }
     vty_out(vty, "\r\n");
     return CMD_SUCCESS;
 }
@@ -171,7 +199,20 @@ DEFUN(cmd_radius_server_host_key,
         vty_out(vty, "%% IP address and key required\r\n");
         return CMD_ERR_INCOMPLETE;
     }
-    vty_out(vty, "RADIUS server %s configured with key\r\n", argv[2]);
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, argv[2], &addr) != 1) {
+        vty_out(vty, "%% Invalid IP address: %s\r\n", argv[2]);
+        return CMD_ERR_INCOMPLETE;
+    }
+
+    int ret = radius_client_add_server(ntohl(addr.s_addr), 1812, 1813, argv[4], 1);
+    if (ret < 0) {
+        vty_out(vty, "%% Failed to add RADIUS server\r\n");
+        return CMD_ERR_INCOMPLETE;
+    }
+
+    vty_out(vty, "RADIUS server %s configured with secret\r\n", argv[2]);
     return CMD_SUCCESS;
 }
 
@@ -186,7 +227,10 @@ DEFUN(cmd_radius_server_timeout,
         vty_out(vty, "%% Timeout value required\r\n");
         return CMD_ERR_INCOMPLETE;
     }
-    vty_out(vty, "RADIUS timeout set to %s seconds\r\n", argv[2]);
+
+    uint32_t timeout = atoi(argv[2]);
+    radius_client_set_timeout(timeout);
+    vty_out(vty, "RADIUS timeout set to %u seconds\r\n", timeout);
     return CMD_SUCCESS;
 }
 
@@ -201,7 +245,10 @@ DEFUN(cmd_radius_server_retransmit,
         vty_out(vty, "%% Retransmit count required\r\n");
         return CMD_ERR_INCOMPLETE;
     }
-    vty_out(vty, "RADIUS retransmit set to %s\r\n", argv[2]);
+
+    uint8_t retries = atoi(argv[2]);
+    radius_client_set_retries(retries);
+    vty_out(vty, "RADIUS retransmit set to %u\r\n", retries);
     return CMD_SUCCESS;
 }
 

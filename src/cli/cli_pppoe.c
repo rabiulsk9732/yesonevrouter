@@ -302,8 +302,8 @@ DEFUN(cmd_pppoe_ac_name,
         return CMD_ERR_INCOMPLETE;
     }
 
+    pppoe_set_ac_name(argv[1]);
     vty_out(vty, "AC name set to: %s\r\n", argv[1]);
-    /* TODO: Set AC name in PPPoE module */
     return CMD_SUCCESS;
 }
 
@@ -318,8 +318,8 @@ DEFUN(cmd_pppoe_service_name,
         return CMD_ERR_INCOMPLETE;
     }
 
+    pppoe_set_service_name(argv[1]);
     vty_out(vty, "Service name set to: %s\r\n", argv[1]);
-    /* TODO: Set service name in PPPoE module */
     return CMD_SUCCESS;
 }
 

@@ -11,6 +11,7 @@ set(CLI_SOURCES
     cli_ippool.c
     cli_route.c
     cli_nat.c
+    cli_vlan.c
 )
 
 add_library(yesrouter_cli STATIC ${CLI_SOURCES})

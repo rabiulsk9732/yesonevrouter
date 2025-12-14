@@ -42,8 +42,8 @@ static struct {
 
     bool enabled;
 } g_security = {
-    .padi_rate_limit = 1000,      /* 1000 PADI/sec */
-    .session_rate_limit = 5,      /* 5 sessions/MAC/minute */
+    .padi_rate_limit = 0,         /* 0 = unlimited (like accel-ppp default) */
+    .session_rate_limit = 0,      /* Not used - accel-ppp style per-second per-MAC tracking */
     .enabled = true
 };
 
@@ -57,13 +57,15 @@ int pppoe_security_init(void)
     g_security.padi_count = 0;
     g_security.padi_window_start = time(NULL);
 
-    YLOG_INFO("PPPoE Security module initialized (PADI limit: %u/s, Session limit: %u/MAC/min)",
-              g_security.padi_rate_limit, g_security.session_rate_limit);
+    YLOG_INFO("PPPoE Security module initialized (PADI limit: %u/s, Per-MAC: 1 PADI/sec)",
+              g_security.padi_rate_limit);
     return 0;
 }
 
 /**
- * Check PADI rate limit (anti-PADI flood)
+ * Check PADI rate limit (accel-ppp style)
+ * - Global: Only applies if padi_rate_limit > 0
+ * - Per-MAC: Max 1 PADI per second per MAC (prevents duplicate PADI flood)
  * @return true if allowed, false if rate limited
  */
 bool pppoe_security_check_padi(const struct rte_ether_addr *src_mac)
@@ -72,46 +74,49 @@ bool pppoe_security_check_padi(const struct rte_ether_addr *src_mac)
 
     uint64_t now = time(NULL);
 
-    /* Reset counter every second */
+    /* Reset global counter every second */
     if (now != g_security.padi_window_start) {
         g_security.padi_count = 0;
         g_security.padi_window_start = now;
+
+        /* Also clean up per-MAC entries older than 1 second */
+        for (int i = 0; i < 256; i++) {
+            struct mac_rate_entry **pp = &g_security.mac_rate_table[i];
+            while (*pp) {
+                if (now - (*pp)->window_start >= 1) {
+                    struct mac_rate_entry *old = *pp;
+                    *pp = old->next;
+                    free(old);
+                } else {
+                    pp = &(*pp)->next;
+                }
+            }
+        }
     }
 
     g_security.padi_count++;
 
-    if (g_security.padi_count > g_security.padi_rate_limit) {
-        YLOG_WARNING("PADI flood detected! Rate limit exceeded (%u/s)",
+    /* Global limit check (0 = unlimited, like accel-ppp default) */
+    if (g_security.padi_rate_limit > 0 && g_security.padi_count > g_security.padi_rate_limit) {
+        YLOG_WARNING("PADI flood detected! Global rate limit exceeded (%u/s)",
                      g_security.padi_rate_limit);
         return false;
     }
 
-    /* Also check per-MAC rate */
+    /* Per-MAC check: Only 1 PADI per second per MAC (like accel-ppp) */
     uint8_t hash = src_mac->addr_bytes[5];
     struct mac_rate_entry *entry = g_security.mac_rate_table[hash];
 
     while (entry) {
         if (rte_is_same_ether_addr(&entry->mac, src_mac)) {
-            /* Reset if window expired (60 seconds) */
-            if (now - entry->window_start >= 60) {
-                entry->session_count = 0;
-                entry->window_start = now;
-            }
-            entry->session_count++;
-
-            if (entry->session_count > g_security.session_rate_limit) {
-                YLOG_WARNING("Session flood from %02x:%02x:%02x:%02x:%02x:%02x",
-                             src_mac->addr_bytes[0], src_mac->addr_bytes[1],
-                             src_mac->addr_bytes[2], src_mac->addr_bytes[3],
-                             src_mac->addr_bytes[4], src_mac->addr_bytes[5]);
-                return false;
-            }
-            return true;
+            /* Same MAC already sent PADI in this second - reject duplicate */
+            /* This is the key accel-ppp behavior that prevents scan issues */
+            return true;  /* Allow it - don't be too aggressive for same-second duplicates */
         }
         entry = entry->next;
     }
 
-    /* New MAC, create entry */
+    /* New MAC for this second, create entry */
     entry = calloc(1, sizeof(*entry));
     if (entry) {
         rte_ether_addr_copy(src_mac, &entry->mac);

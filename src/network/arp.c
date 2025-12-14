@@ -361,9 +361,16 @@ int arp_process_packet(const uint8_t *pkt, uint16_t len, uint32_t ifindex)
         struct interface *iface = interface_find_by_index(ifindex);
         if (iface && iface->config.ipv4_addr.s_addr != 0) {
             uint32_t our_ip = ntohl(iface->config.ipv4_addr.s_addr);
-            if (target_ip == our_ip) {
-                YLOG_INFO("ARP request is for us, sending reply");
-                arp_send_reply_on_interface(sender_ip, arp->ar_sha, our_ip, iface);
+        if (target_ip == our_ip) {
+                YLOG_INFO("ARP request received for us (IP %u.%u.%u.%u) - sending reply",
+                    (target_ip >> 24) & 0xFF, (target_ip >> 16) & 0xFF,
+                    (target_ip >> 8) & 0xFF, target_ip & 0xFF);
+                int ret = arp_send_reply_on_interface(sender_ip, arp->ar_sha, our_ip, iface);
+                if (ret != 0) {
+                     YLOG_ERROR("ARP reply send failed: %d", ret);
+                } else {
+                     YLOG_INFO("ARP reply sent successfully to interface");
+                }
             }
         }
     } else if (op == ARP_OP_REPLY) {

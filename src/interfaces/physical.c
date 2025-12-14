@@ -551,51 +551,123 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             return -1;
         }
 
-        /* Copy packet data to mbuf */
-        void *data = rte_pktmbuf_append(mbuf, pkt->len);
+        /* Copy packet data to mbuf - enforce 60-byte minimum Ethernet frame */
+        uint16_t final_len = (pkt->len < 60) ? 60 : pkt->len;
+        void *data = rte_pktmbuf_append(mbuf, final_len);
         if (!data) {
             rte_pktmbuf_free(mbuf);
             iface->stats.tx_dropped++;
             return -1;
         }
         rte_memcpy(data, pkt->data, pkt->len);
+        /* Zero-pad if needed */
+        if (final_len > pkt->len) {
+            memset((uint8_t *)data + pkt->len, 0, final_len - pkt->len);
+        }
 
-        /* Send packet */
+        /* Debug: Log PPPoE Session packet headers */
+        {
+            struct rte_ether_hdr *d_eth = (struct rte_ether_hdr *)data;
+            uint16_t d_type = rte_be_to_cpu_16(d_eth->ether_type);
+            uint16_t vlan_id = 0;
+            if (d_type == RTE_ETHER_TYPE_VLAN) {
+                struct rte_vlan_hdr *d_vlan = (struct rte_vlan_hdr *)(d_eth + 1);
+                vlan_id = rte_be_to_cpu_16(d_vlan->vlan_tci) & 0xFFF;
+                d_type = rte_be_to_cpu_16(d_vlan->eth_proto);
+            }
+            if (d_type == 0x8864) {
+                YLOG_INFO("LCP TX: len=%u final=%u iface=%s vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
+                          pkt->len, final_len, iface->name, vlan_id,
+                          d_eth->dst_addr.addr_bytes[0], d_eth->dst_addr.addr_bytes[1],
+                          d_eth->dst_addr.addr_bytes[2], d_eth->dst_addr.addr_bytes[3],
+                          d_eth->dst_addr.addr_bytes[4], d_eth->dst_addr.addr_bytes[5]);
+            }
+        }
 
         /* HQoS Interception */
+        /* HQoS Interception */
         if (hqos_is_active(priv->port_id)) {
-            /* Classify Packet (TODO: real classification) */
-            /* For now, map everything to class 2 (default) */
-            /* If we fail to enqueue (ring full), we drop */
-            if (hqos_enqueue(priv->port_id, 2, mbuf) == 0) {
-                 iface->stats.tx_packets++;
-                 iface->stats.tx_bytes += pkt->len;
-                 return 0; /* Enqueued successfully */
-            } else {
-                 rte_pktmbuf_free(mbuf);
-                 iface->stats.tx_dropped++;
-                 return -1;
+            /* Strict Control Plane Bypass Logic */
+            /* Default: BYPASS HQoS (Direct TX) */
+            bool use_hqos = false;
+
+            /* Parse Headers */
+            struct rte_ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+            uint16_t eth_type = rte_be_to_cpu_16(eth->ether_type);
+            size_t header_len = sizeof(struct rte_ether_hdr);
+
+            /* Handle VLAN */
+            if (eth_type == RTE_ETHER_TYPE_VLAN) {
+                struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
+                eth_type = rte_be_to_cpu_16(vlan->eth_proto);
+                header_len += sizeof(struct rte_vlan_hdr);
             }
+
+            /* Identify Subscriber Data */
+            if (eth_type == 0x8864) { /* PPPoE Session */
+                /* Check PPP Protocol */
+                /* PPPoE Header (6) + PPP Protocol (2) */
+                struct pppoe_hdr *pppoe = (struct pppoe_hdr *)((uint8_t *)eth + header_len);
+                /* Ensure packet large enough? Assumed ok for calling pppoe */
+
+                /* PPP Protocol is at offset 6 in PPPoE header */
+                /* struct pppoe_hdr usually has 'ver_type', 'code', 'session_id', 'length' */
+                /* Then payload starts. First 2 bytes of payload = PPP Protocol */
+
+                uint16_t *proto_ptr = (uint16_t *)((uint8_t *)pppoe + 6);
+                uint16_t ppp_proto = rte_be_to_cpu_16(*proto_ptr); // 0th byte of payload? No struct pppoe_hdr is 6 bytes.
+
+                if (ppp_proto == 0x0021 || ppp_proto == 0x0057) {
+                    /* IPv4 (0021) or IPv6 (0057) -> Subscriber Data -> HQoS */
+                    use_hqos = true;
+                }
+                /* LCP (C021), IPCP (8021), PAP (C023) -> BYPASS (use_hqos stays false) */
+            }
+            /* Non-PPPoE (ARP, ICMP, etc) -> BYPASS (use_hqos stays false) */
+
+            if (use_hqos) {
+                 /* Classify Packet (TODO: Flow based classification) */
+                 uint8_t class_id = 2; /* Default: Best Effort (Class 2) */
+
+                 /* Enqueue to HQoS */
+                 if (hqos_enqueue(priv->port_id, class_id, mbuf) == 0) {
+                      iface->stats.tx_packets++;
+                      iface->stats.tx_bytes += pkt->len;
+                      return 0; /* Enqueued successfully */
+                 } else {
+                      rte_pktmbuf_free(mbuf);
+                      iface->stats.tx_dropped++;
+                      return -1;
+                 }
+            }
+            /* If !use_hqos, Fallthrough to Direct TX (Bypass) */
         }
 
         /* Direct Send (Non-HQoS) */
         /* Send packet using thread-local queue ID, clamped to configured TX queues */
-        /* Use default of 1 if not specified (safe assumption as we configure at least 1) */
         uint16_t num_tx_queues = (priv->num_tx_queues > 0) ? priv->num_tx_queues : 1;
-        uint16_t tx_queue_id = (g_thread_queue_id >= 0) ? (g_thread_queue_id % num_tx_queues) : 0;
+        uint16_t queue_id = 0; /* Default to 0 for PoC/Simple Worker (Assuming single worker per port logic or locked) */
 
-        /* LOCKLESS TX: Each worker has dedicated TX queue */
-        uint16_t nb_tx = rte_eth_tx_burst(priv->port_id, tx_queue_id, &mbuf, 1);
-        if (nb_tx == 0) {
+        /* Note: rte_eth_tx_burst is not thread safe on same queue! */
+        /* Assuming Worker 0 (which runs both RX and HQoS) is the only one sending on Queue 0 */
+
+        sent = rte_eth_tx_burst(priv->port_id, queue_id, &mbuf, 1);
+        if (sent > 0) {
+            iface->stats.tx_packets++;
+            iface->stats.tx_bytes += pkt->len;
+            return 0;
+        } else {
+            /* Log Silent Drop in Transmission */
+            static uint64_t last_log = 0;
+            uint64_t now = rte_get_timer_cycles();
+            if (now - last_log > rte_get_timer_hz()) {
+                 YLOG_INFO("TX-BYPASS DROP: Port %u Queue %d burst returned 0", priv->port_id, queue_id);
+                 last_log = now;
+            }
             rte_pktmbuf_free(mbuf);
             iface->stats.tx_dropped++;
             return -1;
         }
-
-        iface->stats.tx_packets++;
-        iface->stats.tx_bytes += pkt->len;
-        /* Skip time() in fast path - timestamp updated periodically */
-        return 0;
     }
 #endif
 

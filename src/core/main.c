@@ -29,6 +29,7 @@
 #include "radius.h"
 #include "routing_table.h"
 #include "env_config.h"
+#include "service_profile.h"
 #include <ipoe.h>
 #include <getopt.h>
 #include <signal.h>
@@ -337,6 +338,12 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    /* Initialize Service Profiles for multi-profile PPPoE */
+    if (service_profile_init() != 0) {
+        YLOG_ERROR("Failed to initialize service profiles");
+        return -1;
+    }
+
     /* Initialize IPoE subsystem */
     if (ipoe_init(NULL) != 0) {
         YLOG_WARNING("Failed to initialize IPoE subsystem");
@@ -345,10 +352,8 @@ int main(int argc, char *argv[])
         YLOG_INFO("IPoE subsystem initialized");
     }
 
-    /* Initialize IP Pools */
+    /* Initialize IP Pools - pools configured via startup.json */
     ippool_init();
-    /* Create default pool: 100.64.0.10 - 100.64.0.250 */
-    ippool_create("default", 0x6440000A, 0x644000FA); /* 100.64.0.10 - 250 */
 
     /* Initialize IPv6 subsystem */
     if (ipv6_init() != 0) {
@@ -356,11 +361,8 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* Initialize RADIUS */
+    /* Initialize RADIUS - servers configured via startup.json */
     radius_init();
-    /* Add real RADIUS server */
-    radius_add_server(0x9D0F6241, 1812, "radius"); /* 157.15.98.65 */
-    YLOG_INFO("RADIUS: Added server 157.15.98.65:1812");
 
     /* Initialize QoS */
     qos_init();

@@ -278,6 +278,13 @@ DEFUN(cmd_write_memory,
 
         if (iface_count > 0) fprintf(f, ",\n");
         fprintf(f, "    \"%s\": {\n", iface->name);
+
+        /* VLAN-specific info */
+        if (iface->type == IF_TYPE_VLAN && iface->config.vlan_id > 0) {
+            fprintf(f, "      \"type\": \"vlan\",\n");
+            fprintf(f, "      \"vlan_id\": %u,\n", iface->config.vlan_id);
+        }
+
         if (iface->config.ipv4_addr.s_addr) {
             fprintf(f, "      \"ipv4_address\": \"%s\",\n", inet_ntoa(iface->config.ipv4_addr));
             fprintf(f, "      \"ipv4_mask\": \"%s\",\n", inet_ntoa(iface->config.ipv4_mask));

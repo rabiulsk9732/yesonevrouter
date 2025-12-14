@@ -359,10 +359,27 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
 
     session->session_id = id;
     rte_ether_addr_copy(mac, &session->client_mac);
-    session->iface = iface;
-    rte_ether_addr_copy(mac, &session->client_mac);
-    session->iface = iface;
     session->vlan_id = vlan_id;
+
+    /* Use VLAN sub-interface if vlan_id is set (for automatic VLAN tagging) */
+    if (vlan_id > 0) {
+        /* Build VLAN interface name: parent.vlan_id (e.g., eth1.100) */
+        char vlan_iface_name[64];
+        snprintf(vlan_iface_name, sizeof(vlan_iface_name), "%s.%u", iface->name, vlan_id);
+
+        struct interface *vlan_iface = interface_find_by_name(vlan_iface_name);
+        if (vlan_iface) {
+            session->iface = vlan_iface;
+            YLOG_INFO("PPPoE session %u using VLAN interface %s", id, vlan_iface_name);
+        } else {
+            /* Fallback to physical interface if VLAN interface not found */
+            session->iface = iface;
+            YLOG_WARNING("PPPoE session %u: VLAN interface %s not found, using %s",
+                        id, vlan_iface_name, iface->name);
+        }
+    } else {
+        session->iface = iface;
+    }
 
     /* Profile Lookup */
     const char *pool = pppoe_get_profile_pool(iface->name, vlan_id);
@@ -448,12 +465,16 @@ static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr 
     payload += sizeof(struct pppoe_tag) + strlen(g_pppoe_ctx.ac_name);
     payload_len += sizeof(struct pppoe_tag) + strlen(g_pppoe_ctx.ac_name);
 
-    /* Add Service-Name Tag (Empty for any service) */
+
+    /* Add Service-Name Tag (use global service_name or AC-Name as fallback) */
     tag = (struct pppoe_tag *)payload;
     tag->type = rte_cpu_to_be_16(PPPOE_TAG_SERVICE_NAME);
-    tag->length = 0;
-    payload += sizeof(struct pppoe_tag);
-    payload_len += sizeof(struct pppoe_tag);
+    const char *svc_name = (g_pppoe_ctx.service_name[0]) ? g_pppoe_ctx.service_name : g_pppoe_ctx.ac_name;
+    uint16_t svc_len = strlen(svc_name);
+    tag->length = rte_cpu_to_be_16(svc_len);
+    memcpy(tag->value, svc_name, svc_len);
+    payload += sizeof(struct pppoe_tag) + svc_len;
+    payload_len += sizeof(struct pppoe_tag) + svc_len;
 
     /* Add Host-Uniq Tag if present in PADI */
     if (host_uniq && host_uniq_len > 0) {
@@ -478,12 +499,49 @@ static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr 
     m->pkt_len = frame_len;
     pkt->len = frame_len;
 
-    /* Send packet */
-    int ret = interface_send(iface, pkt);
-    if (ret != 0) {
+    /* Direct DPDK TX for PPPoE control packets (bypass HQoS for reliability) */
+    /* Get DPDK port from interface */
+    uint16_t port_id = (iface->ifindex == 1) ? 0 : 1;  /* Gi0/1 = port 0, Gi0/2 = port 1 */
+
+    /* Allocate new mbuf and copy data (pkt->mbuf may be internal pool) */
+    extern struct dpdk_config g_dpdk_config;
+    struct rte_mempool *mp = (g_dpdk_config.pkt_mempool && g_dpdk_config.pkt_mempool->pool) ?
+                             (struct rte_mempool *)g_dpdk_config.pkt_mempool->pool : NULL;
+    if (!mp) {
+        YLOG_ERROR("PPPoE: No mempool for PADO TX");
         pkt_free(pkt);
+        return -1;
     }
-    return ret;
+
+    struct rte_mbuf *tx_mbuf = rte_pktmbuf_alloc(mp);
+    if (!tx_mbuf) {
+        YLOG_ERROR("PPPoE: Failed to allocate TX mbuf for PADO");
+        pkt_free(pkt);
+        return -1;
+    }
+
+    void *tx_data = rte_pktmbuf_append(tx_mbuf, frame_len);
+    if (!tx_data) {
+        rte_pktmbuf_free(tx_mbuf);
+        pkt_free(pkt);
+        return -1;
+    }
+    rte_memcpy(tx_data, pkt->data, frame_len);
+
+    /* Send directly via rte_eth_tx_burst (lockless, bypasses HQoS) */
+    uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &tx_mbuf, 1);
+
+    YLOG_INFO("PPPoE: PADO TX to port %u: %s (nb_tx=%u)", port_id,
+              nb_tx == 1 ? "SUCCESS" : "FAILED", nb_tx);
+
+    if (nb_tx == 0) {
+        rte_pktmbuf_free(tx_mbuf);
+        pkt_free(pkt);
+        return -1;
+    }
+
+    pkt_free(pkt);
+    return 0;
 }
 
 /**
@@ -505,19 +563,10 @@ static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_un
     rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
     rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
 
-    /* Add VLAN tag if session has one */
-    if (session->vlan_id > 0) {
-        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
-        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
-        vlan->vlan_tci = rte_cpu_to_be_16(session->vlan_id);
-        vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
-        pppoe = (struct pppoe_hdr *)(vlan + 1);
-        hdr_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr);
-    } else {
-        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
-        pppoe = (struct pppoe_hdr *)(eth + 1);
-        hdr_len = sizeof(struct rte_ether_hdr);
-    }
+    /* PPPoE Discovery - VLAN tagging handled by VLAN interface */
+    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_DISC);
+    pppoe = (struct pppoe_hdr *)(eth + 1);
+    hdr_len = sizeof(struct rte_ether_hdr);
     payload = (uint8_t *)(pppoe + 1);
 
     /* PPPoE Header */
@@ -529,9 +578,23 @@ static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_un
     /* Add Service-Name Tag */
     struct pppoe_tag *tag = (struct pppoe_tag *)payload;
     tag->type = rte_cpu_to_be_16(PPPOE_TAG_SERVICE_NAME);
-    tag->length = 0;
-    payload += sizeof(struct pppoe_tag);
-    payload_len += sizeof(struct pppoe_tag);
+
+    /* Use configured Service-Name (or AC-Name as fallback) */
+    const char *svc_name = g_pppoe_ctx.service_name[0] ? g_pppoe_ctx.service_name :
+                          (g_pppoe_ctx.ac_name[0] ? g_pppoe_ctx.ac_name : NULL);
+
+    if (svc_name) {
+        size_t slen = strlen(svc_name);
+        tag->length = rte_cpu_to_be_16(slen);
+        memcpy(tag->value, svc_name, slen);
+        payload += sizeof(struct pppoe_tag) + slen;
+        payload_len += sizeof(struct pppoe_tag) + slen;
+    } else {
+        /* Empty Service-Name if none configured */
+        tag->length = 0;
+        payload += sizeof(struct pppoe_tag);
+        payload_len += sizeof(struct pppoe_tag);
+    }
 
     /* Add Host-Uniq Tag if present */
     if (host_uniq && host_uniq_len > 0) {
@@ -555,7 +618,7 @@ static int pppoe_send_pads(struct pppoe_session *session, const uint8_t *host_un
     m->pkt_len = frame_len;
     pkt->len = frame_len;
 
-    /* Send packet */
+    /* Send packet via HQoS (immediate drain configured in physical.c) */
     return interface_send(session->iface, pkt);
 }
 
@@ -762,8 +825,8 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
                     memset(node, 0, sizeof(*node));
                     rte_ether_addr_copy(&eth->src_addr, &node->mac);
                     node->used = true;
-                    // Limit: 5 PADI/sec, Burst 5
-                    qos_tb_init(&node->tb, 5, 5);
+                    // Limit: 100 PADI/sec per MAC, Burst 20 (production-grade for 50k+ subs)
+                    qos_tb_init(&node->tb, 100, 20);
                     rte_hash_add_key_data(g_padi_hash, &node->mac, node);
                 } else {
                     /* Table full and no expired entries found in scan window */
@@ -876,7 +939,11 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
     struct pppoe_session *session = pppoe_find_session(session_id, &eth->src_addr);
 
     if (!session) {
-        YLOG_WARNING("PPPoE: Unknown session ID %u", session_id);
+        YLOG_INFO("PPPoE: Dropped packet for unknown session ID %u from %02x:%02x:%02x:%02x:%02x:%02x",
+                  session_id,
+                  eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+                  eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
+                  eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
         return -1;
     }
 

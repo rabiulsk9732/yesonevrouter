@@ -941,13 +941,14 @@ static void process_ipv4(struct pkt_buf *pkt)
 /* Main packet processing function */
 void packet_rx_process_packet(struct pkt_buf *pkt)
 {
-    /* CRITICAL DEBUG - ALWAYS PRINT */
-    fprintf(stderr, "[RX_DEBUG] ENTRY pkt=%p len=%u\n", (void*)pkt, pkt ? pkt->len : 0);
-    fflush(stderr);
+    /* TRACE LOG - CONFIRM PACKET ARRIVAL */
+    struct rte_ether_hdr *eth_trace = (struct rte_ether_hdr *)pkt->data;
+    uint16_t eth_type_trace = rte_be_to_cpu_16(eth_trace->ether_type);
+    YLOG_INFO("RX ENTRY: iface=%u len=%u eth_type=0x%04x",
+              pkt->meta.ingress_ifindex, pkt->len, eth_type_trace);
 
     /* Extract metadata (parse headers) */
     if (pkt_extract_metadata(pkt) != 0) {
-        fprintf(stderr, "[RX_DEBUG] METADATA FAILED\n"); fflush(stderr);
         YLOG_WARNING("Failed to extract packet metadata");
         return;
     }
@@ -962,20 +963,14 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
         eth_type = rte_be_to_cpu_16(vlan->eth_proto);
     }
 
-    fprintf(stderr, "[RX_DEBUG] eth_type=0x%04x (PPPoE_DISC=0x8863)\n", eth_type);
-    fflush(stderr);
-
-    if (eth_type == ETH_P_PPPOE_DISC) {
-        fprintf(stderr, "[RX_DEBUG] PPPoE DISC matched!\n");
-        fflush(stderr);
+    if (eth_type == 0x8863) { /* PPPoE DISC */
+        YLOG_INFO("RX PPPoE DISC");
         struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
-        fprintf(stderr, "[RX_DEBUG] iface=%p\n", (void*)iface);
-        fflush(stderr);
         pppoe_process_discovery(pkt, iface);
         return;
     }
 
-    if (eth_type == ETH_P_PPPOE_SESS) {
+    if (eth_type == 0x8864) { /* PPPoE SESS */
         struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
         pppoe_process_session(pkt, iface);
         return;
@@ -984,6 +979,7 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
     /* Dispatch based on L3 type */
     switch (pkt->meta.l3_type) {
     case PKT_L3_ARP:
+        YLOG_INFO("RX L3 ARP matched");
         process_arp(pkt);
         break;
     case PKT_L3_IPV4:
@@ -993,15 +989,12 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
         process_ipv6(pkt);
         break;
     default:
-        {
-            struct rte_ether_hdr *eth_dbg = (struct rte_ether_hdr *)pkt->data;
-            uint16_t eth_type_dbg = rte_be_to_cpu_16(eth_dbg->ether_type);
-            fprintf(stderr, "[RX_DEBUG] UNKNOWN eth_type=0x%04x len=%u\n", eth_type_dbg, pkt->len);
-            fflush(stderr);
-        }
-        break;
+        YLOG_INFO("RX UNKNOWN L3 TYPE: %d (eth_type=0x%04x)", pkt->meta.l3_type, eth_type);
+        /* Debug: print first bytes */
+        /* YLOG_HEX("Packet Dump", pkt->data, 32); */
     }
 }
+
 /* RX thread function */
 /* Worker thread arguments */
 struct rx_thread_args {
@@ -1140,28 +1133,90 @@ static void *rx_thread_func(void *arg)
                 for (uint16_t i = 0; i < nb_rx; i++) {
                     struct rte_mbuf *pkt = rx_pkts[i];
                     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+                    uint16_t eth_type = rte_be_to_cpu_16(eth->ether_type);
 
-                    /* Only process IPv4 */
-                    if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
-                        struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-                        uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
-                        uint16_t src_port = 0;
+                    /* Check for VLAN tag and get inner ethertype */
+                    uint16_t vlan_id = 0;
+                    if (eth_type == RTE_ETHER_TYPE_VLAN) {
+                        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
+                        vlan_id = rte_be_to_cpu_16(vlan->vlan_tci) & 0xFFF;
+                        eth_type = rte_be_to_cpu_16(vlan->eth_proto);
+                    }
 
-                        /* Get source port for TCP/UDP */
-                        if (ip->next_proto_id == IPPROTO_UDP || ip->next_proto_id == IPPROTO_TCP) {
-                            uint16_t *ports = (uint16_t *)((uint8_t *)ip + (ip->ihl << 2));
-                            src_port = rte_be_to_cpu_16(ports[0]);
+                    /* PPPoE Discovery (PADI/PADO/PADR/PADS/PADT) - route to PPPoE handler */
+                    if (eth_type == 0x8863) {  /* ETH_P_PPPOE_DISC */
+                        struct pkt_buf *pbuf = pkt_alloc();
+                        if (pbuf) {
+                            pbuf->mbuf = pkt;
+                            pbuf->data = rte_pktmbuf_mtod(pkt, uint8_t *);
+                            pbuf->len = rte_pktmbuf_pkt_len(pkt);
+                            pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
+                            pbuf->meta.vlan_id = vlan_id;
+                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            YLOG_INFO("PPPoE: Discovery on port %u vlan %u (iface %s)",
+                                      pkt->port, vlan_id, iface ? iface->name : "?");
+                            pppoe_process_discovery(pbuf, iface);
+                            pkt_free(pbuf);
+                        } else {
+                            rte_pktmbuf_free(pkt);
                         }
+                        continue;  /* Skip NAT for this packet */
+                    }
 
-                        /* PHASE 1 OPTIMIZATION: Process ALL packets locally
-                         * Each worker owns its own session table (lockless)
-                         * No handoff = no ring bottleneck = higher PPS
-                         */
+                    /* PPPoE Session (LCP/IPCP/Data) - route to PPPoE session handler */
+                    if (eth_type == 0x8864) {  /* ETH_P_PPPOE_SESS */
+                        struct pkt_buf *pbuf = pkt_alloc();
+                        if (pbuf) {
+                            pbuf->mbuf = pkt;
+                            pbuf->data = rte_pktmbuf_mtod(pkt, uint8_t *);
+                            pbuf->len = rte_pktmbuf_pkt_len(pkt);
+                            pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
+                            pbuf->meta.vlan_id = vlan_id;
+                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            pppoe_process_session(pbuf, iface);
+                            pkt_free(pbuf);
+                        } else {
+                            rte_pktmbuf_free(pkt);
+                        }
+                        continue;  /* Skip NAT for this packet */
+                    }
+
+                    /* Handle ARP */
+                    if (eth_type == RTE_ETHER_TYPE_ARP) {
+                        struct pkt_buf *pbuf = pkt_alloc();
+                        if (pbuf) {
+                            pbuf->mbuf = pkt;
+                            pbuf->data = rte_pktmbuf_mtod(pkt, uint8_t *);
+                            pbuf->len = rte_pktmbuf_pkt_len(pkt);
+                            /* Map port 0->1 (WAN), 1->2 (LAN) approximately? Or use env/config? */
+                            /* Existing code assumes port 0=WAN(1), port 1=LAN(2) */
+                            pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
+                            pbuf->meta.vlan_id = vlan_id;
+
+                            /* Call generic handler (which has trace logs) */
+                            packet_rx_process_packet(pbuf);
+
+                            /* mbuf ownership is tricky.
+                               If packet_rx_process_packet -> process_arp -> consumes data, it doesn't free mbuf.
+                               We need to ensure mbuf is freed if not forwarded.
+                               process_arp doesn't forward mbuf, it replies with NEW packet.
+                               So we should free mbuf?
+                               pkt_free(pbuf) doesn't free mbuf usually.
+                            */
+                            rte_pktmbuf_free(pkt); /* Free original ARP request mbuf after processing */
+                            pkt_free(pbuf);        /* Free wrapper */
+                        } else {
+                            rte_pktmbuf_free(pkt);
+                        }
+                        continue;
+                    }
+
+                    /* IPv4 - process through NAT fast path */
+                    if (eth_type == RTE_ETHER_TYPE_IPV4) {
                         local_pkts[local_count++] = pkt;
-                        (void)get_nat_worker_id; /* Suppress unused warning */
                     } else {
-                        /* Non-IPv4, process locally */
-                        local_pkts[local_count++] = pkt;
+                        /* Non-IPv4/Non-PPPoE - drop */
+                        rte_pktmbuf_free(pkt);
                     }
                 }
 
@@ -1305,6 +1360,12 @@ static void *rx_thread_func(void *arg)
                 }
                 last_log = now;
             }
+
+            /* HQoS Scheduler - Must run on Worker 0 to avoid race on Queue 0 */
+            if (worker_id == 0) {
+                hqos_run();
+            }
+
             continue;
         }
 #endif
@@ -1401,36 +1462,9 @@ static void *rx_thread_func(void *arg)
             /* Busy wait - DPDK poll mode */
         }
 
-        /* Run HQoS Scheduler */
-        /* Each worker helps run the scheduler */
-        /* Ideal: Separate TX/Scheduler thread. But we use Run-to-Completion. */
-        /* Just make sure hqos_run() is thread-safe or per-port. */
-        /* hqos_run() iterates ports. rte_eth_tx_burst is thread-safe IF queues separate.
-           Our hqos_run uses queue 0.
-           If multiple threads call hqos_run() -> collision on Queue 0.
-           WE NEED LOCK for hqos_run if multiple threads.
-           Queue 0 lock is in physical_priv.
-           hqos_run doesn't lock.
+        /* HQoS Scheduler Logic */
 
-           Wait, physical.c: physical_send locks 'priv->lock'.
-
-           hqos.c: hqos_run does NOT lock.
-           FIX: We need to limit hqos_run to ONE thread? Or implement locking in hqos_run?
-
-           Core 0 (Main) doesn't run RX loop usually?
-           Workers run RX.
-           If 4 workers, all 4 run hqos_run?
-           Race condition on Dequeue (Ring SC) and TX Burst.
-           Ring is SC (Single Consumer). Only ONE thread can dequeue.
-
-           So hqos_run MUST BE SINGLE THREADED Per Port.
-           Or use Locking.
-
-           Simplest: Only Worker 0 runs hqos_run?
-           Or pin ports to workers.
-
-           For this PoC: Only run hqos_run if (worker_id == 0).
-        */
+        /* HQoS Scheduler - Must run on Worker 0 to avoid race on Queue 0 */
         if (worker_id == 0) {
             hqos_run();
         }

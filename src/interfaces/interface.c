@@ -324,14 +324,17 @@ int interface_down(struct interface *iface)
 int interface_send(struct interface *iface, struct pkt_buf *pkt)
 {
     if (!iface || !pkt) {
+        fprintf(stderr, "[IFACE] interface_send: NULL iface or pkt\n");
         return -1;
     }
 
     if (iface->state != IF_STATE_UP) {
+        fprintf(stderr, "[IFACE] interface_send: %s not UP (state=%d)\n", iface->name, iface->state);
         return -1;
     }
 
     if (!iface->ops->send) {
+        fprintf(stderr, "[IFACE] interface_send: %s has no send op\n", iface->name);
         return -1;
     }
 
@@ -553,8 +556,38 @@ int interface_discover_dpdk_ports(void)
             continue;
         }
 
-        /* Simple Cisco-style naming: Gi0/1, Gi0/2, etc. */
-        snprintf(name, sizeof(name), "Gi0/%u", port_id + 1);
+        /* Speed-based dynamic interface naming */
+        /* Counter per interface type for numbering */
+        static int eth_count = 0, gi_count = 0, teng_count = 0;
+        static int twentyfiveg_count = 0, fortyg_count = 0, hundredg_count = 0;
+
+        struct rte_eth_link link;
+        memset(&link, 0, sizeof(link));
+        rte_eth_link_get_nowait(port_id, &link);
+
+        const char *prefix = "eth";  /* Default for unknown/virtio */
+        int *counter = &eth_count;
+
+        /* Map speed to prefix */
+        if (link.link_speed >= RTE_ETH_SPEED_NUM_100G) {
+            prefix = "100g";
+            counter = &hundredg_count;
+        } else if (link.link_speed >= RTE_ETH_SPEED_NUM_40G) {
+            prefix = "40g";
+            counter = &fortyg_count;
+        } else if (link.link_speed >= RTE_ETH_SPEED_NUM_25G) {
+            prefix = "25g";
+            counter = &twentyfiveg_count;
+        } else if (link.link_speed >= RTE_ETH_SPEED_NUM_10G) {
+            prefix = "10g";
+            counter = &teng_count;
+        } else if (link.link_speed >= RTE_ETH_SPEED_NUM_1G) {
+            prefix = "gi";
+            counter = &gi_count;
+        }
+        /* eth for 100M, 10M, or unknown (virtio) */
+
+        snprintf(name, sizeof(name), "%s%d", prefix, (*counter)++);
 
         /* Check if already exists */
         if (interface_find_by_name(name)) {

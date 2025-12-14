@@ -24,6 +24,9 @@ static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t ide
     struct pkt_buf *pkt = pkt_alloc();
     if (!pkt) return -1;
 
+    YLOG_INFO("LCP SEND: session=%u vlan_id=%u iface=%s",
+              session->session_id, session->vlan_id, session->iface->name);
+
     struct rte_mbuf *m = pkt->mbuf;
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     struct pppoe_hdr *pppoe;
@@ -36,19 +39,10 @@ static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t ide
     rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
     rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
 
-    /* Add VLAN tag if session has one */
-    if (session->vlan_id > 0) {
-        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
-        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
-        vlan->vlan_tci = rte_cpu_to_be_16(session->vlan_id);
-        vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
-        pppoe = (struct pppoe_hdr *)(vlan + 1);
-        hdr_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr);
-    } else {
-        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
-        pppoe = (struct pppoe_hdr *)(eth + 1);
-        hdr_len = sizeof(struct rte_ether_hdr);
-    }
+    /* PPPoE Session ethertype - VLAN tagging handled by VLAN interface if session->iface is a VLAN sub-interface */
+    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
+    pppoe = (struct pppoe_hdr *)(eth + 1);
+    hdr_len = sizeof(struct rte_ether_hdr);
 
     proto = (uint16_t *)(pppoe + 1);
     lcp = (struct lcp_hdr *)(proto + 1);
@@ -81,7 +75,7 @@ static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t ide
     m->pkt_len = m->data_len;
     pkt->len = m->data_len;
 
-    /* Send */
+    /* Send via HQoS (hqos_run called immediately after enqueue) */
     int ret = interface_send(session->iface, pkt);
     if (ret != 0) {
         pkt_free(pkt);
@@ -118,6 +112,7 @@ static void ppp_lcp_send_conf_req(struct pppoe_session *session)
     len += opt->length;
 
     ppp_lcp_send(session, LCP_CODE_CONF_REQ, ++session->next_lcp_identifier, options, len);
+    YLOG_INFO("LCP: Sent Configure-Request for session %u", session->session_id);
     session->lcp_state = LCP_STATE_REQ_SENT;
     session->last_conf_req_ts = time(NULL);
 }
@@ -169,6 +164,7 @@ void ppp_lcp_init(struct pppoe_session *session)
 
 void ppp_lcp_open(struct pppoe_session *session)
 {
+    YLOG_INFO("LCP: Opening session %u", session->session_id);
     session->lcp_state = LCP_STATE_STARTING;
     ppp_lcp_send_conf_req(session);
 }
@@ -193,7 +189,7 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
     YLOG_DEBUG("LCP: code=%u state=%d", lcp->code, session->lcp_state);
     switch (lcp->code) {
     case LCP_CODE_CONF_REQ: {
-        YLOG_INFO("LCP: Received Configure-Request");
+        YLOG_INFO("LCP: Received Configure-Request (State=%u, Retry=%u)", session->lcp_state, session->conf_req_retries);
 
         uint8_t ack_options[1500];
         uint16_t ack_len = 0;
@@ -263,11 +259,14 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
 
         /* Decision Logic */
         if (rej_len > 0) {
+            YLOG_INFO("LCP: Sending Config-Reject (len=%u)", rej_len);
             ppp_lcp_send_conf_rej(session, lcp->identifier, rej_options, rej_len);
         } else if (nak_len > 0) {
+            YLOG_INFO("LCP: Sending Config-Nak (len=%u)", nak_len);
             ppp_lcp_send_conf_nak(session, lcp->identifier, nak_options, nak_len);
         } else {
             /* All options acceptable */
+            YLOG_INFO("LCP: Sending Config-Ack (len=%u)", ack_len);
             ppp_lcp_send_conf_ack(session, lcp->identifier, ack_options, ack_len);
 
             /* RFC 1661 State Machine Transitions after sending Conf-Ack */

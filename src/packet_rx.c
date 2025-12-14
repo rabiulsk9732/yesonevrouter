@@ -48,6 +48,19 @@ extern struct nat_config g_nat_config;
 #include <netinet/ip_icmp.h>
 #endif
 
+/* Helper: Create pkt_buf from DPDK mbuf for PPPoE processing */
+#ifdef HAVE_DPDK
+static inline struct pkt_buf *pkt_alloc_from_mbuf(struct rte_mbuf *mbuf)
+{
+    struct pkt_buf *pkt = pkt_alloc();
+    if (!pkt) return NULL;
+
+    pkt->mbuf = mbuf;
+    pkt->data = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    pkt->len = rte_pktmbuf_pkt_len(mbuf);
+    return pkt;
+}
+#endif
 #include "env_config.h"
 
 #ifdef HAVE_DPDK
@@ -1119,9 +1132,46 @@ static void *rx_thread_func(void *arg)
                 for (uint16_t i = 0; i < nb_rx; i++) {
                     struct rte_mbuf *pkt = rx_pkts[i];
                     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+                    uint16_t eth_type = rte_be_to_cpu_16(eth->ether_type);
+
+                    /* Check for VLAN tag and get inner ethertype */
+                    if (eth_type == RTE_ETHER_TYPE_VLAN) {
+                        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
+                        eth_type = rte_be_to_cpu_16(vlan->eth_proto);
+                    }
+
+                    /* PPPoE Discovery (PADI/PADO/PADR/PADS/PADT) - route to PPPoE handler */
+                    if (eth_type == 0x8863) {  /* ETH_P_PPPOE_DISC */
+                        /* Create pkt_buf wrapper and process */
+                        struct pkt_buf *pbuf = pkt_alloc_from_mbuf(pkt);
+                        if (pbuf) {
+                            pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
+                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            YLOG_INFO("PPPoE: PADI received on port %u (iface %s)", pkt->port, iface ? iface->name : "?");
+                            pppoe_process_discovery(pbuf, iface);
+                            pkt_free(pbuf);
+                        } else {
+                            rte_pktmbuf_free(pkt);
+                        }
+                        continue;  /* Skip NAT for this packet */
+                    }
+
+                    /* PPPoE Session (data) - route to PPPoE session handler */
+                    if (eth_type == 0x8864) {  /* ETH_P_PPPOE_SESS */
+                        struct pkt_buf *pbuf = pkt_alloc_from_mbuf(pkt);
+                        if (pbuf) {
+                            pbuf->meta.ingress_ifindex = (pkt->port == 0) ? 1 : 2;
+                            struct interface *iface = interface_find_by_index(pbuf->meta.ingress_ifindex);
+                            pppoe_process_session(pbuf, iface);
+                            pkt_free(pbuf);
+                        } else {
+                            rte_pktmbuf_free(pkt);
+                        }
+                        continue;  /* Skip NAT for this packet */
+                    }
 
                     /* Only process IPv4 */
-                    if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+                    if (rte_be_to_cpu_16(eth->ether_type) == RTE_ETHER_TYPE_IPV4) {
                         struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
                         uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
                         uint16_t src_port = 0;
@@ -1138,9 +1188,11 @@ static void *rx_thread_func(void *arg)
                          */
                         local_pkts[local_count++] = pkt;
                         (void)get_nat_worker_id; /* Suppress unused warning */
+                        (void)src_ip;
+                        (void)src_port;
                     } else {
-                        /* Non-IPv4, process locally */
-                        local_pkts[local_count++] = pkt;
+                        /* Non-IPv4/Non-PPPoE, free packet */
+                        rte_pktmbuf_free(pkt);
                     }
                 }
 

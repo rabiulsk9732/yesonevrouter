@@ -228,6 +228,16 @@ void hqos_run(void) {
              /* Charge tokens for SENT packets */
              if (sent > 0) {
                  qos_tb_consume(&port->tb, sent_bytes);
+                 if (sent_bytes > 0) {
+                     /* Rate limit logs */
+                     static uint64_t last_log = 0;
+                     uint64_t now = rte_get_timer_cycles();
+                     if (now - last_log > rte_get_timer_hz()) {
+                        YLOG_INFO("HQoS: Port %u sent %u packets (%u bytes)",
+                                  port->port_id, sent, sent_bytes);
+                        last_log = now;
+                     }
+                 }
              }
         }
     }

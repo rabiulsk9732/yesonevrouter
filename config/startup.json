@@ -1,5 +1,5 @@
 {
-  "_comment": "YESRouter Cisco-Style CLI Configuration (Runtime)",
+  "_comment": "YESRouter vBNG Production Config",
   "interfaces": {
     "Gi0/1": {
       "description": "WAN Interface",
@@ -9,12 +9,44 @@
       "nat_outside": true
     },
     "Gi0/2": {
-      "description": "LAN Interface",
+      "description": "LAN Interface - PPPoE",
       "ipv4_address": "172.16.17.1",
       "ipv4_mask": "255.255.255.0",
       "nat_inside": true,
       "nat_outside": false
     }
+  },
+  "ip_pools": [
+    {
+      "name": "PPP_POOL",
+      "start": "100.64.0.1",
+      "end": "100.64.0.254"
+    }
+  ],
+  "service_profiles": [
+    {
+      "name": "hello1",
+      "interface": "Gi0/2",
+      "vlan_id": "100",
+      "pool_name": "PPP_POOL",
+      "ac_name": "hello",
+      "service_names": [
+        "hello1"
+      ]
+    }
+  ],
+  "radius": {
+    "servers": [
+      {
+        "host": "127.0.0.1",
+        "auth_port": "1812",
+        "acct_port": "1813",
+        "secret": "testing123",
+        "priority": "1"
+      }
+    ],
+    "timeout": "3",
+    "retries": "3"
   },
   "nat44": {
     "enabled": true,
@@ -29,7 +61,8 @@
       }
     ],
     "inside_networks": [
-      "172.16.17.0/24"
+      "172.16.17.0/24",
+      "100.64.0.0/24"
     ],
     "timeouts": {
       "udp": 300,

@@ -45,13 +45,4 @@ bool dhcpv6pd_is_enabled(void) { return false; }
 void dhcpv6pd_dump_leases(void) { printf("DHCPv6-PD: No leases\n"); }
 int dhcpv6pd_enable(bool e) { (void)e; return 0; }
 
-/* ========== Service Profile ========== */
-
-void service_profile_list(void) { printf("No profiles\n"); }
-int service_profile_create(const char *n) { (void)n; return 0; }
-int service_profile_set_interface(const char *n, const char *i) { (void)n; (void)i; return 0; }
-int service_profile_set_pool(const char *n, const char *p) { (void)n; (void)p; return 0; }
-int service_profile_set_ac_name(const char *n, const char *a) { (void)n; (void)a; return 0; }
-int service_profile_add_service_name(const char *p, const char *s) { (void)p; (void)s; return 0; }
-int service_profile_remove_service_name(const char *p, const char *s) { (void)p; (void)s; return 0; }
-
+/* Service Profile functions are now in src/pppoe/service_profile.c */
