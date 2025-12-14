@@ -24,7 +24,7 @@
 
 /* Existing YesRouter modules */
 #include <arp.h>
-#include <radius.h>
+#include <radius_lockless.h>
 
 /*============================================================================
  * IPoE Global Configuration

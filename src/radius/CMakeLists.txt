@@ -1,5 +1,5 @@
 set(RADIUS_SOURCES
-    radius_client.c
+    radius_lockless.c
 )
 
 add_library(yesrouter_radius STATIC ${RADIUS_SOURCES})

@@ -6,9 +6,9 @@
 #ifndef PPPOE_TX_H
 #define PPPOE_TX_H
 
-#include <stdint.h>
-#include <stdbool.h>
 #include <rte_ether.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 /**
  * Initialize PPPoE TX subsystem
@@ -33,11 +33,26 @@ int pppoe_tx_init(void);
  * @return 0 on success, -1 on error
  */
 int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
-                            const struct rte_ether_addr *dst_mac,
-                            const uint8_t *src_mac,
-                            uint16_t vlan_id,
-                            const uint8_t *pppoe_payload,
-                            uint16_t payload_len);
+                            const struct rte_ether_addr *dst_mac, const uint8_t *src_mac,
+                            uint16_t vlan_id, const uint8_t *pppoe_payload, uint16_t payload_len);
+
+/**
+ * Send PPPoE session packet (LCP/CHAP/IPCP/DATA) with VLAN support
+ *
+ * Same as pppoe_tx_send_discovery but uses ETH_P_PPPOE_SESS (0x8864)
+ *
+ * @param port_id DPDK port ID
+ * @param queue_id TX queue ID
+ * @param dst_mac Destination MAC address
+ * @param src_mac Source MAC address
+ * @param vlan_id VLAN ID (0 = untagged)
+ * @param pppoe_payload PPPoE header + PPP protocol + payload
+ * @param payload_len Length of PPPoE header + payload
+ * @return 0 on success, -1 on error
+ */
+int pppoe_tx_send_session(uint16_t port_id, uint16_t queue_id, const struct rte_ether_addr *dst_mac,
+                          const uint8_t *src_mac, uint16_t vlan_id, const uint8_t *pppoe_payload,
+                          uint16_t payload_len);
 
 /**
  * Check if port supports hardware VLAN insertion

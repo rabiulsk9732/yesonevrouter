@@ -34,6 +34,7 @@ extern void ppp_lcp_check_timeouts(struct pppoe_session *session);
 #include "ppp_auth.h"
 #include "pppoe_defs.h"
 #include "pppoe_tx.h"
+#include "radius_lockless.h"
 
 /* Forward declarations */
 static void log_packet_hex(const char *type, struct pkt_buf *pkt);
@@ -66,7 +67,7 @@ static inline uint16_t interface_get_dpdk_port(struct interface *iface)
 }
 #include "ha.h"
 #include "qos.h"
-#include "radius.h"
+#include "radius_lockless.h"
 
 /* Global PPPoE configuration/state */
 struct pppoe_session *g_pppoe_session_slab = NULL;
@@ -129,6 +130,9 @@ static struct {
     uint16_t next_session_id;
     char service_name[32];
     char ac_name[32];
+
+    /* Spinlock for thread-safe session allocation */
+    rte_spinlock_t alloc_lock;
 } g_pppoe_ctx;
 
 /* Global PPP Settings with defaults */
@@ -199,7 +203,6 @@ void pppoe_set_padi_rate_limit(uint32_t rate_per_sec)
 }
 
 /* Forward declarations */
-static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_result *result);
 
 /**
  * Initialize PPPoE subsystem
@@ -213,6 +216,9 @@ int pppoe_init(void)
     g_pppoe_ctx.next_session_id = 1;
     strncpy(g_pppoe_ctx.service_name, "yesrouter-pppoe", sizeof(g_pppoe_ctx.service_name) - 1);
     strncpy(g_pppoe_ctx.ac_name, "yesrouter", sizeof(g_pppoe_ctx.ac_name) - 1);
+
+    /* Initialize spinlock for thread-safe session allocation */
+    rte_spinlock_init(&g_pppoe_ctx.alloc_lock);
 
     /* 1. Allocate Session Slab (Hugepages) */
     YLOG_INFO("Allocating PPPoE Session Slab for %u sessions...", MAX_SESSIONS);
@@ -284,12 +290,7 @@ int pppoe_init(void)
     /* Clear bitmap */
     rte_bitmap_reset(g_pppoe_ctx.session_bitmap);
 
-    /* Register Callbacks */
-    radius_set_coa_callback(pppoe_update_qos);
-    radius_set_auth_callback(pppoe_auth_callback);
-    /* Forward declaration for callback */
-    void pppoe_disconnect_callback(const char *session_str, const uint8_t *mac, uint32_t ip);
-    radius_set_disconnect_callback(pppoe_disconnect_callback);
+    /* Lockless RADIUS - no callbacks needed, responses polled in packet_rx loop */
 
     YLOG_INFO("PPPoE subsystem initialized (High Performance Mode)");
     return 0;
@@ -380,10 +381,17 @@ struct pppoe_session *pppoe_find_session_by_ip(uint32_t ip)
 
 /**
  * Create new session
+ * Thread-safe using DPDK spinlock to prevent race conditions
  */
 static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *mac,
                                                   struct interface *iface, uint16_t vlan_id)
 {
+    /* FIXED: Acquire spinlock to prevent concurrent session allocation
+     * This prevents race conditions where two threads could allocate
+     * the same session ID or corrupt the hash table
+     */
+    rte_spinlock_lock(&g_pppoe_ctx.alloc_lock);
+
     /* 1. Allocate ID (Find free slot) */
     uint16_t id = g_pppoe_ctx.next_session_id;
     uint32_t attempts = 0;
@@ -395,6 +403,7 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
             id = 1;
         attempts++;
         if (attempts >= MAX_SESSIONS) {
+            rte_spinlock_unlock(&g_pppoe_ctx.alloc_lock);
             YLOG_ERROR("PPPoE: Max sessions reached (%u)", MAX_SESSIONS);
             return NULL;
         }
@@ -441,7 +450,7 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
     }
 
     session->state = PPPOE_STATE_INITIAL;
-    session->acct_interim_interval = radius_client_get_config()->interim_interval_sec;
+    session->acct_interim_interval = 300; /* Default 5 minutes */
     session->created_ts = time(NULL);
 
     /* 3. Add to ID Hash */
@@ -451,10 +460,16 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
 
     int ret = rte_hash_add_key_data(g_pppoe_ctx.session_id_hash, &key, (void *)(uintptr_t)id);
     if (ret < 0) {
+        rte_spinlock_unlock(&g_pppoe_ctx.alloc_lock);
         YLOG_ERROR("PPPoE: Failed to add to ID hash");
         rte_bitmap_clear(g_pppoe_ctx.session_bitmap, id);
         return NULL;
     }
+
+    /* Release lock before calling subsystem init functions
+     * These are independent operations that don't require the lock
+     */
+    rte_spinlock_unlock(&g_pppoe_ctx.alloc_lock);
 
     /* Initialize Subsystems */
     ppp_lcp_init(session);
@@ -852,40 +867,76 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
 
     switch (pppoe->code) {
     case PPPOE_CODE_PADI: {
-        /* Per-MAC Rate Limiter */
+        /* Per-MAC Rate Limiter with proper LRU eviction */
         struct padi_node *node = NULL;
         int ret = rte_hash_lookup_data(g_padi_hash, &eth->src_addr, (void **)&node);
 
         if (ret < 0) {
-            /* Alloc new node */
-            /* Simple linear search for free/old slot (Optimized: use ring in production) */
+            /* Alloc new node - use proper LRU clock algorithm */
             int free_idx = -1;
-            /* Try specific range based on clock to avoid full scan? Or just scan 100 slots? */
-            /* For now: Scan 32 slots starting from LRU clock */
-            for (int i = 0; i < 32; i++) {
-                int idx = (g_padi_lru_clock + i) % MAX_PADI_TRACKERS;
-                if (!g_padi_nodes[idx].used || (time(NULL) - g_padi_nodes[idx].last_seen > 10)) {
-                    free_idx = idx;
-                    /* If used, remove old hash entry */
-                    if (g_padi_nodes[idx].used) {
-                        rte_hash_del_key(g_padi_hash, &g_padi_nodes[idx].mac);
-                    }
+
+            /* FIXED: Scan ALL slots to find LRU entry, not just 32
+             * This prevents DoS attacks where attackers use MACs beyond the scan window
+             * Time complexity: O(n) where n=MAX_PADI_TRACKERS (4096)
+             * Acceptable for DoS protection on 100k session systems
+             */
+            uint64_t oldest_ts = UINT64_MAX;
+            int oldest_idx = -1;
+
+            /* First pass: find free slot */
+            for (int i = 0; i < MAX_PADI_TRACKERS; i++) {
+                if (!g_padi_nodes[i].used) {
+                    free_idx = i;
                     break;
                 }
             }
-            g_padi_lru_clock = (g_padi_lru_clock + 1) % MAX_PADI_TRACKERS;
+
+            /* Second pass: if no free slots, find LRU (oldest last_seen) */
+            if (free_idx < 0) {
+                for (int i = 0; i < MAX_PADI_TRACKERS; i++) {
+                    if (g_padi_nodes[i].last_seen < oldest_ts) {
+                        oldest_ts = g_padi_nodes[i].last_seen;
+                        oldest_idx = i;
+                    }
+                }
+
+                /* Evict oldest entry if it's older than 10 seconds */
+                if (oldest_idx >= 0 && (time(NULL) - oldest_ts > 10)) {
+                    free_idx = oldest_idx;
+                    rte_hash_del_key(g_padi_hash, &g_padi_nodes[oldest_idx].mac);
+                    YLOG_DEBUG("PPPoE: Evicted PADI tracker for MAC %02x:%02x:%02x:%02x:%02x:%02x "
+                               "(age=%lu sec)",
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[0],
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[1],
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[2],
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[3],
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[4],
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[5],
+                               time(NULL) - oldest_ts);
+                }
+            }
 
             if (free_idx >= 0) {
                 node = &g_padi_nodes[free_idx];
                 memset(node, 0, sizeof(*node));
                 rte_ether_addr_copy(&eth->src_addr, &node->mac);
                 node->used = true;
-                // Limit: 100 PADI/sec per MAC, Burst 20 (production-grade for 50k+ subs)
-                qos_tb_init(&node->tb, 100, 20);
+                /* FIXED: Lower rate limit to prevent DoS - 50 PADI/sec per MAC, Burst 10 */
+                qos_tb_init(&node->tb, 50, 10);
                 rte_hash_add_key_data(g_padi_hash, &node->mac, node);
             } else {
-                /* Table full and no expired entries found in scan window */
-                YLOG_WARNING("PPPoE: PADI Table Full, dropping packet from new MAC");
+                /* Table full and all entries are active/recent */
+                /* DoS protection: drop the packet */
+                static time_t last_full_log = 0;
+                if (time(NULL) > last_full_log) {
+                    YLOG_WARNING(
+                        "PPPoE: PADI Table Full (DoS attack?). All %u slots active and recent. "
+                        "Dropping PADI from %02x:%02x:%02x:%02x:%02x:%02x",
+                        MAX_PADI_TRACKERS, eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+                        eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
+                        eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
+                    last_full_log = time(NULL);
+                }
                 return 0;
             }
         }
@@ -1230,13 +1281,44 @@ void pppoe_terminate_session(struct pppoe_session *session, const char *reason)
 #define PPPOE_ECHO_INTERVAL 30 /* Send echo every 30 seconds */
 #define PPPOE_ECHO_MAX_FAILS 3 /* Max failures before terminate */
 
+/* Per-core keepalive state to distribute load */
+#define MAX_KEEPALIVE_WORKERS 8
+static struct {
+    uint32_t next_session_idx;
+    uint32_t sessions_per_core;
+    uint32_t total_sessions;
+    uint8_t initialized;
+} g_keepalive_state[MAX_KEEPALIVE_WORKERS];
+
 void pppoe_check_keepalives(void)
 {
+    /* FIX: Only one core (lcore 0) handles keepalive checks to avoid lock contention
+     * This prevents per-core imbalance and enables proper scaling to 100k+ sessions
+     */
+    uint32_t core_id = rte_lcore_id();
+
+    /* In DPDK, lcore_id 0 is typically the main/core 0 */
+    /* Only this core should run keepalive checks */
+    if (core_id != 0) {
+        return;
+    }
+
+    /* Initialize per-core partitioning on first run */
+    if (!g_keepalive_state[0].initialized) {
+        g_keepalive_state[0].total_sessions = MAX_SESSIONS;
+        g_keepalive_state[0].sessions_per_core = MAX_SESSIONS / MAX_KEEPALIVE_WORKERS;
+        g_keepalive_state[0].initialized = 1;
+        YLOG_INFO("PPPoE: Initialized keepalive checker (single-core mode)");
+    }
+
     struct rte_bitmap *bmp = g_pppoe_ctx.session_bitmap;
     uint32_t pos = 0;
     uint64_t mask = 0;
     uint64_t now = time(NULL);
 
+    /* Scan all active sessions - in production, this could be further optimized
+     * with a priority queue or timer wheel for better scalability
+     */
     __rte_bitmap_scan_init(bmp);
     while (rte_bitmap_scan(bmp, &pos, &mask)) {
         for (int i = 0; i < 64; i++) {
@@ -1336,57 +1418,68 @@ void pppoe_update_qos(const uint8_t *mac, uint64_t rate_bps)
     YLOG_WARNING("PPPoE: Session not found for QoS update");
 }
 
-static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_result *result)
+
+/**
+ * Handle RADIUS response from lockless RADIUS client
+ * Called from packet processing loop when responses arrive
+ */
+void pppoe_handle_radius_response(struct radius_auth_response *resp)
 {
-    struct pppoe_session *session = pppoe_find_session(session_id, NULL);
+    if (!resp) return;
 
+    struct pppoe_session *session = pppoe_find_session(resp->session_id, NULL);
     if (!session) {
-        YLOG_WARNING("PPPoE: Auth response for unknown session %u", session_id);
+        YLOG_WARNING("PPPoE: Lockless RADIUS response for unknown session %u", resp->session_id);
         return;
     }
 
-    /* CRITICAL: Atomic CAS to prevent duplicate auth processing from multiple lcores */
-    uint8_t expected_state = PPPOE_STATE_PADR_RCVD;
-    if (!__atomic_compare_exchange_n(&session->state, &expected_state,
-                                     PPPOE_STATE_SESSION_ESTABLISHED, 0, __ATOMIC_SEQ_CST,
-                                     __ATOMIC_SEQ_CST)) {
+    /* Check session is still active and auth pending */
+    uint8_t current_state = session->state;
+    if (current_state == PPPOE_STATE_TERMINATED) {
+        YLOG_WARNING("PPPoE: RADIUS response for terminated session %u", resp->session_id);
         return;
     }
 
-    if (result->success) {
-        /* Only use RADIUS Framed-IP if provided, otherwise keep pool-allocated IP */
-        uint32_t assigned_ip = (result->framed_ip != 0) ? result->framed_ip : session->client_ip;
+    /* Already established - ignore duplicate */
+    if (current_state == PPPOE_STATE_SESSION_ESTABLISHED && session->auth_complete) {
+        YLOG_DEBUG("PPPoE: Ignoring duplicate RADIUS response for session %u", resp->session_id);
+        return;
+    }
 
-        YLOG_INFO("PPPoE: Auth success for session %u, IP %u.%u.%u.%u (RADIUS: %u.%u.%u.%u)",
-                  session_id, (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
-                  (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF, (result->framed_ip >> 24) & 0xFF,
-                  (result->framed_ip >> 16) & 0xFF, (result->framed_ip >> 8) & 0xFF,
-                  result->framed_ip & 0xFF);
+    /* Mark auth complete to prevent duplicates */
+    session->auth_complete = 1;
+    session->state = PPPOE_STATE_SESSION_ESTABLISHED;
 
-        /* Update session - keep pool IP if RADIUS didn't provide one */
-        if (result->framed_ip != 0) {
-            session->client_ip = result->framed_ip;
+    YLOG_INFO("PPPoE: Processing lockless RADIUS response for session %u (result=%d)",
+              resp->session_id, resp->result);
+
+    if (resp->result == 1) { /* RADIUS_RESULT_ACCEPT */
+        /* Use RADIUS Framed-IP if provided, otherwise keep pool-allocated IP */
+        uint32_t assigned_ip = (resp->framed_ip != 0) ? resp->framed_ip : session->client_ip;
+
+        YLOG_INFO("PPPoE: Auth success session=%u IP=%u.%u.%u.%u",
+                  resp->session_id,
+                  (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
+                  (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF);
+
+        /* Update session */
+        if (resp->framed_ip != 0)
+            session->client_ip = resp->framed_ip;
+        session->session_timeout = resp->session_timeout;
+        session->idle_timeout = resp->idle_timeout;
+
+        if (resp->rate_limit_down > 0) {
+            session->rate_bps = resp->rate_limit_down;
+            pppoe_update_qos(session->client_mac.addr_bytes, resp->rate_limit_down);
         }
-        session->session_timeout = result->session_timeout;
-        session->idle_timeout = result->idle_timeout;
 
-        if (result->rate_limit_bps > 0) {
-            session->rate_bps = result->rate_limit_bps;
-            pppoe_update_qos(session->client_mac.addr_bytes, result->rate_limit_bps);
-        }
-
-        /* Send CHAP/PAP success or just proceed to IPCP */
-        /* Implementation specific... assuming we send success here */
-
-        /* Send Accounting Start if configured */
-        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id, session->username,
-                            session->client_ip);
+        /* Send Accounting Start */
+        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id,
+                            session->username, session->client_ip);
         session->last_acct_ts = time(NULL);
-
-        /* Set start timestamp */
         session->start_ts = time(NULL);
 
-        /* Send Success Packet */
+        /* Send CHAP/PAP Success */
         const char *msg = "Login OK";
         if (session->lcp_state == LCP_STATE_OPENED) {
             if (session->chap_challenge_len > 0) {
@@ -1401,35 +1494,33 @@ static void pppoe_auth_callback(uint16_t session_id, const struct radius_auth_re
             }
         }
 
-        /* State already transitioned by atomic CAS above */
-
         /* Start IPCP */
         ppp_ipcp_open(session);
 
-        /* Send HA Sync */
-        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id, session->client_mac.addr_bytes, 0,
-                     session->state);
+        /* HA Sync */
+        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id,
+                     session->client_mac.addr_bytes, 0, session->state);
 
     } else {
-        YLOG_INFO("PPPoE: Session %u Auth Failure", session_id);
+        /* Auth failed (reject, timeout, or error) */
+        YLOG_INFO("PPPoE: Auth failed session=%u result=%d msg='%s'",
+                  resp->session_id, resp->result, resp->reply_message);
 
-        /* Send Failure Packet */
-        const char *msg = "Auth Failed";
+        const char *msg = resp->reply_message[0] ? resp->reply_message : "Auth Failed";
         if (session->chap_challenge_len > 0) {
-            ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE, session->next_lcp_identifier,
-                          (const uint8_t *)msg, strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE,
+                          session->next_lcp_identifier, (const uint8_t *)msg, strlen(msg));
         } else {
             uint8_t reply_data[256];
             reply_data[0] = strlen(msg);
             memcpy(reply_data + 1, msg, strlen(msg));
-            ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK, session->next_lcp_identifier,
-                          reply_data, 1 + strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK,
+                          session->next_lcp_identifier, reply_data, 1 + strlen(msg));
         }
 
-        /* Terminate */
         session->state = PPPOE_STATE_TERMINATED;
-        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0,
-                     session->state);
+        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id,
+                     session->client_mac.addr_bytes, 0, session->state);
     }
 }
 

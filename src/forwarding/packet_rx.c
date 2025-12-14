@@ -20,7 +20,7 @@
 #include "nat.h"
 #include "packet.h"
 #include "pppoe.h"
-#include "radius.h"
+#include "radius_lockless.h"
 #include "reassembly.h"
 #include "routing_table.h"
 #include <stdio.h>
@@ -820,6 +820,29 @@ static void process_ipv4(struct pkt_buf *pkt)
     }
 #endif
 
+    /* Intercept RADIUS responses (UDP from port 1812/1813) BEFORE for_us check */
+    /* RADIUS responses go to NAS IP which may not be on any interface */
+    if (pkt->meta.protocol == IPPROTO_UDP) {
+        struct rte_ether_hdr *eth_r = (struct rte_ether_hdr *)pkt->data;
+        struct rte_ipv4_hdr *ip_r = (struct rte_ipv4_hdr *)(eth_r + 1);
+        struct rte_udp_hdr *udp_r = (struct rte_udp_hdr *)((uint8_t *)ip_r + (ip_r->version_ihl & 0x0F) * 4);
+        uint16_t src_port = rte_be_to_cpu_16(udp_r->src_port);
+
+        if (src_port == 1812 || src_port == 1813) {
+            /* RADIUS response - pass to lockless RADIUS handler */
+            uint8_t *radius_data = (uint8_t *)(udp_r + 1);
+            uint16_t radius_len = rte_be_to_cpu_16(udp_r->dgram_len) - sizeof(struct rte_udp_hdr);
+
+            extern void radius_lockless_process_dpdk_response(uint8_t *data, uint16_t len);
+            YLOG_INFO("RADIUS response intercepted from %u.%u.%u.%u:%d len=%d",
+                      (pkt->meta.src_ip >> 24) & 0xFF, (pkt->meta.src_ip >> 16) & 0xFF,
+                      (pkt->meta.src_ip >> 8) & 0xFF, pkt->meta.src_ip & 0xFF,
+                      src_port, radius_len);
+            radius_lockless_process_dpdk_response(radius_data, radius_len);
+            return;
+        }
+    }
+
     /* Check if destined for us (check all interfaces) */
     bool for_us = false;
 
@@ -934,6 +957,23 @@ static void process_ipv4(struct pkt_buf *pkt)
         if (pkt->meta.protocol == IPPROTO_ICMP) {
             /* Removed verbose logging for performance - caused 35% ICMP drop */
             process_icmp_echo(pkt, iface);
+        } else if (pkt->meta.protocol == IPPROTO_UDP) {
+            /* Check for RADIUS response (from port 1812) */
+            struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
+            struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
+            struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((uint8_t *)ip + (ip->version_ihl & 0x0F) * 4);
+            uint16_t src_port = rte_be_to_cpu_16(udp->src_port);
+
+            if (src_port == 1812 || src_port == 1813) {
+                /* RADIUS response - pass to lockless RADIUS handler */
+                uint8_t *radius_data = (uint8_t *)(udp + 1);
+                uint16_t radius_len = rte_be_to_cpu_16(udp->dgram_len) - sizeof(struct rte_udp_hdr);
+
+                extern void radius_lockless_process_dpdk_response(uint8_t *data, uint16_t len);
+                radius_lockless_process_dpdk_response(radius_data, radius_len);
+                YLOG_INFO("RADIUS response intercepted from port %d, len=%d", src_port, radius_len);
+                return;
+            }
         }
     } else {
         /* Packet is not for us - forward it */
@@ -983,6 +1023,28 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
         struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
         pppoe_process_session(pkt, iface);
         return;
+    }
+
+    /* Early intercept for RADIUS responses before other processing */
+    if (pkt->meta.l3_type == PKT_L3_IPV4 && pkt->meta.protocol == IPPROTO_UDP) {
+        struct rte_ether_hdr *eth_chk = (struct rte_ether_hdr *)pkt->data;
+        struct rte_ipv4_hdr *ip_chk = (struct rte_ipv4_hdr *)(eth_chk + 1);
+        struct rte_udp_hdr *udp_chk = (struct rte_udp_hdr *)((uint8_t *)ip_chk + (ip_chk->version_ihl & 0x0F) * 4);
+        uint16_t src_port = rte_be_to_cpu_16(udp_chk->src_port);
+
+        if (src_port == 1812 || src_port == 1813) {
+            uint8_t *radius_data = (uint8_t *)(udp_chk + 1);
+            uint16_t radius_len = rte_be_to_cpu_16(udp_chk->dgram_len) - sizeof(struct rte_udp_hdr);
+
+            extern void radius_lockless_process_dpdk_response(uint8_t *data, uint16_t len);
+            YLOG_INFO("RADIUS RX: src=%u.%u.%u.%u:%d dst=%u.%u.%u.%u len=%d",
+                      (pkt->meta.src_ip >> 24) & 0xFF, (pkt->meta.src_ip >> 16) & 0xFF,
+                      (pkt->meta.src_ip >> 8) & 0xFF, pkt->meta.src_ip & 0xFF, src_port,
+                      (pkt->meta.dst_ip >> 24) & 0xFF, (pkt->meta.dst_ip >> 16) & 0xFF,
+                      (pkt->meta.dst_ip >> 8) & 0xFF, pkt->meta.dst_ip & 0xFF, radius_len);
+            radius_lockless_process_dpdk_response(radius_data, radius_len);
+            return;
+        }
     }
 
     /* Dispatch based on L3 type */
@@ -1042,10 +1104,7 @@ static void *rx_thread_func(void *arg)
 
     free(args);
 
-    /* Initialize RADIUS context for this worker */
-    if (radius_init_worker(worker_id) != 0) {
-        YLOG_WARNING("Failed to initialize RADIUS for worker %d", worker_id);
-    }
+    /* Lockless RADIUS - no per-worker init needed */
 
 #ifdef HAVE_DPDK
     /* Initialize per-worker NAT port pool for LOCKLESS allocation */
@@ -1110,6 +1169,22 @@ static void *rx_thread_func(void *arg)
             }
 
             poll_count++;
+
+            /* Poll lockless RADIUS responses - distribute across workers using modulo */
+            /* Each worker polls at offset intervals to spread the load */
+            if ((poll_count & 0x3F) == (uint64_t)worker_id) { /* Each worker polls every 64 iterations, staggered */
+                extern unsigned int radius_lockless_poll_responses(
+                    struct radius_auth_response **responses, unsigned int max);
+                extern void radius_lockless_free_response(struct radius_auth_response *resp);
+                extern void pppoe_handle_radius_response(struct radius_auth_response *resp);
+
+                struct radius_auth_response *resps[8];
+                unsigned int n = radius_lockless_poll_responses(resps, 8);
+                for (unsigned int r = 0; r < n; r++) {
+                    pppoe_handle_radius_response(resps[r]);
+                    radius_lockless_free_response(resps[r]);
+                }
+            }
 
             /* Poll ALL available DPDK ports (dynamic from env) */
             uint16_t nb_rx = 0;
@@ -1434,6 +1509,22 @@ static void *rx_thread_func(void *arg)
         g_thread_queue_id = queue_id;
         g_thread_worker_id = worker_id;
 
+        /* Poll lockless RADIUS responses ONCE per loop iteration (worker 0 only) */
+        if (worker_id == 0) {
+            extern unsigned int radius_lockless_poll_responses(
+                struct radius_auth_response **responses, unsigned int max);
+            extern void radius_lockless_free_response(struct radius_auth_response *resp);
+            extern void pppoe_handle_radius_response(struct radius_auth_response *resp);
+
+            struct radius_auth_response *resps[32];
+            unsigned int n = radius_lockless_poll_responses(resps, 32);
+            for (unsigned int r = 0; r < n; r++) {
+                YLOG_INFO("RADIUS: Dispatching response to pppoe_handle session=%u", resps[r]->session_id);
+                pppoe_handle_radius_response(resps[r]);
+                radius_lockless_free_response(resps[r]);
+            }
+        }
+
         /* Poll interfaces 1..32 (max) */
         static int iface_debug_done = 0;
         for (int i = 1; i <= 32; i++) {
@@ -1448,11 +1539,6 @@ static void *rx_thread_func(void *arg)
             }
 
             struct pkt_buf *pkt = NULL;
-            /* This will eventually call physical_recv which reads g_thread_queue_id */
-
-            /* Poll RADIUS responses (Async non-blocking) */
-            /* Every loop iteration (approx 1 burst from each interface) */
-            radius_poll();
 
             /* Process burst of packets from this interface */
             int quota = 64; /* Increased burst for better throughput */

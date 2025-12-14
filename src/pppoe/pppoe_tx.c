@@ -200,6 +200,119 @@ int pppoe_tx_send_discovery(uint16_t port_id, uint16_t queue_id,
 }
 
 /**
+ * Send PPPoE session packet (LCP/CHAP/IPCP/DATA) with VLAN support
+ *
+ * Same as pppoe_tx_send_discovery but uses ETH_P_PPPOE_SESS (0x8864)
+ *
+ * @param port_id DPDK port ID
+ * @param queue_id TX queue ID
+ * @param dst_mac Destination MAC address
+ * @param src_mac Source MAC address
+ * @param vlan_id VLAN ID (0 = untagged)
+ * @param pppoe_payload PPPoE header + PPP protocol + payload (already formatted)
+ * @param payload_len Length of PPPoE header + payload
+ * @return 0 on success, -1 on error
+ */
+int pppoe_tx_send_session(uint16_t port_id, uint16_t queue_id, const struct rte_ether_addr *dst_mac,
+                          const uint8_t *src_mac, uint16_t vlan_id, const uint8_t *pppoe_payload,
+                          uint16_t payload_len)
+{
+    /* Get mempool for mbuf allocation */
+    struct rte_mempool *mp = dpdk_get_mempool();
+    if (!mp) {
+        YLOG_ERROR("[PPPoE-TX] Failed to get DPDK mempool for session");
+        return -1;
+    }
+
+    /* Allocate mbuf */
+    struct rte_mbuf *m = rte_pktmbuf_alloc(mp);
+    if (!m) {
+        YLOG_ERROR("[PPPoE-TX] Failed to allocate mbuf for session");
+        return -1;
+    }
+
+    /* Build packet based on NIC capabilities */
+    uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt;
+    uint16_t frame_len;
+
+    /* Ethernet header */
+    rte_ether_addr_copy(dst_mac, &eth->dst_addr);
+    memcpy(&eth->src_addr, src_mac, 6);
+
+    if (vlan_id > 0 && port_id < RTE_MAX_ETHPORTS && g_port_vlan_insert[port_id]) {
+        /* HARDWARE VLAN OFFLOAD PATH (Intel, Mellanox, etc.) */
+        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
+
+        /* Copy PPPoE payload right after Ethernet header */
+        memcpy(pkt + sizeof(struct rte_ether_hdr), pppoe_payload, payload_len);
+
+        /* Set hardware offload flags */
+        m->vlan_tci = vlan_id;
+        m->ol_flags |= RTE_MBUF_F_TX_VLAN;
+
+        frame_len = sizeof(struct rte_ether_hdr) + payload_len;
+
+        YLOG_DEBUG("[PPPoE-TX-SESS] HW offload: port=%u vlan=%u len=%u", port_id, vlan_id,
+                   frame_len);
+
+    } else if (vlan_id > 0) {
+        /* SOFTWARE VLAN TAGGING (Virtio, tap, etc.) */
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
+
+        /* Insert VLAN tag manually */
+        struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
+        vlan->vlan_tci = rte_cpu_to_be_16(vlan_id);
+        vlan->eth_proto = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
+
+        /* Copy PPPoE payload after VLAN header */
+        memcpy(pkt + sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr), pppoe_payload,
+               payload_len);
+
+        /* NO hardware offload flags */
+        m->ol_flags &= ~RTE_MBUF_F_TX_VLAN;
+
+        frame_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_vlan_hdr) + payload_len;
+
+        YLOG_DEBUG("[PPPoE-TX-SESS] SW tagging: port=%u vlan=%u len=%u", port_id, vlan_id,
+                   frame_len);
+
+    } else {
+        /* UNTAGGED */
+        eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
+        memcpy(pkt + sizeof(struct rte_ether_hdr), pppoe_payload, payload_len);
+        frame_len = sizeof(struct rte_ether_hdr) + payload_len;
+
+        YLOG_DEBUG("[PPPoE-TX-SESS] Untagged: port=%u len=%u", port_id, frame_len);
+    }
+
+    /* Enforce minimum Ethernet frame size (60 bytes without FCS) */
+    if (frame_len < 60) {
+        memset(pkt + frame_len, 0, 60 - frame_len);
+        frame_len = 60;
+    }
+
+    /* Set mbuf lengths */
+    m->data_len = frame_len;
+    m->pkt_len = frame_len;
+    m->port = port_id;
+
+    /* Send packet using DPDK TX burst */
+    uint16_t sent = rte_eth_tx_burst(port_id, queue_id, &m, 1);
+
+    if (sent == 0) {
+        YLOG_WARNING("[PPPoE-TX-SESS] Failed to send on port %u (TX queue full?)", port_id);
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+
+    /* TX descriptor cleanup */
+    rte_eth_tx_done_cleanup(port_id, queue_id, 0);
+
+    return 0;
+}
+
+/**
  * Check if port supports hardware VLAN insertion
  * @param port_id DPDK port ID
  * @return true if HW VLAN insert is supported, false otherwise

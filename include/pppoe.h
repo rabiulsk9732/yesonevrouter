@@ -112,6 +112,7 @@ struct pppoe_session {
     uint32_t server_ip;
     uint8_t next_lcp_identifier;
     uint8_t echo_failures;
+    uint8_t auth_complete;     /* 1 if RADIUS auth completed */
 
     uint32_t magic_number;
     uint32_t peer_magic_number;

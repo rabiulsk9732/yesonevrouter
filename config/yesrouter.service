@@ -16,7 +16,7 @@ ExecStartPre=/bin/mkdir -p /run/yesrouter /var/log/yesrouter
 ExecStartPre=-/sbin/modprobe uio_pci_generic
 
 # Main executable - DPDK vBNG daemon
-ExecStart=/root/yesonevrouter/build/yesrouter --daemon
+ExecStart=/root/yesonevrouter/build/yesrouterd --daemon
 ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 

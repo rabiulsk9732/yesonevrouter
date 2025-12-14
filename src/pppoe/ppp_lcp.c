@@ -16,40 +16,21 @@
 #include "ppp_lcp.h"
 #include "pppoe.h"
 #include "pppoe_defs.h"
+#include "pppoe_tx.h"
 #include <time.h>
 
-/* Helper to send LCP packet */
+/* Helper to send LCP packet - Uses pppoe_tx_send_session for proper VLAN handling */
 static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t identifier,
                         const uint8_t *data, uint16_t len)
 {
-    struct pkt_buf *pkt = pkt_alloc();
-    if (!pkt)
-        return -1;
+    /* Build PPPoE + PPP + LCP payload */
+    uint8_t pppoe_buf[1500];
+    struct pppoe_hdr *pppoe = (struct pppoe_hdr *)pppoe_buf;
+    uint16_t *proto = (uint16_t *)(pppoe + 1);
+    struct lcp_hdr *lcp = (struct lcp_hdr *)(proto + 1);
 
-    YLOG_INFO("LCP SEND: session=%u vlan_id=%u iface=%s", session->session_id, session->vlan_id,
-              session->iface->name);
-
-    struct rte_mbuf *m = pkt->mbuf;
-    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    struct pppoe_hdr *pppoe;
-    uint16_t *proto;
-    struct lcp_hdr *lcp;
-    uint8_t *payload;
-    uint16_t hdr_len;
-
-    /* Ethernet Header */
-    rte_ether_addr_copy(&session->client_mac, &eth->dst_addr);
-    rte_ether_addr_copy((const struct rte_ether_addr *)session->iface->mac_addr, &eth->src_addr);
-
-    /* PPPoE Session ethertype - VLAN tagging handled by VLAN interface if session->iface is a VLAN
-     * sub-interface */
-    eth->ether_type = rte_cpu_to_be_16(ETH_P_PPPOE_SESS);
-    pppoe = (struct pppoe_hdr *)(eth + 1);
-    hdr_len = sizeof(struct rte_ether_hdr);
-
-    proto = (uint16_t *)(pppoe + 1);
-    lcp = (struct lcp_hdr *)(proto + 1);
-    payload = lcp->data;
+    YLOG_INFO("LCP SEND: session=%u vlan_id=%u iface=%s code=%u", session->session_id,
+              session->vlan_id, session->iface->name, code);
 
     /* PPPoE Header */
     pppoe->ver = 1;
@@ -67,23 +48,27 @@ static int ppp_lcp_send(struct pppoe_session *session, uint8_t code, uint8_t ide
 
     /* LCP Data */
     if (data && len > 0) {
-        memcpy(payload, data, len);
+        memcpy(lcp->data, data, len);
     }
 
-    /* Lengths */
+    /* Set PPPoE length */
     uint16_t ppp_len = sizeof(uint16_t) + sizeof(struct lcp_hdr) + len;
     pppoe->length = rte_cpu_to_be_16(ppp_len);
 
-    m->data_len = hdr_len + sizeof(struct pppoe_hdr) + ppp_len;
-    m->pkt_len = m->data_len;
-    pkt->len = m->data_len;
+    uint16_t payload_len = sizeof(struct pppoe_hdr) + ppp_len;
 
-    /* Send via HQoS (hqos_run called immediately after enqueue) */
-    int ret = interface_send(session->iface, pkt);
-    if (ret != 0) {
-        pkt_free(pkt);
+    /* Get port_id: For VLAN iface, get parent's DPDK port via parent_ifindex */
+    /* For physical iface, port_id is in flags (lower 31 bits) */
+    struct interface *phys_iface = session->iface;
+    if (session->iface->type == IF_TYPE_VLAN && session->iface->config.parent_ifindex > 0) {
+        phys_iface = interface_find_by_index(session->iface->config.parent_ifindex);
     }
-    return ret;
+    uint16_t port_id = (uint16_t)(phys_iface->flags & 0x7FFFFFFF);
+    uint16_t queue_id = 0; /* Use queue 0 for control packets */
+
+    /* Use pppoe_tx_send_session for proper VLAN handling */
+    return pppoe_tx_send_session(port_id, queue_id, &session->client_mac, session->iface->mac_addr,
+                                 session->vlan_id, pppoe_buf, payload_len);
 }
 
 /* Send Configure-Request */
@@ -133,16 +118,11 @@ static void ppp_lcp_send_conf_ack(struct pppoe_session *session, uint8_t identif
 {
     ppp_lcp_send(session, LCP_CODE_CONF_ACK, identifier, options, len);
 
-    /* RFC 1661 State Machine: Update state after sending Conf-Ack */
-    if (session->lcp_state == LCP_STATE_ACK_RCVD) {
-        /* We already received their Ack, now we sent ours -> OPENED */
-        session->lcp_state = LCP_STATE_OPENED;
-        YLOG_INFO("LCP Session %u Opened", session->session_id);
-        ppp_auth_start(session); /* Start authentication ONCE here */
-    } else {
-        /* We sent Ack but haven't received theirs yet */
-        session->lcp_state = LCP_STATE_ACK_SENT;
-    }
+    /* RFC 1661 State Machine: Update state after sending Conf-Ack
+     * Authentication is started ONLY in the CONF_ACK handler (line 289)
+     * to ensure it's called exactly once when transitioning to OPENED state
+     */
+    session->lcp_state = LCP_STATE_ACK_SENT;
 }
 
 /* Send Configure-Reject */
@@ -283,18 +263,11 @@ int ppp_lcp_process_packet(struct pppoe_session *session, const uint8_t *packet,
             /* All options acceptable */
             YLOG_INFO("LCP: Sending Config-Ack (len=%u)", ack_len);
 
-            /* CRITICAL: Save state BEFORE ppp_lcp_send_conf_ack changes it */
-            int saved_state = session->lcp_state;
-
+            /* RFC 1661 State Machine: Send ConfAck and transition to ACK_SENT
+             * Server waits for client's ConfAck before initiating its own ConfReq
+             * This ensures proper state synchronization per RFC 1661 Section 3.2
+             */
             ppp_lcp_send_conf_ack(session, lcp->identifier, ack_options, ack_len);
-
-            /* RFC 1661 State Machine: Send our own ConfReq if we haven't completed negotiation */
-            /* Use saved_state since ppp_lcp_send_conf_ack changes session->lcp_state */
-            if (saved_state == LCP_STATE_INITIAL || saved_state == LCP_STATE_STARTING ||
-                saved_state == LCP_STATE_REQ_SENT) {
-                /* We need to send our own Conf-Req too (or resend if lost) */
-                ppp_lcp_send_conf_req(session);
-            }
         }
         break;
     }

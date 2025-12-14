@@ -411,13 +411,50 @@ int startup_json_load(const char *path) {
         }
     }
 
-    /* ========== RADIUS Section ========== */
+    /* ========== RADIUS Section (Lockless DPDK-native) ========== */
     char *radius_section = strstr(json, "\"radius\"");
     if (radius_section) {
-        extern int radius_client_add_server(uint32_t ip, uint16_t auth_port, uint16_t acct_port,
-                                            const char *secret, int priority);
-        extern void radius_client_set_timeout(uint32_t timeout_sec);
-        extern void radius_client_set_retries(uint8_t retries);
+        extern int radius_lockless_add_server(uint32_t ip, uint16_t auth_port,
+                                              uint16_t acct_port, const char *secret,
+                                              int priority);
+        extern void radius_lockless_set_timeout(uint32_t timeout_ms, uint8_t retries);
+
+        uint32_t timeout_ms = 3000;
+        uint8_t retries = 3;
+
+        /* Parse timeout first */
+        char timeout_str[8] = {0};
+        json_get_string(radius_section, "timeout", timeout_str, sizeof(timeout_str));
+        if (timeout_str[0]) {
+            timeout_ms = atoi(timeout_str) * 1000;
+            YLOG_INFO("[STARTUP] RADIUS timeout: %s sec", timeout_str);
+        }
+
+        /* Parse retries */
+        char retries_str[8] = {0};
+        json_get_string(radius_section, "retries", retries_str, sizeof(retries_str));
+        if (retries_str[0]) {
+            retries = atoi(retries_str);
+            YLOG_INFO("[STARTUP] RADIUS retries: %s", retries_str);
+        }
+
+        /* Configure lockless RADIUS timeout */
+        radius_lockless_set_timeout(timeout_ms, retries);
+
+        /* Parse source_ip for socket binding (to avoid kernel default IP) */
+        char source_ip_str[32] = {0};
+        json_get_string(radius_section, "source_ip", source_ip_str, sizeof(source_ip_str));
+        if (source_ip_str[0]) {
+            struct in_addr src_addr;
+            if (inet_pton(AF_INET, source_ip_str, &src_addr) == 1) {
+                extern void radius_lockless_set_nas(uint32_t nas_ip, const char *nas_identifier);
+                extern int radius_lockless_bind_source(void);
+                radius_lockless_set_nas(ntohl(src_addr.s_addr), "yesrouter");
+                if (radius_lockless_bind_source() == 0) {
+                    YLOG_INFO("[STARTUP] RADIUS source IP: %s", source_ip_str);
+                }
+            }
+        }
 
         /* Parse servers array */
         char *server_pos = strstr(radius_section, "\"servers\"");
@@ -443,30 +480,12 @@ int startup_json_load(const char *path) {
                         uint16_t acct_port = acct_port_str[0] ? atoi(acct_port_str) : 1813;
                         int priority = priority_str[0] ? atoi(priority_str) : 1;
 
-                        int ret = radius_client_add_server(ntohl(addr.s_addr), auth_port, acct_port, secret, priority);
-                        if (ret >= 0) {
-                            YLOG_INFO("[STARTUP] RADIUS server added: %s:%d/%d", host, auth_port, acct_port);
-                        }
+                        radius_lockless_add_server(ntohl(addr.s_addr), auth_port, acct_port, secret, priority);
+                        YLOG_INFO("[STARTUP] RADIUS server added: %s:%d/%d (lockless)", host, auth_port, acct_port);
                     }
                 }
                 srv++;
             }
-        }
-
-        /* Parse timeout */
-        char timeout_str[8] = {0};
-        json_get_string(radius_section, "timeout", timeout_str, sizeof(timeout_str));
-        if (timeout_str[0]) {
-            radius_client_set_timeout(atoi(timeout_str));
-            YLOG_INFO("[STARTUP] RADIUS timeout: %s sec", timeout_str);
-        }
-
-        /* Parse retries */
-        char retries_str[8] = {0};
-        json_get_string(radius_section, "retries", retries_str, sizeof(retries_str));
-        if (retries_str[0]) {
-            radius_client_set_retries(atoi(retries_str));
-            YLOG_INFO("[STARTUP] RADIUS retries: %s", retries_str);
         }
     }
 

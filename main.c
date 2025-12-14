@@ -14,8 +14,10 @@
 #include "cpu_scheduler.h"
 #include "dns.h"
 #include "dpdk_init.h"
+#include "env_config.h"
 #include "forwarding.h"
 #include "ha.h"
+#include "hqos.h"
 #include "interface.h"
 #include "ippool.h"
 #include "ipv6/ipv6.h"
@@ -23,14 +25,11 @@
 #include "nat.h"
 #include "packet.h"
 #include "pppoe.h"
-#include "pppoe.h"
 #include "qos.h"
-#include "hqos.h"
 #include "radius.h"
 #include "routing_table.h"
-#include "env_config.h"
-#include <ipoe.h>
 #include <getopt.h>
+#include <ipoe.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -87,8 +86,8 @@ static void print_usage(const char *prog)
     printf("  --interactive,-i Run in interactive mode (legacy)\n");
     printf("  -h, --help       Show this help\n");
     printf("\nDaemon Mode:\n");
-    printf("  In daemon mode, use 'yesrouterctl' to connect to CLI\n");
-    printf("  Example: sudo yesrouterctl show interfaces\n");
+    printf("  In daemon mode, use 'yesrouter' to connect to CLI\n");
+    printf("  Example: sudo yesrouter show interfaces\n");
     printf("\nCommands:\n");
     printf("  (none)     Start router (daemon or interactive)\n");
     printf("  <cmd>      Execute single command and exit\n");
@@ -156,11 +155,11 @@ int main(int argc, char *argv[])
         /* Core mask/list from .env */
         dpdk_argv[dpdk_argc++] = "-l";
         char lcore_list[512];
-        int pos = snprintf(lcore_list, sizeof(lcore_list), "%d",
-                          g_env_config.dpdk.main_lcore);
-        for (int i = 0; i < g_env_config.dpdk.num_workers && pos < (int)sizeof(lcore_list) - 10; i++) {
+        int pos = snprintf(lcore_list, sizeof(lcore_list), "%d", g_env_config.dpdk.main_lcore);
+        for (int i = 0; i < g_env_config.dpdk.num_workers && pos < (int)sizeof(lcore_list) - 10;
+             i++) {
             pos += snprintf(lcore_list + pos, sizeof(lcore_list) - pos, ",%d",
-                           g_env_config.dpdk.worker_lcores[i]);
+                            g_env_config.dpdk.worker_lcores[i]);
         }
         dpdk_argv[dpdk_argc++] = strdup(lcore_list);
         printf("[ENV] DPDK lcores: %s\n", lcore_list);
@@ -469,7 +468,7 @@ int main(int argc, char *argv[])
         }
 
         YLOG_INFO("Daemon started - CLI socket: %s", socket_path);
-        printf("Router running. Use 'yesrouterctl' to connect.\n");
+        printf("Router running. Use 'yesrouter' to connect.\n");
 
         /* Keep running */
         while (g_running) {
@@ -515,7 +514,7 @@ cleanup:
     /* Cleanup subsystems - order matters (reverse of init) */
     radius_client_acct_off(); /* Send Accounting-Off (P2 #10) */
     nat_cleanup();
-    ipoe_cleanup();  /* IPoE cleanup before PPPoE */
+    ipoe_cleanup(); /* IPoE cleanup before PPPoE */
     pppoe_cleanup();
     routing_table_cleanup(routing_table_get_instance());
     dns_cleanup();

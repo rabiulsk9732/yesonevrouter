@@ -14,8 +14,10 @@
 #include "cpu_scheduler.h"
 #include "dns.h"
 #include "dpdk_init.h"
+#include "env_config.h"
 #include "forwarding.h"
 #include "ha.h"
+#include "hqos.h"
 #include "interface.h"
 #include "ippool.h"
 #include "ipv6/ipv6.h"
@@ -23,15 +25,13 @@
 #include "nat.h"
 #include "packet.h"
 #include "pppoe.h"
-#include "pppoe.h"
 #include "qos.h"
-#include "hqos.h"
-#include "radius.h"
+#include "radius_lockless.h"
 #include "routing_table.h"
-#include "env_config.h"
 #include "service_profile.h"
-#include <ipoe.h>
 #include <getopt.h>
+#include <ipoe.h>
+#include <libgen.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -52,7 +52,7 @@ static void *management_thread(void *arg)
     while (g_running) {
         ha_poll();
         ha_check_failover();
-        radius_poll();
+        /* Lockless RADIUS - polling done in packet_rx loop */
         pppoe_check_keepalives();
         pppoe_check_accounting();
         sleep(1); /* 1 second tick */
@@ -88,8 +88,8 @@ static void print_usage(const char *prog)
     printf("  --interactive,-i Run in interactive mode (legacy)\n");
     printf("  -h, --help       Show this help\n");
     printf("\nDaemon Mode:\n");
-    printf("  In daemon mode, use 'yesrouterctl' to connect to CLI\n");
-    printf("  Example: sudo yesrouterctl show interfaces\n");
+    printf("  In daemon mode, use 'yesrouter' to connect to CLI\n");
+    printf("  Example: sudo yesrouter show interfaces\n");
     printf("\nCommands:\n");
     printf("  (none)     Start router (daemon or interactive)\n");
     printf("  <cmd>      Execute single command and exit\n");
@@ -100,12 +100,32 @@ int main(int argc, char *argv[])
 
     const char *config_file = NULL;
     bool daemon_mode = false;
-    bool interactive_mode = false;
+    bool client_mode = false; /* Connect to running daemon as CLI client */
     char *dpdk_argv[32];
     int dpdk_argc = 0;
 
     /* Initialize logging with defaults (stdout/stderr) */
     log_init(NULL);
+
+    /* Check for --daemon flag FIRST before anything else */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--daemon") == 0 || strcmp(argv[i], "-d") == 0) {
+            daemon_mode = true;
+            break;
+        }
+    }
+
+    /* If not daemon mode, check if daemon is already running - act as CLI client */
+    if (!daemon_mode) {
+        const char *socket_path = "/run/yesrouter/cli.sock";
+        if (access(socket_path, F_OK) == 0) {
+            /* Socket exists - daemon is running, exec CLI client immediately */
+            execl("/root/yesonevrouter/build/yesrouter", "yesrouter", (char *)NULL);
+            /* If execl returns, it failed */
+            perror("execl yesrouter");
+            return EXIT_FAILURE;
+        }
+    }
 
     /* Load Bison-style .env configuration (DPDK/hardware params) */
     if (env_config_load("/etc/yesrouter/yesrouter.env") != 0) {
@@ -122,14 +142,6 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--daemon") == 0 || strcmp(argv[i], "-d") == 0) {
             daemon_mode = true;
-            /* Remove it from argv so DPDK doesn't see it */
-            for (int j = i; j < argc - 1; j++) {
-                argv[j] = argv[j + 1];
-            }
-            argc--;
-            i--;
-        } else if (strcmp(argv[i], "--interactive") == 0 || strcmp(argv[i], "-i") == 0) {
-            interactive_mode = true;
             /* Remove it from argv so DPDK doesn't see it */
             for (int j = i; j < argc - 1; j++) {
                 argv[j] = argv[j + 1];
@@ -157,11 +169,11 @@ int main(int argc, char *argv[])
         /* Core mask/list from .env */
         dpdk_argv[dpdk_argc++] = "-l";
         char lcore_list[512];
-        int pos = snprintf(lcore_list, sizeof(lcore_list), "%d",
-                          g_env_config.dpdk.main_lcore);
-        for (int i = 0; i < g_env_config.dpdk.num_workers && pos < (int)sizeof(lcore_list) - 10; i++) {
+        int pos = snprintf(lcore_list, sizeof(lcore_list), "%d", g_env_config.dpdk.main_lcore);
+        for (int i = 0; i < g_env_config.dpdk.num_workers && pos < (int)sizeof(lcore_list) - 10;
+             i++) {
             pos += snprintf(lcore_list + pos, sizeof(lcore_list) - pos, ",%d",
-                           g_env_config.dpdk.worker_lcores[i]);
+                            g_env_config.dpdk.worker_lcores[i]);
         }
         dpdk_argv[dpdk_argc++] = strdup(lcore_list);
         printf("[ENV] DPDK lcores: %s\n", lcore_list);
@@ -277,6 +289,13 @@ int main(int argc, char *argv[])
     /* Discover DPDK ports only - this is a DPDK-based application */
     interface_discover_dpdk_ports();
 
+    /* Initialize IP Reassembly subsystem for fragment processing */
+    extern int ip_reassembly_init(void);
+    if (ip_reassembly_init() != 0) {
+        YLOG_ERROR("Failed to initialize IP reassembly subsystem");
+        goto cleanup;
+    }
+
     /* Initialize TX batching for DPDK ports */
 #ifdef HAVE_DPDK
     extern int tx_batch_init(int num_ports);
@@ -368,8 +387,12 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* Initialize RADIUS - servers configured via startup.json */
-    radius_init();
+    /* Initialize lockless RADIUS client for DPDK */
+    if (radius_lockless_init(rte_socket_id()) != 0) {
+        YLOG_ERROR("Failed to initialize lockless RADIUS client");
+    } else {
+        YLOG_INFO("Lockless RADIUS client initialized");
+    }
 
     /* Initialize QoS */
     qos_init();
@@ -429,8 +452,7 @@ int main(int argc, char *argv[])
     }
     YLOG_INFO("Packet processing started");
 
-    /* Send RADIUS Accounting-On (P2 #10) */
-    radius_client_acct_on();
+    /* Lockless RADIUS - accounting not yet implemented */
 
     /* Check if command-line command was provided */
     if (optind < argc) {
@@ -453,7 +475,7 @@ int main(int argc, char *argv[])
             }
         }
         /* else exit after command */
-    } else if (daemon_mode || !interactive_mode) {
+    } else if (daemon_mode) {
         /* Daemon mode - run in background with Unix socket CLI */
         printf("Starting in daemon mode...\n");
         printf("Connect using: sudo yesrouterctl\n");
@@ -478,7 +500,7 @@ int main(int argc, char *argv[])
         }
 
         YLOG_INFO("Daemon started - CLI socket: %s", socket_path);
-        printf("Router running. Use 'yesrouterctl' to connect.\n");
+        printf("Router running. Use 'yesrouter' to connect.\n");
 
         /* Keep running */
         while (g_running) {
@@ -522,15 +544,18 @@ cleanup:
     }
 
     /* Cleanup subsystems - order matters (reverse of init) */
-    radius_client_acct_off(); /* Send Accounting-Off (P2 #10) */
+    radius_lockless_cleanup();
     nat_cleanup();
-    ipoe_cleanup();  /* IPoE cleanup before PPPoE */
+    ipoe_cleanup(); /* IPoE cleanup before PPPoE */
     pppoe_cleanup();
     routing_table_cleanup(routing_table_get_instance());
     dns_cleanup();
     arp_cleanup();
     ipv6_cleanup();
     interface_cleanup();
+    /* Cleanup IP Reassembly subsystem */
+    extern void ip_reassembly_cleanup(void);
+    ip_reassembly_cleanup();
     config_cleanup();
     cpu_scheduler_cleanup();
     log_cleanup();

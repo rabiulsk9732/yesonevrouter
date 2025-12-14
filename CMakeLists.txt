@@ -112,8 +112,8 @@ set(YESROUTER_SOURCES
 )
 
 # Main executable
-add_executable(yesrouter src/core/main.c)
-target_link_libraries(yesrouter
+add_executable(yesrouterd src/core/main.c)
+target_link_libraries(yesrouterd
     -Wl,--start-group
     yesrouter_interfaces
     yesrouter_network
@@ -162,7 +162,7 @@ add_subdirectory(src/natexport)
 
 # yesrouter CLI client tool (named 'yesrouter' for user, daemon is 'yesrouterd')
 add_executable(yesrouter_client src/cli/yesrouter_cli.c)
-set_target_properties(yesrouter_client PROPERTIES OUTPUT_NAME "yesroutercli")
+set_target_properties(yesrouter_client PROPERTIES OUTPUT_NAME "yesrouter")
 install(TARGETS yesrouter_client DESTINATION bin)
 
 # Testing
@@ -175,7 +175,7 @@ endif()
 # add_subdirectory(tools)  # Removed during cleanup
 
 # Installation
-# install(TARGETS yesrouter DESTINATION bin)
+install(TARGETS yesrouterd DESTINATION bin)
 # install(DIRECTORY ${CMAKE_SOURCE_DIR}/docs/ DESTINATION share/doc/yesrouter)
 
 # Print configuration summary

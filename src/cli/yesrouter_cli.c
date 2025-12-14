@@ -7,17 +7,17 @@
  *   With args: execute command and exit
  */
 
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <errno.h>
-#include <signal.h>
 #include <termios.h>
-#include <sys/select.h>
-#include <fcntl.h>
+#include <unistd.h>
 
 #define SOCKET_PATH "/run/yesrouter/cli.sock"
 #define BUF_SIZE 4096
@@ -50,7 +50,8 @@ static void signal_handler(int sig)
 static int set_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
+    if (flags < 0)
+        return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
@@ -94,19 +95,25 @@ static int run_single_command(int argc, char *argv[])
 
     /* Build command from args */
     for (i = 1; i < argc; i++) {
-        if (i > 1) strcat(cmd, " ");
+        if (i > 1)
+            strcat(cmd, " ");
         strcat(cmd, argv[i]);
     }
     strcat(cmd, "\n");
 
     /* Wait for banner/prompt and discard */
-    tv.tv_sec = 0; tv.tv_usec = 200000;
-    FD_ZERO(&fds); FD_SET(g_sock_fd, &fds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;
+    FD_ZERO(&fds);
+    FD_SET(g_sock_fd, &fds);
     while (select(g_sock_fd + 1, &fds, NULL, NULL, &tv) > 0) {
         n = recv(g_sock_fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break;
-        FD_ZERO(&fds); FD_SET(g_sock_fd, &fds);
-        tv.tv_sec = 0; tv.tv_usec = 50000;
+        if (n <= 0)
+            break;
+        FD_ZERO(&fds);
+        FD_SET(g_sock_fd, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 50000;
     }
 
     /* Send command */
@@ -121,21 +128,24 @@ static int run_single_command(int argc, char *argv[])
     while (!got_prompt) {
         FD_ZERO(&fds);
         FD_SET(g_sock_fd, &fds);
-        tv.tv_sec = 2; tv.tv_usec = 0;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
 
         if (select(g_sock_fd + 1, &fds, NULL, NULL, &tv) <= 0) {
             break; /* Timeout or error */
         }
 
         n = recv(g_sock_fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         buf[n] = '\0';
 
         /* Print output, filter prompts */
         char *p = buf;
         while (*p) {
             char *nl = strchr(p, '\n');
-            if (nl) *nl = '\0';
+            if (nl)
+                *nl = '\0';
 
             /* Check for prompt */
             if (strstr(p, "Router>") || strstr(p, "Router#")) {
@@ -144,7 +154,8 @@ static int run_single_command(int argc, char *argv[])
                 printf("%s\n", p);
             }
 
-            if (!nl) break;
+            if (!nl)
+                break;
             p = nl + 1;
         }
     }
@@ -205,7 +216,8 @@ static int run_interactive(void)
         int ret = select(maxfd + 1, &fds, NULL, NULL, &tv);
 
         if (ret < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             break;
         }
 

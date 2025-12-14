@@ -14,7 +14,7 @@
 #include <stdbool.h>
 
 /* Use existing RADIUS client */
-#include <radius.h>
+#include <radius_lockless.h>
 
 /*============================================================================
  * MAC-Auth Credential Formats
