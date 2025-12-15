@@ -767,8 +767,6 @@ static void process_ipv4(struct pkt_buf *pkt)
      */
 #ifdef HAVE_DPDK
     if (nat_is_enabled() && (iface->config.nat_inside || iface->config.nat_outside)) {
-        struct rte_mbuf *m = pkt->mbuf;
-        struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
         struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(pkt->data + sizeof(struct rte_ether_hdr));
         uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
         uint32_t dst_ip = rte_be_to_cpu_32(ip->dst_addr);
@@ -904,7 +902,6 @@ static void process_ipv4(struct pkt_buf *pkt)
 
     /* NAT44 HAIRPIN: Private IP -> NAT -> Same port back (for testing) */
     if (nat_is_enabled()) {
-        struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
         struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(pkt->data + sizeof(struct rte_ether_hdr));
         uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
 
@@ -1108,11 +1105,12 @@ static void process_ipv4(struct pkt_buf *pkt)
 void packet_rx_process_packet(struct pkt_buf *pkt)
 {
     /* TRACE LOG - CONFIRM PACKET ARRIVAL */
-    struct rte_ether_hdr *eth_trace = (struct rte_ether_hdr *)pkt->data;
-    uint16_t eth_type_trace = rte_be_to_cpu_16(eth_trace->ether_type);
+    (void)pkt; /* Suppress warning - packet arrived */
     /* PERFORMANCE: Changed from YLOG_INFO to avoid latency */
-    /* YLOG_DEBUG("RX ENTRY: iface=%u len=%u eth_type=0x%04x",
-              pkt->meta.ingress_ifindex, pkt->len, eth_type_trace); */
+    /* struct rte_ether_hdr *eth_trace = (struct rte_ether_hdr *)pkt->data;
+       uint16_t eth_type_trace = rte_be_to_cpu_16(eth_trace->ether_type);
+       YLOG_DEBUG("RX ENTRY: iface=%u len=%u eth_type=0x%04x",
+               pkt->meta.ingress_ifindex, pkt->len, eth_type_trace); */
 
     /* Extract metadata (parse headers) */
     if (pkt_extract_metadata(pkt) != 0) {
@@ -1232,18 +1230,20 @@ static void *rx_thread_func(void *arg)
                                           uint16_t port_max);
     extern struct nat_config g_nat_config;
     uint32_t nat_ip = 0;
-    /* Get IP from first active NAT pool */
+
+    /* Get IP from first active NAT pool - VPP style */
     for (int i = 0; i < g_nat_config.num_pools && nat_ip == 0; i++) {
         if (g_nat_config.pools[i].active) {
             nat_ip = g_nat_config.pools[i].start_ip;
+            break; /* Use first pool */
         }
     }
+
+    /* CRITICAL: NAT pool MUST be configured */
     if (nat_ip == 0) {
-        /* Fallback: get WAN interface IP */
-        struct interface *wan = interface_find_by_name("Gi0/1");
-        if (wan && wan->config.ipv4_addr.s_addr != 0) {
-            nat_ip = ntohl(wan->config.ipv4_addr.s_addr);
-        }
+        YLOG_ERROR("[NAT] Worker %d: No NAT pool configured! Cannot initialize.", worker_id);
+        /* Don't initialize port pool with invalid IP */
+        goto skip_nat_init;
     }
 
     /* VPP-STYLE: Allocate NON-OVERLAPPING port blocks per worker
@@ -1264,6 +1264,8 @@ static void *rx_thread_func(void *arg)
     YLOG_INFO("[NAT] Worker %d: NAT port range %u-%u (IP=%u.%u.%u.%u)", worker_id, port_min,
               port_max, (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF, (nat_ip >> 8) & 0xFF,
               nat_ip & 0xFF);
+
+skip_nat_init:
 #endif
 
     /* Main loop - DPDK DIRECT FAST PATH */
@@ -1489,6 +1491,11 @@ static void *rx_thread_func(void *arg)
                 /* Process local packets through NAT */
                 uint16_t nb_tx = 0;
                 if (local_count > 0) {
+                    static __thread uint64_t trace_ctr = 0;
+                    if ((trace_ctr++ % 100) == 0) {
+                        YLOG_INFO("[RX-TRACE] W%u: %u IPv4 pkts -> nat_process_burst_dpdk",
+                                  worker_id, local_count);
+                    }
                     nb_tx = nat_process_burst_dpdk(local_pkts, local_count, worker_id);
                 }
 

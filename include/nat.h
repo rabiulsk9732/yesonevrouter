@@ -30,10 +30,11 @@
 #define NAT_ICMP_TIMEOUT 60  /* ICMP session timeout (1 minute) */
 
 /* Per-Worker Session Tables */
-#define NAT_MAX_WORKERS 64              /* Supports up to 64 worker cores */
-#define NAT_WORKER_TABLE_SIZE 4194304   /* 4M base (multiplied by 4 = 16M for 10M sessions, 0.625 load factor) */
+#define NAT_MAX_WORKERS 64 /* Supports up to 64 worker cores */
+#define NAT_WORKER_TABLE_SIZE                                                                      \
+    4194304 /* 4M base (multiplied by 4 = 16M for 10M sessions, 0.625 load factor) */
 #define NAT_WORKER_TABLE_MASK (NAT_WORKER_TABLE_SIZE - 1)
-#define NAT_SESSION_CACHE_SIZE 256      /* Per-worker cache for hot sessions */
+#define NAT_SESSION_CACHE_SIZE 256 /* Per-worker cache for hot sessions */
 
 /* Forward declaration */
 /* Forward declaration */
@@ -91,6 +92,11 @@ struct nat_worker_data {
     uint64_t packets_translated;
     uint64_t snat_packets;
     uint64_t dnat_packets;
+
+    /* Cross-Worker Lookup Stats (RSS Asymmetry Handling) */
+    uint64_t cross_worker_lookups; /* DNAT searched other workers' tables */
+    uint64_t cross_worker_hits;    /* Session found on different worker */
+    uint64_t cross_worker_misses;  /* Session not found even after scanning all workers */
 
     /* Per-worker session cache (L1-resident hot path) */
     struct nat_session_cache_entry session_cache[NAT_SESSION_CACHE_SIZE];
@@ -279,6 +285,7 @@ struct nat_stats {
 
     /* ALG statistics */
     uint64_t alg_icmp_packets;
+    uint64_t alg_icmp_errors_processed; /* ICMP error messages with embedded IP processed */
     uint64_t alg_pptp_packets;
 
     /* Debug/Performance counters */
@@ -292,6 +299,9 @@ struct nat_stats {
     uint64_t icmp_echo_replies;          /* ICMP echo replies processed */
     uint64_t icmp_identifier_mismatches; /* ICMP identifier lookup failures */
     uint64_t icmp_session_race_failures; /* Session creation/lookup race failures */
+    uint64_t icmp_sessions_created;      /* ICMP sessions successfully created */
+    uint64_t icmp_sessions_lookup_hits;  /* ICMP session lookup hits */
+    uint64_t icmp_sessions_lookup_misses; /* ICMP session lookup misses */
 
     /* Diagnostic counters */
     uint64_t snat_function_calls; /* Total SNAT function invocations */
@@ -717,8 +727,9 @@ int nat_worker_handoff_init(uint32_t num_workers);
  * VPP-STYLE: Uses ONLY inside tuple (inside_ip, inside_port, proto)
  * NEVER hash on outside tuple - it changes after NAT translation!
  * @return Worker ID that should handle this flow
+ * NOTE: Now defined as static inline in nat_flow_affinity.h
  */
-uint32_t nat_flow_to_worker(uint32_t inside_ip, uint16_t inside_port, uint8_t proto);
+// uint32_t nat_flow_to_worker(uint32_t inside_ip, uint16_t inside_port, uint8_t proto);
 
 /**
  * Determine session owner from NAT outside port

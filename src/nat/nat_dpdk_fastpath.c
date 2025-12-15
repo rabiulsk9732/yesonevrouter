@@ -10,29 +10,30 @@
  * - Prefetching and cache optimization
  */
 
-#include "nat.h"
 #include "log.h"
+#include "nat.h"
+#include "nat_flow_affinity.h"
 #include <string.h>
 
 #ifdef HAVE_DPDK
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
-#include <rte_mbuf.h>
 #include <rte_ip.h>
-#include <rte_udp.h>
-#include <rte_tcp.h>
-#include <rte_prefetch.h>
-#include <rte_cycles.h>
 #include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_prefetch.h>
+#include <rte_tcp.h>
+#include <rte_udp.h>
 #endif
 
 /* Performance tuning constants */
-#define NAT_BURST_SIZE         128   /* Packets per burst - larger for higher throughput */
-#define NAT_PREFETCH_OFFSET    8     /* Prefetch N packets ahead for cache warming */
+#define NAT_BURST_SIZE 128    /* Packets per burst - larger for higher throughput */
+#define NAT_PREFETCH_OFFSET 8 /* Prefetch N packets ahead for cache warming */
 
 /* Performance: disable hot-path logging for production */
-#define NAT_PERF_MODE          1     /* 1 = disable debug logs in hot path */
-#define NAT_CACHE_LINE_SIZE    64
+#define NAT_PERF_MODE 1 /* 1 = disable debug logs in hot path */
+#define NAT_CACHE_LINE_SIZE 64
 
 /* NAT interface direction - determined dynamically from interface config */
 #include "interface.h"
@@ -41,8 +42,10 @@
 static __thread struct interface *g_cached_iface[RTE_MAX_ETHPORTS];
 static __thread int g_iface_cache_init = 0;
 
-static inline void nat_init_iface_cache(void) {
-    if (likely(g_iface_cache_init)) return;
+static inline void nat_init_iface_cache(void)
+{
+    if (likely(g_iface_cache_init))
+        return;
     for (int i = 0; i < RTE_MAX_ETHPORTS; i++) {
         g_cached_iface[i] = interface_find_by_dpdk_port(i);
     }
@@ -54,39 +57,43 @@ static inline void nat_init_iface_cache(void) {
         struct interface *iface = g_cached_iface[i];
         if (iface) {
             LOG_INFO("[NAT-CACHE] Worker %d: port %d -> %s (inside=%d outside=%d)",
-                     g_thread_worker_id, i, iface->name,
-                     iface->config.nat_inside, iface->config.nat_outside);
+                     g_thread_worker_id, i, iface->name, iface->config.nat_inside,
+                     iface->config.nat_outside);
         }
     }
 }
 
 /* Check if port is NAT inside (LAN) - CACHED lookup */
-static inline bool nat_is_inside_port(uint16_t port_id) {
+static inline bool nat_is_inside_port(uint16_t port_id)
+{
     struct interface *iface = g_cached_iface[port_id];
     return iface ? iface->config.nat_inside : false;
 }
 
 /* Check if port is NAT outside (WAN) - CACHED lookup */
-static inline bool nat_is_outside_port(uint16_t port_id) {
+static inline bool nat_is_outside_port(uint16_t port_id)
+{
     struct interface *iface = g_cached_iface[port_id];
     return iface ? iface->config.nat_outside : false;
 }
 
 /* Legacy functions for compatibility */
-static inline bool nat_is_inside_port_slow(uint16_t port_id) {
+static inline bool nat_is_inside_port_slow(uint16_t port_id)
+{
     struct interface *iface = interface_find_by_dpdk_port(port_id);
     if (iface) {
         return iface->config.nat_inside;
     }
-    return false;  /* Default: not inside */
+    return false; /* Default: not inside */
 }
 
-static inline bool nat_is_outside_port_slow(uint16_t port_id) {
+static inline bool nat_is_outside_port_slow(uint16_t port_id)
+{
     struct interface *iface = interface_find_by_dpdk_port(port_id);
     if (iface) {
         return iface->config.nat_outside;
     }
-    return false;  /* Default: not outside */
+    return false; /* Default: not outside */
 }
 
 /* Per-lcore statistics for zero contention */
@@ -117,11 +124,9 @@ extern struct nat_worker_data g_nat_workers[];
 
 /* Forward declaration for hash function */
 extern uint32_t nat_hash_inside(uint32_t ip, uint16_t port, uint8_t protocol);
-static inline uint16_t nat_fast_cksum_update(uint16_t old_cksum,
-                                              uint32_t old_addr,
-                                              uint32_t new_addr,
-                                              uint16_t old_port,
-                                              uint16_t new_port)
+static inline uint16_t nat_fast_cksum_update(uint16_t old_cksum, uint32_t old_addr,
+                                             uint32_t new_addr, uint16_t old_port,
+                                             uint16_t new_port)
 {
     uint32_t sum;
 
@@ -157,7 +162,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
     uint64_t start_cycles = rte_rdtsc();
     uint16_t nb_tx = 0;
 
-    if (unlikely(nb_rx == 0)) return 0;
+    if (unlikely(nb_rx == 0))
+        return 0;
 
     stats->bursts_processed++;
 
@@ -191,7 +197,7 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
         /* Handle ARP packets - send to ARP subsystem */
         if (unlikely(ether_type == RTE_ETHER_TYPE_ARP)) {
-            extern int arp_process_packet_dpdk(struct rte_mbuf *mbuf, uint16_t port_id);
+            extern int arp_process_packet_dpdk(struct rte_mbuf * mbuf, uint16_t port_id);
             arp_process_packet_dpdk(pkt, pkt->port);
             continue;
         }
@@ -215,7 +221,7 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
         if (unlikely(i == 0)) {
             extern int arp_update_lockless(uint32_t ip_address, const uint8_t *mac_address);
             extern int arp_add_entry(uint32_t ip_address, const uint8_t *mac_address,
-                                    uint32_t ifindex, int state);
+                                     uint32_t ifindex, int state);
 
             if (is_inside_to_outside) {
                 /* LAN packet: learn client MAC (create if first packet) */
@@ -304,14 +310,21 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
         /* Handle based on direction */
         if (is_inside_to_outside) {
+            /* HYBRID-STYLE: Allow RSS to place packets on any worker
+             * Each worker creates sessions in its own table (lockless)
+             * DNAT uses cross-worker lookup to find sessions regardless of which worker created them
+             * This handles RSS asymmetry: outbound on worker A, inbound on worker B works correctly
+             */
+
             /* INSIDE -> OUTSIDE: SNAT (translate source) */
-            static __thread uint64_t snat_count = 0;
 #if !NAT_PERF_MODE
+            static __thread uint64_t snat_count = 0;
             if (snat_count++ < 10) {
                 LOG_INFO("[NAT-SNAT] pkt from port %u: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u",
-                    ingress_port,
-                    (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
-                    (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port, proto);
+                         ingress_port, (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                         (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port, (dst_ip >> 24) & 0xFF,
+                         (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port,
+                         proto);
             }
 #endif
 
@@ -329,6 +342,9 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 worker->cache_hits++;
             } else {
                 /* Cache miss - lookup in per-worker hash table */
+                YLOG_INFO("[NAT-DEBUG] Worker %u: Cache miss for %u.%u.%u.%u:%u", worker_id,
+                          (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF,
+                          src_ip & 0xFF, src_port);
                 stats->cache_misses++;
                 worker->cache_misses++;
 
@@ -351,12 +367,16 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                     }
 
                     /* LOCKLESS session create - each worker owns its session table */
-                    session = nat_session_create_lockless(
-                        worker_id,
-                        src_ip, src_port,
-                        worker->port_pool.nat_ip, nat_port,
-                        proto, dst_ip, dst_port
-                    );
+                    YLOG_INFO("[NAT-DEBUG] Creating session: inside=%u.%u.%u.%u:%u -> "
+                              "nat_ip=%u.%u.%u.%u:%u proto=%u worker=%u",
+                              (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF,
+                              src_ip & 0xFF, src_port, (worker->port_pool.nat_ip >> 24) & 0xFF,
+                              (worker->port_pool.nat_ip >> 16) & 0xFF,
+                              (worker->port_pool.nat_ip >> 8) & 0xFF,
+                              worker->port_pool.nat_ip & 0xFF, nat_port, proto, worker_id);
+                    session = nat_session_create_lockless(worker_id, src_ip, src_port,
+                                                          worker->port_pool.nat_ip, nat_port, proto,
+                                                          dst_ip, dst_port);
 
                     if (!session) {
                         /* Session create failed - log once */
@@ -375,6 +395,11 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             }
 
             /* Apply SNAT translation (inside -> outside) */
+            YLOG_INFO("[NAT-DEBUG] Translating: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                      (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF,
+                      src_ip & 0xFF, src_port, (session->outside_ip >> 24) & 0xFF,
+                      (session->outside_ip >> 16) & 0xFF, (session->outside_ip >> 8) & 0xFF,
+                      session->outside_ip & 0xFF, session->outside_port);
             if (!session) {
                 static __thread uint64_t null_sess = 0;
                 if (null_sess++ < 5) {
@@ -394,9 +419,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
                 } else if (udp->dgram_cksum != 0) {
-                    udp->dgram_cksum = nat_fast_cksum_update(
-                        udp->dgram_cksum, old_src, ip->src_addr,
-                        old_port, udp->src_port);
+                    udp->dgram_cksum = nat_fast_cksum_update(udp->dgram_cksum, old_src,
+                                                             ip->src_addr, old_port, udp->src_port);
                 }
             } else if (proto == IPPROTO_TCP) {
                 uint16_t old_port = tcp->src_port;
@@ -404,9 +428,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
                 } else {
-                    tcp->cksum = nat_fast_cksum_update(
-                        tcp->cksum, old_src, ip->src_addr,
-                        old_port, tcp->src_port);
+                    tcp->cksum = nat_fast_cksum_update(tcp->cksum, old_src, ip->src_addr, old_port,
+                                                       tcp->src_port);
                 }
             } else if (proto == IPPROTO_ICMP) {
                 /* ICMP SNAT - update identifier */
@@ -424,11 +447,27 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
         } else {
             /* OUTSIDE -> INSIDE: DNAT (translate destination) */
 
-            /* Lookup session by outside (public) IP:port */
-            session = nat_session_lookup_outside(dst_ip, dst_port, proto);
+            /* CROSS-WORKER LOOKUP: Search all worker tables to handle RSS asymmetry
+             * Session may have been created by a different worker (due to RSS steering)
+             * This lookup checks current worker first (fast), then scans others (slow but correct)
+             */
+            uint32_t owner_worker = 0;
+            session = nat_session_lookup_outside_any_worker(dst_ip, dst_port, proto, &owner_worker);
+
+#if !NAT_PERF_MODE
+            /* Debug: Track cross-worker hits for observability */
+            if (session && owner_worker != worker_id) {
+                static __thread uint64_t cross_worker_hits = 0;
+                if ((cross_worker_hits++ & 0xFF) == 0) {  /* Log every 256th */
+                    YLOG_DEBUG("[NAT-DNAT] Cross-worker session: owner=%u current=%u (RST asymmetry)",
+                               owner_worker, worker_id);
+                }
+                worker->cross_worker_hits++;  /* Per-worker counter */
+            }
+#endif
 
             if (!session) {
-                /* No session - drop packet (unsolicited inbound) */
+                /* No session - drop packet (unsolicited inbound or ED filtering) */
                 stats->dropped++;
                 rte_pktmbuf_free(pkt);
                 continue;
@@ -444,9 +483,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
                 } else if (udp->dgram_cksum != 0) {
-                    udp->dgram_cksum = nat_fast_cksum_update(
-                        udp->dgram_cksum, old_dst, ip->dst_addr,
-                        old_port, udp->dst_port);
+                    udp->dgram_cksum = nat_fast_cksum_update(udp->dgram_cksum, old_dst,
+                                                             ip->dst_addr, old_port, udp->dst_port);
                 }
             } else if (proto == IPPROTO_TCP) {
                 uint16_t old_port = tcp->dst_port;
@@ -454,9 +492,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
                 } else {
-                    tcp->cksum = nat_fast_cksum_update(
-                        tcp->cksum, old_dst, ip->dst_addr,
-                        old_port, tcp->dst_port);
+                    tcp->cksum = nat_fast_cksum_update(tcp->cksum, old_dst, ip->dst_addr, old_port,
+                                                       tcp->dst_port);
                 }
             } else if (proto == IPPROTO_ICMP) {
                 /* ICMP DNAT - update identifier */
@@ -480,13 +517,13 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
             if (is_inside_to_outside) {
                 /* SNAT: Send to WAN port (0), next-hop is gateway */
-                egress_port = 0;  /* WAN port */
+                egress_port = 0; /* WAN port */
                 /* Get gateway from config (parsed from startup.json routing section) */
                 extern uint32_t g_default_gateway;
                 next_hop_ip = g_default_gateway;
             } else {
                 /* DNAT: Send to LAN port (1), next-hop is inside IP */
-                egress_port = 1;  /* LAN port */
+                egress_port = 1; /* LAN port */
                 next_hop_ip = session->inside_ip;
             }
 
@@ -514,17 +551,18 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 static __thread uint64_t arp_miss = 0;
                 if (arp_miss++ < 10) {
                     LOG_WARN("[NAT] ARP miss for %u.%u.%u.%u - dropping",
-                        (next_hop_ip >> 24) & 0xFF, (next_hop_ip >> 16) & 0xFF,
-                        (next_hop_ip >> 8) & 0xFF, next_hop_ip & 0xFF);
+                             (next_hop_ip >> 24) & 0xFF, (next_hop_ip >> 16) & 0xFF,
+                             (next_hop_ip >> 8) & 0xFF, next_hop_ip & 0xFF);
                 }
 
                 /* Trigger ARP request (slow path) */
                 struct interface *egress_iface = interface_find_by_dpdk_port(egress_port);
                 if (egress_iface) {
                     extern int arp_send_request(uint32_t target_ip, uint32_t source_ip,
-                                               const uint8_t *source_mac, uint32_t ifindex);
+                                                const uint8_t *source_mac, uint32_t ifindex);
                     uint32_t src_ip = ntohl(egress_iface->config.ipv4_addr.s_addr);
-                    arp_send_request(next_hop_ip, src_ip, egress_iface->mac_addr, egress_iface->ifindex);
+                    arp_send_request(next_hop_ip, src_ip, egress_iface->mac_addr,
+                                     egress_iface->ifindex);
                 }
 
                 stats->dropped++;
@@ -548,12 +586,11 @@ int nat_dpdk_worker_loop(void *arg)
     uint16_t queue_id = rte_lcore_id();
     struct rte_mbuf *pkts[NAT_BURST_SIZE];
 
-    LOG_INFO("[NAT-DPDK] Worker %u starting on lcore %u, port %u queue %u",
-             g_thread_worker_id, rte_lcore_id(), port_id, queue_id);
+    LOG_INFO("[NAT-DPDK] Worker %u starting on lcore %u, port %u queue %u", g_thread_worker_id,
+             rte_lcore_id(), port_id, queue_id);
 
     /* Initialize per-worker port pool */
-    nat_worker_port_pool_init(g_thread_worker_id,
-                              0xCB007100 + g_thread_worker_id,  /* 203.0.113.X */
+    nat_worker_port_pool_init(g_thread_worker_id, 0xCB007100 + g_thread_worker_id, /* 203.0.113.X */
                               1024, 65535);
 
     while (1) {
@@ -584,8 +621,8 @@ int nat_dpdk_worker_loop(void *arg)
 /**
  * Get DPDK NAT statistics for a specific lcore
  */
-void nat_dpdk_get_stats(uint32_t lcore_id, uint64_t *rx, uint64_t *tx,
-                        uint64_t *dropped, double *cycles_per_pkt)
+void nat_dpdk_get_stats(uint32_t lcore_id, uint64_t *rx, uint64_t *tx, uint64_t *dropped,
+                        double *cycles_per_pkt)
 {
     struct nat_lcore_stats *stats = &g_lcore_stats[lcore_id];
 
@@ -621,9 +658,8 @@ void nat_dpdk_print_stats(void)
         if (stats->rx_packets > 0) {
             double cpp = (double)stats->cycles_total / stats->rx_packets;
             (void)cpp; /* Silence warning when LOG is no-op */
-            LOG_INFO("  |   %2u   | %10lu | %10lu | %8lu |   %6.1f   |",
-                     i, stats->rx_packets, stats->tx_packets,
-                     stats->dropped, cpp);
+            LOG_INFO("  |   %2u   | %10lu | %10lu | %8lu |   %6.1f   |", i, stats->rx_packets,
+                     stats->tx_packets, stats->dropped, cpp);
 
             total_rx += stats->rx_packets;
             total_tx += stats->tx_packets;
@@ -635,19 +671,19 @@ void nat_dpdk_print_stats(void)
 
     LOG_INFO("  |--------|------------|------------|----------|------------|");
     double total_cpp = total_rx > 0 ? (double)total_cycles / total_rx : 0;
-    LOG_INFO("  | TOTAL  | %10lu | %10lu | %8lu |   %6.1f   |",
-             total_rx, total_tx, total_dropped, total_cpp);
+    LOG_INFO("  | TOTAL  | %10lu | %10lu | %8lu |   %6.1f   |", total_rx, total_tx, total_dropped,
+             total_cpp);
     LOG_INFO("  ------------------------------------------------");
 
     /* Calculate throughput estimate */
-    double avg_pkt_size = 400;  /* IMIX average */
-    double cpu_ghz = 2.5;       /* Assumed CPU frequency */
+    double avg_pkt_size = 400; /* IMIX average */
+    double cpu_ghz = 2.5;      /* Assumed CPU frequency */
     double pps_per_core = (cpu_ghz * 1e9) / (total_cpp > 0 ? total_cpp : 1);
     double gbps_per_core = (pps_per_core * avg_pkt_size * 8) / 1e9;
 
     LOG_INFO("  Estimated performance at %.1f GHz:", cpu_ghz);
     LOG_INFO("    %.2f Mpps/core, %.2f Gbps/core", pps_per_core / 1e6, gbps_per_core);
-    (void)total_bursts; /* Mark as used */
+    (void)total_bursts;  /* Mark as used */
     (void)gbps_per_core; /* Mark as used */
 }
 
@@ -656,7 +692,9 @@ void nat_dpdk_print_stats(void)
 /* Stub implementations when DPDK is not available */
 uint16_t nat_process_burst_dpdk(void **pkts, uint16_t nb_rx, uint32_t worker_id)
 {
-    (void)pkts; (void)nb_rx; (void)worker_id;
+    (void)pkts;
+    (void)nb_rx;
+    (void)worker_id;
     return 0;
 }
 
