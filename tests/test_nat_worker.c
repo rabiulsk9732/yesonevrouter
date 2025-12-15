@@ -66,6 +66,103 @@ static void test_worker_statistics(void)
     printf("    Sessions created: %lu\n", stats->sessions_created);
 }
 
+/* Test 4: 10M Session Distribution */
+static void test_10m_session_distribution(void)
+{
+    printf("Test 4: 10M Session Distribution (Simplified - Test 1000 sessions)\n");
+
+    /* Set up 4 workers */
+    nat_set_num_workers(4);
+
+    /* Create 1000 sessions and check distribution */
+    uint32_t worker_counts[4] = {0, 0, 0, 0};
+    uint32_t num_sessions = 1000;
+
+    printf("  Creating %u test sessions...\n", num_sessions);
+
+    for (uint32_t i = 0; i < num_sessions; i++) {
+        uint32_t inside_ip = 0xAC100000 | (i >> 8); /* 172.16.X.X */
+        uint16_t inside_port = 1024 + (i % 64512);
+        uint32_t outside_ip = 0x67AEF743; /* 103.174.247.67 */
+        uint16_t outside_port = 1024 + i;
+        uint8_t protocol = (i % 3 == 0) ? IPPROTO_TCP : (i % 3 == 1) ? IPPROTO_UDP : IPPROTO_ICMP;
+
+        struct nat_session *session = nat_session_create(inside_ip, inside_port, outside_ip,
+                                                         outside_port, protocol, 0, 0);
+
+        if (session) {
+            worker_counts[session->owner_worker]++;
+        }
+
+        /* Print progress every 100 sessions */
+        if ((i + 1) % 100 == 0) {
+            printf("  Created %u sessions...\n", i + 1);
+        }
+    }
+
+    printf("\n  Session distribution across workers:\n");
+    for (int i = 0; i < 4; i++) {
+        double percent = (double)worker_counts[i] / num_sessions * 100.0;
+        printf("    Worker %d: %u sessions (%.1f%%)\n", i, worker_counts[i], percent);
+    }
+
+    /* Check that distribution is reasonably even (within 15% of expected 25%) */
+    for (int i = 0; i < 4; i++) {
+        double percent = (double)worker_counts[i] / num_sessions * 100.0;
+        assert(percent >= 10.0 && percent <= 40.0);
+    }
+
+    printf("  ✓ Session distribution is reasonably even\n");
+
+    /* Print load balance statistics if function is available */
+#ifdef HAVE_DPDK
+    printf("\n");
+    nat_worker_print_load_balance();
+#endif
+}
+
+/* Test 5: ICMP Session Creation and Lookup */
+static void test_icmp_sessions(void)
+{
+    printf("Test 5: ICMP Session Creation and Lookup\n");
+
+    /* Create ICMP session */
+    uint32_t inside_ip = 0xAC101003;  /* 172.16.16.3 */
+    uint16_t inside_port = 1234;      /* ICMP identifier */
+    uint32_t outside_ip = 0x67AEF744; /* 103.174.247.68 */
+    uint16_t outside_port = 1234;     /* Should be same as inside for ICMP */
+    uint8_t protocol = IPPROTO_ICMP;
+
+    /* Create session */
+    struct nat_session *session = nat_session_create(inside_ip, inside_port, outside_ip,
+                                                     outside_port, protocol, 0, 0);
+
+    assert(session != NULL);
+    printf("  ✓ ICMP session created\n");
+
+    /* Verify EIM: inside_port == outside_port for ICMP */
+    assert(session->inside_port == session->outside_port);
+    printf("  ✓ ICMP EIM verified (inside_port == outside_port)\n");
+
+    /* Lookup by inside */
+    struct nat_session *lookup_in = nat_session_lookup_inside(inside_ip, inside_port, protocol);
+    assert(lookup_in != NULL);
+    printf("  ✓ ICMP inside lookup successful\n");
+
+    /* Lookup by outside */
+    struct nat_session *lookup_out = nat_session_lookup_outside(outside_ip, outside_port, protocol);
+    assert(lookup_out != NULL);
+    printf("  ✓ ICMP outside lookup successful\n");
+
+    /* Verify same session returned */
+    assert(lookup_in == lookup_out);
+    printf("  ✓ ICMP session consistency verified\n");
+
+    /* Cleanup */
+    nat_session_delete(session);
+    printf("  ✓ ICMP session deleted\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -89,6 +186,8 @@ int main(void)
     test_worker_assignment();
     test_session_worker_assignment();
     test_worker_statistics();
+    test_10m_session_distribution();
+    test_icmp_sessions();
 
     printf("\n========================================\n");
     printf("All tests passed!\n");

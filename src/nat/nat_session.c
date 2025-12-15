@@ -33,7 +33,7 @@ void nat_session_delete(struct nat_session *session);
 static inline void nat_hash_insert(struct nat_worker_data *worker, struct nat_hash_bucket *table,
                                    uint32_t signature, uint32_t session_idx);
 static inline void nat_hash_delete(struct nat_worker_data *worker, struct nat_hash_bucket *table,
-                                  uint32_t signature, uint32_t session_idx);
+                                   uint32_t signature, uint32_t session_idx);
 
 /* Global NAT session table (Inside -> Outside) */
 static struct nat_session *session_table[NAT_SESSION_TABLE_SIZE];
@@ -64,8 +64,8 @@ int nat_session_slab_init(uint32_t max_sessions)
 
     /* Allocate global slab on hugepages */
 #ifdef HAVE_DPDK
-    g_session_slab = rte_zmalloc("nat_session_slab",
-                                sizeof(struct nat_session) * g_max_sessions, 64);
+    g_session_slab =
+        rte_zmalloc("nat_session_slab", sizeof(struct nat_session) * g_max_sessions, 64);
 #else
     g_session_slab = calloc(g_max_sessions, sizeof(struct nat_session));
 #endif
@@ -74,9 +74,8 @@ int nat_session_slab_init(uint32_t max_sessions)
         return -1;
     }
 
-    YLOG_INFO("NAT Session Slab initialized: %u sessions (%lu MB)",
-              g_max_sessions,
-              ((uint64_t)g_max_sessions * sizeof(struct nat_session)) / (1024*1024));
+    YLOG_INFO("NAT Session Slab initialized: %u sessions (%lu MB)", g_max_sessions,
+              ((uint64_t)g_max_sessions * sizeof(struct nat_session)) / (1024 * 1024));
     return 0;
 }
 
@@ -106,7 +105,7 @@ struct nat_session *nat_session_alloc_slab(void)
     }
 
     worker->session_pool.alloc_fail++;
-    return NULL;  /* No fallback - worker pool exhausted */
+    return NULL; /* No fallback - worker pool exhausted */
 }
 
 /**
@@ -114,7 +113,8 @@ struct nat_session *nat_session_alloc_slab(void)
  */
 void nat_session_free_slab(struct nat_session *s)
 {
-    if (!s || s->session_index == 0) return;
+    if (!s || s->session_index == 0)
+        return;
 
     int worker_id = g_thread_worker_id;
     if (worker_id < 0 || worker_id >= (int)g_num_workers) {
@@ -158,10 +158,10 @@ int nat_session_init(void)
         g_nat_workers[i].hash_mask = table_size - 1;
 
 #ifdef HAVE_DPDK
-        g_nat_workers[i].in2out_hash = rte_zmalloc_socket("nat_hash_in",
-            sizeof(struct nat_hash_bucket) * table_size, 64, SOCKET_ID_ANY);
-        g_nat_workers[i].out2in_hash = rte_zmalloc_socket("nat_hash_out",
-            sizeof(struct nat_hash_bucket) * table_size, 64, SOCKET_ID_ANY);
+        g_nat_workers[i].in2out_hash = rte_zmalloc_socket(
+            "nat_hash_in", sizeof(struct nat_hash_bucket) * table_size, 64, SOCKET_ID_ANY);
+        g_nat_workers[i].out2in_hash = rte_zmalloc_socket(
+            "nat_hash_out", sizeof(struct nat_hash_bucket) * table_size, 64, SOCKET_ID_ANY);
 #else
         g_nat_workers[i].in2out_hash = calloc(table_size, sizeof(struct nat_hash_bucket));
         g_nat_workers[i].out2in_hash = calloc(table_size, sizeof(struct nat_hash_bucket));
@@ -173,10 +173,11 @@ int nat_session_init(void)
     }
 
     /* g_num_workers already set by nat_set_num_workers() in main.c - don't reset! */
-    YLOG_INFO("NAT: VPP-style per-worker hash tables initialized (size %u, workers=%u)", NAT_WORKER_TABLE_SIZE * 4, g_num_workers);
+    YLOG_INFO("NAT: VPP-style per-worker hash tables initialized (size %u, workers=%u)",
+              NAT_WORKER_TABLE_SIZE * 4, g_num_workers);
 
     /* Initialize session slab allocator */
-    if (nat_session_slab_init(1000000) != 0) {
+    if (nat_session_slab_init(10000000) != 0) {
         YLOG_ERROR("Failed to initialize NAT session slab");
         return -1;
     }
@@ -184,14 +185,16 @@ int nat_session_init(void)
     /* VPP-STYLE: Initialize per-worker session pools (LOCKLESS) */
     /* Use g_num_workers (set by nat_set_num_workers) for better distribution */
     uint32_t actual_workers = g_num_workers > 0 ? g_num_workers : 1;
-    if (actual_workers > NAT_MAX_WORKERS) actual_workers = NAT_MAX_WORKERS;
+    if (actual_workers > NAT_MAX_WORKERS)
+        actual_workers = NAT_MAX_WORKERS;
     uint32_t sessions_per_worker = g_max_sessions / actual_workers;
-    YLOG_INFO("NAT: Allocating %u sessions per worker (%u workers)", sessions_per_worker, actual_workers);
+    YLOG_INFO("NAT: Allocating %u sessions per worker (%u workers)", sessions_per_worker,
+              actual_workers);
     for (int i = 0; i < NAT_MAX_WORKERS; i++) {
         g_nat_workers[i].session_pool.capacity = sessions_per_worker;
 #ifdef HAVE_DPDK
-        g_nat_workers[i].session_pool.free_stack = rte_zmalloc_socket("nat_worker_pool",
-            sizeof(uint32_t) * sessions_per_worker, 64, SOCKET_ID_ANY);
+        g_nat_workers[i].session_pool.free_stack = rte_zmalloc_socket(
+            "nat_worker_pool", sizeof(uint32_t) * sessions_per_worker, 64, SOCKET_ID_ANY);
 #else
         g_nat_workers[i].session_pool.free_stack = calloc(sessions_per_worker, sizeof(uint32_t));
 #endif
@@ -206,7 +209,8 @@ int nat_session_init(void)
         }
         g_nat_workers[i].session_pool.free_top = sessions_per_worker;
     }
-    YLOG_INFO("NAT: VPP-style per-worker session pools (%u sessions/worker, LOCKLESS)", sessions_per_worker);
+    YLOG_INFO("NAT: VPP-style per-worker session pools (%u sessions/worker, LOCKLESS)",
+              sessions_per_worker);
 
     /* Initialize TSC for fast timing */
     init_tsc_freq();
@@ -261,8 +265,8 @@ static inline uint32_t nat_hash_outside(uint32_t ip, uint16_t port, uint8_t prot
  * Returns 1 if found, 0 if miss. Outputs outside_ip/port on hit.
  * This is the ultra-fast path that avoids hash table lookup entirely.
  */
-static inline uint32_t nat_cache_lookup(struct nat_worker_data *worker, uint32_t hash, uint32_t inside_ip,
-                                   uint16_t inside_port, uint8_t protocol)
+static inline uint32_t nat_cache_lookup(struct nat_worker_data *worker, uint32_t hash,
+                                        uint32_t inside_ip, uint16_t inside_port, uint8_t protocol)
 {
     /* Direct Map Cache (O(1)) */
     uint32_t idx = hash & (NAT_SESSION_CACHE_SIZE - 1);
@@ -280,8 +284,7 @@ static inline uint32_t nat_cache_lookup(struct nat_worker_data *worker, uint32_t
  * Uses circular buffer for LRU-like eviction when full
  */
 static inline void nat_cache_add(struct nat_worker_data *worker, uint32_t hash, uint32_t inside_ip,
-                                 uint16_t inside_port, uint32_t session_index,
-                                 uint8_t protocol)
+                                 uint16_t inside_port, uint32_t session_index, uint8_t protocol)
 {
     /* Direct Map Replacement */
     uint32_t idx = hash & (NAT_SESSION_CACHE_SIZE - 1);
@@ -336,7 +339,8 @@ static int nat_recycle_expired_session(uint8_t protocol)
     struct nat_session *session, *oldest = NULL;
     uint64_t oldest_age = 0;
 
-    if (unlikely(g_tsc_hz == 0)) init_tsc_freq();
+    if (unlikely(g_tsc_hz == 0))
+        init_tsc_freq();
 
     /* Scan a portion of hash table for expired sessions */
     /* For efficiency, we check up to 64 buckets per call */
@@ -399,8 +403,8 @@ static uint64_t allocate_session_id(void)
  * VPP pattern: Try to recycle expired session before allocating new one
  */
 struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
-                                       uint32_t outside_ip, uint16_t outside_port,
-                                       uint8_t protocol, uint32_t dest_ip, uint16_t dest_port)
+                                       uint32_t outside_ip, uint16_t outside_port, uint8_t protocol,
+                                       uint32_t dest_ip, uint16_t dest_port)
 {
     struct nat_session *session;
     uint32_t hash_inside, hash_outside;
@@ -429,7 +433,7 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
     session->outside_ip = outside_ip;
     session->outside_port = outside_port;
     session->protocol = protocol;
-    session->dest_ip = dest_ip;       /* Store destination for NetFlow DELETE */
+    session->dest_ip = dest_ip; /* Store destination for NetFlow DELETE */
     session->dest_port = dest_port;
 
     /* Set session ID */
@@ -500,9 +504,9 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
             /* Free the allocated session memory */
             /* Free the allocated session memory */
 #ifdef HAVE_DPDK
-             nat_session_free_slab(session);
+            nat_session_free_slab(session);
 #else
-             free(session);
+            free(session);
 #endif
             return NULL;
         }
@@ -522,13 +526,20 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
         struct nat_worker_data *worker = &g_nat_workers[assigned_worker];
         __atomic_fetch_add(&worker->sessions_created, 1, __ATOMIC_RELAXED);
 
+        /* VPP-STYLE: Track which worker owns this session for handoff */
+        session->owner_worker = (uint8_t)assigned_worker;
+
         /* Insert into Open Addressing Hash Tables */
         nat_hash_insert(worker, worker->in2out_hash, hash_inside, session->session_index);
         nat_hash_insert(worker, worker->out2in_hash, hash_outside, session->session_index);
 
         /* Add to fast cache for L1-resident lookups */
         /* Add to fast cache for L1-resident lookups */
-        nat_cache_add(worker, hash_inside, inside_ip, inside_port, session->session_index, protocol);
+        nat_cache_add(worker, hash_inside, inside_ip, inside_port, session->session_index,
+                      protocol);
+    } else {
+        /* Single worker mode or fallback - worker 0 owns */
+        session->owner_worker = 0;
     }
 
     /* Update statistics */
@@ -563,10 +574,10 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
  * @param dest_port Destination port
  * @return Session pointer or NULL on error
  */
-struct nat_session *nat_session_create_lockless(uint32_t worker_id,
-                                                 uint32_t inside_ip, uint16_t inside_port,
-                                                 uint32_t outside_ip, uint16_t outside_port,
-                                                 uint8_t protocol, uint32_t dest_ip, uint16_t dest_port)
+struct nat_session *nat_session_create_lockless(uint32_t worker_id, uint32_t inside_ip,
+                                                uint16_t inside_port, uint32_t outside_ip,
+                                                uint16_t outside_port, uint8_t protocol,
+                                                uint32_t dest_ip, uint16_t dest_port)
 {
     struct nat_session *session;
     uint32_t hash_inside, hash_outside;
@@ -574,8 +585,8 @@ struct nat_session *nat_session_create_lockless(uint32_t worker_id,
     /* Validate worker ID */
     if (worker_id >= NAT_MAX_WORKERS || g_num_workers <= 1) {
         /* Fall back to locked path */
-        return nat_session_create(inside_ip, inside_port, outside_ip, outside_port,
-                                  protocol, dest_ip, dest_port);
+        return nat_session_create(inside_ip, inside_port, outside_ip, outside_port, protocol,
+                                  dest_ip, dest_port);
     }
 
     struct nat_worker_data *worker = &g_nat_workers[worker_id];
@@ -637,6 +648,9 @@ struct nat_session *nat_session_create_lockless(uint32_t worker_id,
     session->inside_hash = hash_inside;
     session->outside_hash = hash_outside;
 
+    /* VPP-STYLE: Track which worker owns this session for handoff */
+    session->owner_worker = (uint8_t)worker_id;
+
     /* Insert into per-worker tables ONLY (no global locks!) */
     nat_hash_insert(worker, worker->in2out_hash, hash_inside, session->session_index);
     nat_hash_insert(worker, worker->out2in_hash, hash_outside, session->session_index);
@@ -684,7 +698,7 @@ static inline void nat_hash_insert(struct nat_worker_data *worker, struct nat_ha
 
 /* Delete from Open Addressing - Requires Backward Shifting */
 static inline void nat_hash_delete(struct nat_worker_data *worker, struct nat_hash_bucket *table,
-                                  uint32_t signature, uint32_t session_idx)
+                                   uint32_t signature, uint32_t session_idx)
 {
     uint32_t mask = worker->hash_mask;
     uint32_t idx = signature & mask;
@@ -692,36 +706,38 @@ static inline void nat_hash_delete(struct nat_worker_data *worker, struct nat_ha
     for (uint32_t i = 0; i < mask; i++) {
         if (table[idx].idx == session_idx) {
             /* Found it. Mark as empty. */
-             table[idx].idx = 0;
-             table[idx].sig = 0;
+            table[idx].idx = 0;
+            table[idx].sig = 0;
 
-             /* Re-insert subsequent items until empty slot (Robin Hood / Backward Shift) */
-             /* Simplified: Just leave gap? No, linear probing breaks with gaps. */
-             /* Must shift back items that hashed to "idx" or before */
-             /* For now, simplified SWAP: */
+            /* Re-insert subsequent items until empty slot (Robin Hood / Backward Shift) */
+            /* Simplified: Just leave gap? No, linear probing breaks with gaps. */
+            /* Must shift back items that hashed to "idx" or before */
+            /* For now, simplified SWAP: */
 
-             /* Proper Backward Shift implementation */
-             uint32_t hole = idx;
-             uint32_t scan = (hole + 1) & mask;
+            /* Proper Backward Shift implementation */
+            uint32_t hole = idx;
+            uint32_t scan = (hole + 1) & mask;
 
-             while (table[scan].idx != 0) {
-                 /* uint32_t ideal = table[scan].sig & mask; */
-                 /* Re-insert everyone in the cluster to be safe (simplified Robin Hood) */
-                 /* Wrap-around logic: (ideal <= hole < scan) OR (scan < ideal <= hole) OR (hole < scan < ideal) */
-                 /* simpler: distance from ideal */
+            while (table[scan].idx != 0) {
+                /* uint32_t ideal = table[scan].sig & mask; */
+                /* Re-insert everyone in the cluster to be safe (simplified Robin Hood) */
+                /* Wrap-around logic: (ideal <= hole < scan) OR (scan < ideal <= hole) OR (hole <
+                 * scan < ideal) */
+                /* simpler: distance from ideal */
 
-                 /* If (scan - ideal) & mask >= (scan - hole) & mask */
-                 /* No, let's keep it simple: Re-insert */
+                /* If (scan - ideal) & mask >= (scan - hole) & mask */
+                /* No, let's keep it simple: Re-insert */
 
-                 struct nat_hash_bucket temp = table[scan];
-                 table[scan].idx = 0;
-                 nat_hash_insert(worker, table, temp.sig, temp.idx);
+                struct nat_hash_bucket temp = table[scan];
+                table[scan].idx = 0;
+                nat_hash_insert(worker, table, temp.sig, temp.idx);
 
-                 scan = (scan + 1) & mask;
-             }
-             return;
+                scan = (scan + 1) & mask;
+            }
+            return;
         }
-        if (table[idx].idx == 0) return; /* Not found */
+        if (table[idx].idx == 0)
+            return; /* Not found */
         idx = (idx + 1) & mask;
     }
 }
@@ -736,7 +752,8 @@ static inline void nat_hash_delete(struct nat_worker_data *worker, struct nat_ha
 struct nat_session *nat_session_lookup_lockless(uint32_t inside_ip, uint16_t inside_port,
                                                 uint8_t protocol, uint32_t worker_id)
 {
-    if (unlikely(worker_id >= NAT_MAX_WORKERS)) return NULL;
+    if (unlikely(worker_id >= NAT_MAX_WORKERS))
+        return NULL;
 
     struct nat_worker_data *worker = &g_nat_workers[worker_id];
 
@@ -751,19 +768,26 @@ struct nat_session *nat_session_lookup_lockless(uint32_t inside_ip, uint16_t ins
     uint32_t idx = hash & mask;
     struct nat_hash_bucket *b;
 
-    /* Unrolled loop - max 8 probes */
-    #define PROBE(N) \
-        b = &worker->in2out_hash[(idx + N) & mask]; \
-        if (b->idx == 0) return NULL; \
-        if (b->sig == hash) { \
-            struct nat_session *s = &g_session_slab[b->idx]; \
-            if (likely(s->inside_ip == inside_ip && s->inside_port == inside_port)) \
-                return s; \
-        }
+/* Unrolled loop - max 8 probes */
+#define PROBE(N)                                                                                   \
+    b = &worker->in2out_hash[(idx + N) & mask];                                                    \
+    if (b->idx == 0)                                                                               \
+        return NULL;                                                                               \
+    if (b->sig == hash) {                                                                          \
+        struct nat_session *s = &g_session_slab[b->idx];                                           \
+        if (likely(s->inside_ip == inside_ip && s->inside_port == inside_port))                    \
+            return s;                                                                              \
+    }
 
-    PROBE(0); PROBE(1); PROBE(2); PROBE(3);
-    PROBE(4); PROBE(5); PROBE(6); PROBE(7);
-    #undef PROBE
+    PROBE(0);
+    PROBE(1);
+    PROBE(2);
+    PROBE(3);
+    PROBE(4);
+    PROBE(5);
+    PROBE(6);
+    PROBE(7);
+#undef PROBE
 
     return NULL;
 }
@@ -794,30 +818,30 @@ struct nat_session *nat_session_lookup_inside(uint32_t inside_ip, uint16_t insid
             if (likely(s->inside_ip == inside_ip && s->inside_port == inside_port &&
                        s->protocol == protocol)) {
 
-                 /* Update timestamp and return */
-                 uint64_t now = get_timestamp_cycles();
-                 /* Check timeout */
-                 if (unlikely(now - s->last_used_ts > (uint64_t)s->timeout * g_tsc_hz)) {
-                      if (!(s->flags & NAT_SESSION_FLAG_STATIC)) {
-                           /* Expired - let slow path handle deletion or just return NULL?
-                              Better to fall through to slow path which handles lookup+expire logic?
-                              Or just return NULL and let lookup logic handle it.
-                              Actually, standard lookup below handles expiration.
-                              Let's just fall through if expired?
-                              Or replicate expiration logic? */
-                           /* Replicating expiration logic for speed */
-                           /* Wait, if it's expired in cache, it might be expired in table too.
-                              We should not return it. */
-                      } else {
-                           s->last_used_ts = now;
-                           __atomic_fetch_add(&worker->cache_hits, 1, __ATOMIC_RELAXED);
-                           return s;
-                      }
-                 } else {
-                     s->last_used_ts = now;
-                     __atomic_fetch_add(&worker->cache_hits, 1, __ATOMIC_RELAXED);
-                     return s;
-                 }
+                /* Update timestamp and return */
+                uint64_t now = get_timestamp_cycles();
+                /* Check timeout */
+                if (unlikely(now - s->last_used_ts > (uint64_t)s->timeout * g_tsc_hz)) {
+                    if (!(s->flags & NAT_SESSION_FLAG_STATIC)) {
+                        /* Expired - let slow path handle deletion or just return NULL?
+                           Better to fall through to slow path which handles lookup+expire logic?
+                           Or just return NULL and let lookup logic handle it.
+                           Actually, standard lookup below handles expiration.
+                           Let's just fall through if expired?
+                           Or replicate expiration logic? */
+                        /* Replicating expiration logic for speed */
+                        /* Wait, if it's expired in cache, it might be expired in table too.
+                           We should not return it. */
+                    } else {
+                        s->last_used_ts = now;
+                        __atomic_fetch_add(&worker->cache_hits, 1, __ATOMIC_RELAXED);
+                        return s;
+                    }
+                } else {
+                    s->last_used_ts = now;
+                    __atomic_fetch_add(&worker->cache_hits, 1, __ATOMIC_RELAXED);
+                    return s;
+                }
             }
         }
         __atomic_fetch_add(&worker->cache_misses, 1, __ATOMIC_RELAXED);
@@ -828,32 +852,34 @@ struct nat_session *nat_session_lookup_inside(uint32_t inside_ip, uint16_t insid
         struct nat_hash_bucket *bucket;
 
         /* Max probes = 32 or until hit/empty */
-        for (int i=0; i < 32; i++) {
-             bucket = &worker->in2out_hash[idx];
-             if (bucket->idx == 0) break; /* Not found */
+        for (int i = 0; i < 32; i++) {
+            bucket = &worker->in2out_hash[idx];
+            if (bucket->idx == 0)
+                break; /* Not found */
 
-             /* Check signature first (fast filter) */
-             if (bucket->sig == hash) {
-                 /* Potential Match - Fetch Session */
-                 session = &g_session_slab[bucket->idx];
-                 if (session->inside_ip == inside_ip && session->inside_port == inside_port &&
-                     session->protocol == protocol) {
+            /* Check signature first (fast filter) */
+            if (bucket->sig == hash) {
+                /* Potential Match - Fetch Session */
+                session = &g_session_slab[bucket->idx];
+                if (session->inside_ip == inside_ip && session->inside_port == inside_port &&
+                    session->protocol == protocol) {
 
-                     /* HIT */
-                     /* Expiration Logic here (same as before) */
-                     uint64_t now = get_timestamp_cycles();
-                     if (unlikely(now - session->last_used_ts > (uint64_t)session->timeout * g_tsc_hz)) {
-                          if (!(session->flags & NAT_SESSION_FLAG_STATIC)) {
-                              /* Expired */
-                              break;
-                          }
-                     }
-                     session->last_used_ts = now;
-                     __atomic_fetch_add(&worker->in2out_hits, 1, __ATOMIC_RELAXED);
-                     return session;
-                 }
-             }
-             idx = (idx + 1) & mask;
+                    /* HIT */
+                    /* Expiration Logic here (same as before) */
+                    uint64_t now = get_timestamp_cycles();
+                    if (unlikely(now - session->last_used_ts >
+                                 (uint64_t)session->timeout * g_tsc_hz)) {
+                        if (!(session->flags & NAT_SESSION_FLAG_STATIC)) {
+                            /* Expired */
+                            break;
+                        }
+                    }
+                    session->last_used_ts = now;
+                    __atomic_fetch_add(&worker->in2out_hits, 1, __ATOMIC_RELAXED);
+                    return session;
+                }
+            }
+            idx = (idx + 1) & mask;
         }
 
         /* Not found in worker table - try global table as fallback */
@@ -879,11 +905,12 @@ struct nat_session *nat_session_lookup_inside(uint32_t inside_ip, uint16_t insid
             uint64_t now = get_timestamp_cycles();
             uint64_t session_idle_cycles = now - session->last_used_ts;
 
-            if (unlikely(g_tsc_hz == 0)) init_tsc_freq();
+            if (unlikely(g_tsc_hz == 0))
+                init_tsc_freq();
             uint64_t timeout_cycles = (uint64_t)session->timeout * g_tsc_hz;
 
             if (session_idle_cycles > timeout_cycles) {
-                 /* Logic handled by global timeout */
+                /* Logic handled by global timeout */
             }
 
             /* Update last used timestamp */
@@ -928,28 +955,30 @@ struct nat_session *nat_session_lookup_outside(uint32_t outside_ip, uint16_t out
         struct nat_hash_bucket *bucket;
 
         /* Max probes = 32 */
-        for (int i=0; i < 32; i++) {
-             bucket = &worker->out2in_hash[idx];
-             if (bucket->idx == 0) break;
+        for (int i = 0; i < 32; i++) {
+            bucket = &worker->out2in_hash[idx];
+            if (bucket->idx == 0)
+                break;
 
-             if (bucket->sig == hash) {
-                 session = &g_session_slab[bucket->idx];
-                 if (session->outside_ip == outside_ip && session->outside_port == outside_port &&
-                     session->protocol == protocol) {
+            if (bucket->sig == hash) {
+                session = &g_session_slab[bucket->idx];
+                if (session->outside_ip == outside_ip && session->outside_port == outside_port &&
+                    session->protocol == protocol) {
 
-                     /* HIT */
-                     uint64_t now = get_timestamp_cycles();
-                     if (unlikely(now - session->last_used_ts > (uint64_t)session->timeout * g_tsc_hz)) {
-                          if (!(session->flags & NAT_SESSION_FLAG_STATIC)) {
-                              break; /* Expired */
-                          }
-                     }
-                     session->last_used_ts = now;
-                     __atomic_fetch_add(&worker->out2in_hits, 1, __ATOMIC_RELAXED);
-                     return session;
-                 }
-             }
-             idx = (idx + 1) & mask;
+                    /* HIT */
+                    uint64_t now = get_timestamp_cycles();
+                    if (unlikely(now - session->last_used_ts >
+                                 (uint64_t)session->timeout * g_tsc_hz)) {
+                        if (!(session->flags & NAT_SESSION_FLAG_STATIC)) {
+                            break; /* Expired */
+                        }
+                    }
+                    session->last_used_ts = now;
+                    __atomic_fetch_add(&worker->out2in_hits, 1, __ATOMIC_RELAXED);
+                    return session;
+                }
+            }
+            idx = (idx + 1) & mask;
         }
         __atomic_fetch_add(&worker->out2in_misses, 1, __ATOMIC_RELAXED);
     }
@@ -967,7 +996,8 @@ struct nat_session *nat_session_lookup_outside(uint32_t outside_ip, uint16_t out
             uint64_t now = get_timestamp_cycles();
             uint64_t session_idle_cycles = now - session->last_used_ts;
 
-            if (unlikely(g_tsc_hz == 0)) init_tsc_freq();
+            if (unlikely(g_tsc_hz == 0))
+                init_tsc_freq();
             uint64_t timeout_cycles = (uint64_t)session->timeout * g_tsc_hz;
 
             if (session_idle_cycles > timeout_cycles) {
@@ -987,6 +1017,230 @@ struct nat_session *nat_session_lookup_outside(uint32_t outside_ip, uint16_t out
     }
 
     pthread_rwlock_unlock(&outside_session_table_locks[partition]);
+
+    g_nat_config.stats.session_not_found++;
+    return NULL;
+}
+
+/**
+ * VPP-STYLE: Cross-worker session lookup for DNAT
+ * Searches ALL worker tables when current worker doesn't have the session
+ * This handles RSS asymmetry where reverse packet lands on different worker
+ * Returns session pointer AND sets out_owner_worker to indicate which worker owns it
+ */
+struct nat_session *nat_session_lookup_outside_any_worker(uint32_t outside_ip,
+                                                          uint16_t outside_port, uint8_t protocol,
+                                                          uint32_t *out_owner_worker)
+{
+    uint32_t hash = nat_hash_outside(outside_ip, outside_port, protocol);
+    struct nat_session *session;
+
+    /* Initialize output */
+    if (out_owner_worker)
+        *out_owner_worker = 0;
+
+    /* Try each worker's table */
+    for (uint32_t wid = 0; wid < g_num_workers && wid < NAT_MAX_WORKERS; wid++) {
+        struct nat_worker_data *worker = &g_nat_workers[wid];
+
+        uint32_t mask = worker->hash_mask;
+        uint32_t idx = hash & mask;
+        struct nat_hash_bucket *bucket;
+
+        /* Max probes = 32 */
+        for (int i = 0; i < 32; i++) {
+            bucket = &worker->out2in_hash[idx];
+            if (bucket->idx == 0)
+                break;
+
+            if (bucket->sig == hash) {
+                session = &g_session_slab[bucket->idx];
+                if (session->outside_ip == outside_ip && session->outside_port == outside_port &&
+                    session->protocol == protocol) {
+
+                    /* FOUND IT! Check expiry */
+                    uint64_t now = get_timestamp_cycles();
+                    if (now - session->last_used_ts > (uint64_t)session->timeout * g_tsc_hz) {
+                        if (!(session->flags & NAT_SESSION_FLAG_STATIC)) {
+                            continue; /* Expired, skip */
+                        }
+                    }
+
+                    session->last_used_ts = now;
+                    if (out_owner_worker)
+                        *out_owner_worker = wid;
+                    return session;
+                }
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    /* Not found in any worker table - fall back to global */
+    return nat_session_lookup_outside(outside_ip, outside_port, protocol);
+}
+
+/**
+ * ICMP EIM (Endpoint-Independent Mapping) Lookup
+ * RFC 5508: ICMP sessions use identifier-based mapping
+ * For ICMP, we need to search by inside IP + identifier (not outside port)
+ */
+struct nat_session *nat_session_lookup_icmp_eim(uint32_t outside_ip, uint16_t icmp_id)
+{
+    /* For ICMP with EIM: inside_ip + icmp_id = outside_ip + icmp_id (same identifier)
+     * We need to find the session by matching the outside_ip and icmp_id
+     * But we stored inside_ip + inside_port in the session
+     * Since icmp_id == inside_port == outside_port for ICMP EIM
+     * We can search for sessions with matching outside_ip and port=icmp_id
+     */
+
+    uint32_t hash = nat_hash_outside(outside_ip, icmp_id, IPPROTO_ICMP);
+    uint32_t partition = get_partition_id(hash);
+    struct nat_session *session;
+
+    /* Try per-worker fast path (Lockless) - SEARCH ALL WORKERS for ICMP */
+    extern __thread int g_thread_worker_id;
+
+    if (g_num_workers > 1) {
+        /* VPP-STYLE: Search ALL worker tables for ICMP (RSS asymmetry) */
+        for (uint32_t wid = 0; wid < g_num_workers && wid < NAT_MAX_WORKERS; wid++) {
+            struct nat_worker_data *worker = &g_nat_workers[wid];
+
+            uint32_t mask = worker->hash_mask;
+            uint32_t idx = hash & mask;
+            struct nat_hash_bucket *bucket;
+
+            /* Max probes = 32 */
+            for (int i = 0; i < 32; i++) {
+                bucket = &worker->out2in_hash[(idx + i) & mask];
+
+                if (bucket->idx == 0)
+                    continue; /* Empty bucket */
+
+                session = &g_session_slab[bucket->idx];
+
+                /* Verify signature match */
+                if (bucket->sig != (hash & 0xFFFFFFFF))
+                    continue;
+
+                /* Check if this is our session */
+                if (session->outside_ip == outside_ip && session->outside_port == icmp_id &&
+                    session->protocol == IPPROTO_ICMP) {
+
+                    /* Update last used timestamp */
+                    uint64_t now = get_timestamp_cycles();
+                    session->last_used_ts = now;
+
+                    return session;
+                }
+            }
+        }
+    }
+
+    /* Fallback to global table (with locks) */
+    pthread_rwlock_rdlock(&outside_session_table_locks[partition]);
+
+    session = outside_session_table[hash];
+
+    while (session) {
+        if (session->outside_ip == outside_ip && session->outside_port == icmp_id &&
+            session->protocol == IPPROTO_ICMP) {
+
+            /* VPP pattern: check if session has expired */
+            uint64_t now = get_timestamp_cycles();
+            uint64_t session_idle_cycles = now - session->last_used_ts;
+
+            if (unlikely(g_tsc_hz == 0))
+                init_tsc_freq();
+            uint64_t timeout_cycles = (uint64_t)session->timeout * g_tsc_hz;
+
+            if (session_idle_cycles > timeout_cycles) {
+                /* Session expired - delete it */
+                pthread_rwlock_unlock(&outside_session_table_locks[partition]);
+                nat_session_delete(session);
+                g_nat_config.stats.sessions_timeout++;
+                return NULL;
+            }
+
+            /* Update last used timestamp */
+            session->last_used_ts = now;
+            pthread_rwlock_unlock(&outside_session_table_locks[partition]);
+            return session;
+        }
+        session = session->next_outside;
+    }
+
+    pthread_rwlock_unlock(&outside_session_table_locks[partition]);
+
+    g_nat_config.stats.session_not_found++;
+    return NULL;
+}
+
+/**
+ * Flow-based NAT session lookup for IP fragments
+ * Used when L4 header is not available (subsequent fragments)
+ * Looks up session using only (inside_ip, protocol)
+ * This ensures fragments get the SAME NAT translation as the first fragment
+ */
+struct nat_session *nat_session_lookup_flow(uint32_t inside_ip, uint32_t outside_ip,
+                                            uint8_t protocol)
+{
+    /* For fragments, we can't extract ports
+     * We need to match on inside_ip + protocol to find the session
+     * The session was created with nat_hash_inside(inside_ip, port, protocol)
+     * So we compute the same hash base and iterate through the bucket
+     */
+
+    /* Since we don't know the port, we need to search multiple buckets
+     * We'll use a hash that's based on inside_ip + protocol only
+     */
+    uint32_t hash_base = nat_hash_5tuple(inside_ip, 0, protocol);
+    uint32_t partition = get_partition_id(hash_base);
+    struct nat_session *session;
+
+    /* Try per-worker fast path first */
+    extern __thread int g_thread_worker_id;
+    int worker_id = g_thread_worker_id;
+
+    if (worker_id >= 0 && worker_id < NAT_MAX_WORKERS && g_num_workers > 1) {
+        struct nat_worker_data *worker = &g_nat_workers[worker_id];
+
+        /* For simplicity in the fast path, just skip it for fragments
+         * Fragment lookup needs to check both hash tables
+         */
+        (void)worker;
+    }
+
+    /* Slow path: Search all partitions (needed for fragments)
+     * We need to scan multiple buckets because we don't know the port
+     * But we can limit the scan to a small range for efficiency
+     */
+    for (uint32_t p = 0; p < NAT_NUM_PARTITIONS; p++) {
+        pthread_rwlock_rdlock(&session_table_locks[p]);
+
+        /* Scan a small range of buckets around the base hash
+         * This is safe because port variations will create nearby hashes
+         */
+        for (int offset = 0; offset < 8; offset++) {
+            uint32_t idx = (hash_base + offset) & NAT_SESSION_HASH_MASK;
+            session = session_table[idx];
+
+            while (session) {
+                if (session->inside_ip == inside_ip && session->protocol == protocol) {
+                    pthread_rwlock_unlock(&session_table_locks[p]);
+
+                    /* Release other locks if we held them */
+                    for (uint32_t p2 = 0; p2 < p; p2++) {
+                        pthread_rwlock_unlock(&session_table_locks[p2]);
+                    }
+                    return session;
+                }
+                session = session->next;
+            }
+        }
+
+        pthread_rwlock_unlock(&session_table_locks[p]);
+    }
 
     g_nat_config.stats.session_not_found++;
     return NULL;
@@ -1059,12 +1313,12 @@ void nat_session_delete(struct nat_session *session)
     /* Note: We need to know which worker owns this session.
        Ideally session has a worker_id field or we recompute hash. */
     if (g_num_workers > 1) {
-         uint32_t assigned_worker = get_worker_id(hash_in);
-         if (assigned_worker < NAT_MAX_WORKERS) {
-             struct nat_worker_data *worker = &g_nat_workers[assigned_worker];
-             nat_hash_delete(worker, worker->in2out_hash, hash_in, session->session_index);
-             nat_hash_delete(worker, worker->out2in_hash, hash_out, session->session_index);
-         }
+        uint32_t assigned_worker = get_worker_id(hash_in);
+        if (assigned_worker < NAT_MAX_WORKERS) {
+            struct nat_worker_data *worker = &g_nat_workers[assigned_worker];
+            nat_hash_delete(worker, worker->in2out_hash, hash_in, session->session_index);
+            nat_hash_delete(worker, worker->out2in_hash, hash_out, session->session_index);
+        }
     }
 
     /* Update statistics */
@@ -1081,9 +1335,8 @@ void nat_session_delete(struct nat_session *session)
 
     /* Log event using stored destination from session */
     nat_log_session_event(NAT_EVENT_DELETE, session->inside_ip, session->inside_port,
-                          session->outside_ip, session->outside_port,
-                          session->dest_ip, session->dest_port,
-                          session->protocol, 0, 0);
+                          session->outside_ip, session->outside_port, session->dest_ip,
+                          session->dest_port, session->protocol, 0, 0);
 
     /* Free session memory */
     /* Free session memory */
@@ -1103,28 +1356,43 @@ void nat_session_delete(struct nat_session *session)
  */
 int nat_session_timeout_check(void)
 {
-    static uint32_t current_scan_partition = 0;
-    /* Process ~1.6% of table per call (16 partitions out of 1024)
-     * At 10 calls/sec, full scan takes ~6.4 seconds.
+    /* FIXED: Per-worker timer distribution (lock-free, multi-core)
+     * Each worker checks only its partition range
+     * No global scans, no cross-core contention
      */
-    const uint32_t partitions_to_scan = 16;
+    extern __thread int g_thread_worker_id;
+    int worker_id = g_thread_worker_id;
 
+    if (worker_id < 0 || worker_id >= (int)g_num_workers) {
+        /* Not a NAT worker thread, skip */
+        return 0;
+    }
+
+    /* Each worker gets a portion of partitions based on worker_id */
+    uint32_t partitions_per_worker = NAT_NUM_PARTITIONS / g_num_workers;
+    uint32_t start_partition = worker_id * partitions_per_worker;
+    uint32_t end_partition = (worker_id == g_num_workers - 1)
+                                 ? NAT_NUM_PARTITIONS
+                                 : (worker_id + 1) * partitions_per_worker;
+
+    /* Process only this worker's partitions */
+    const uint32_t partitions_to_scan = 4; /* Smaller batch per call */
     uint64_t now = get_timestamp_cycles();
     int deleted = 0;
 
-    if (unlikely(g_tsc_hz == 0)) init_tsc_freq();
+    if (unlikely(g_tsc_hz == 0))
+        init_tsc_freq();
 
+    /* Scan only our partition range */
     for (uint32_t count = 0; count < partitions_to_scan; count++) {
-        uint32_t p = current_scan_partition++;
-        if (current_scan_partition >= NAT_NUM_PARTITIONS) {
-            current_scan_partition = 0;
-        }
+        /* Round-robin through our partitions */
+        static __thread uint32_t local_scan_idx = 0;
+        uint32_t p = start_partition + (local_scan_idx++ % (end_partition - start_partition));
 
         /* Lock the partition */
         pthread_rwlock_wrlock(&session_table_locks[p]);
 
         /* Iterate all buckets belonging to this partition */
-        /* Since hash mapping is modulo, buckets are strided by NUM_PARTITIONS */
         for (uint32_t i = p; i < NAT_SESSION_TABLE_SIZE; i += NAT_NUM_PARTITIONS) {
             struct nat_session **prev = &session_table[i];
             struct nat_session *session;
@@ -1181,11 +1449,11 @@ int nat_session_timeout_check(void)
                     __atomic_fetch_add(&g_nat_config.stats.sessions_timeout, 1, __ATOMIC_RELAXED);
                     __atomic_fetch_add(&g_nat_config.stats.sessions_deleted, 1, __ATOMIC_RELAXED);
 
-            /* Free the allocated session memory */
+                    /* Free the allocated session memory */
 #ifdef HAVE_DPDK
-             nat_session_free_slab(session);
+                    nat_session_free_slab(session);
 #else
-             free(session);
+                    free(session);
 #endif
                     deleted++;
                 } else {
@@ -1298,7 +1566,8 @@ void nat_print_sessions(void)
                                         : session->protocol == IPPROTO_ICMP ? "ICMP"
                                                                             : "OTHER";
 
-                printf("  %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%s) pkts=%lu/%lu bytes=%lu/%lu age=%u timeout=%d idle=%u flags=%s\n",
+                printf("  %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%s) pkts=%lu/%lu bytes=%lu/%lu age=%u "
+                       "timeout=%d idle=%u flags=%s\n",
                        (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
                        (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF,
                        session->inside_port, (session->outside_ip >> 24) & 0xFF,

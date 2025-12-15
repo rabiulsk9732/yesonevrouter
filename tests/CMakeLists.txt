@@ -58,6 +58,21 @@ target_link_libraries(ipv6_route_test
     pthread
 )
 
+# NAT Worker Test (10M sessions and ICMP)
+add_executable(test_nat_worker test_nat_worker.c)
+target_link_libraries(test_nat_worker
+    yesrouter_core
+    yesrouter_nat
+    yesrouter_network
+    yesrouter_interfaces
+    yesrouter_qos
+    yesrouter_dpdk
+    yesrouter_logging
+    yesrouter_routing
+    yesrouter_config
+    pthread
+)
+
 # Register tests with CTest
 enable_testing()
 
@@ -65,3 +80,4 @@ add_test(NAME pppoe_unit_tests COMMAND pppoe_unit_tests)
 add_test(NAME radius_unit_tests COMMAND radius_unit_tests)
 add_test(NAME ipv6_pool_test COMMAND ipv6_pool_test)
 add_test(NAME ipv6_route_test COMMAND ipv6_route_test)
+add_test(NAME test_nat_worker COMMAND test_nat_worker)

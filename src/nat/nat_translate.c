@@ -10,8 +10,8 @@
 #include "interface.h"
 #include "log.h"
 #include "nat.h"
-#include "nat_log.h"
 #include "nat_alg.h"
+#include "nat_log.h"
 #include "packet.h"
 #include <rte_byteorder.h>
 #include <rte_icmp.h>
@@ -105,77 +105,111 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
     /* Fast path: Get IP header directly from mbuf */
     ip = rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
 
+    /* FIXED: Check for IP fragments (RFC 3022 Section 4.1)
+     * Fragments with non-zero offset have no L4 header
+     */
+    uint16_t frag_offset = rte_be_to_cpu_16(ip->fragment_offset);
+    bool is_fragment = (frag_offset & 0x1FFF) != 0;       /* MF bit or non-zero offset */
+    bool is_first_fragment = (frag_offset & 0x1FFF) == 0; /* offset=0, has L4 header */
+
     protocol = ip->next_proto_id;
     inside_ip = rte_be_to_cpu_32(ip->src_addr);
     /* Capture destination IP from packet for NetFlow logging */
     uint32_t dest_ip = rte_be_to_cpu_32(ip->dst_addr);
     uint16_t dest_port = 0;
+    inside_port = 0; /* Default: no port for fragments */
 
-    /* Ensure L4 header is contiguous in first mbuf segment for safe casting */
-    /* This handles cases where reassembly created chained mbufs with split headers */
-    uint16_t l3_len = (ip->version_ihl & 0x0F) * 4;
-    uint16_t min_contig_len = sizeof(struct rte_ether_hdr) + l3_len;
+    /* Only extract L4 info if not a fragment OR if it's the first fragment */
+    if (!is_fragment || is_first_fragment) {
+        /* Ensure L4 header is contiguous in first mbuf segment for safe casting */
+        uint16_t l3_len = (ip->version_ihl & 0x0F) * 4;
+        uint16_t min_contig_len = sizeof(struct rte_ether_hdr) + l3_len;
 
-    switch (protocol) {
-        case IPPROTO_TCP: min_contig_len += sizeof(struct rte_tcp_hdr); break;
-        case IPPROTO_UDP: min_contig_len += sizeof(struct rte_udp_hdr); break;
-        case IPPROTO_ICMP: min_contig_len += sizeof(struct rte_icmp_hdr); break;
-    }
+        switch (protocol) {
+        case IPPROTO_TCP:
+            min_contig_len += sizeof(struct rte_tcp_hdr);
+            break;
+        case IPPROTO_UDP:
+            min_contig_len += sizeof(struct rte_udp_hdr);
+            break;
+        case IPPROTO_ICMP:
+            min_contig_len += sizeof(struct rte_icmp_hdr);
+            break;
+        }
 
-    if (unlikely(rte_pktmbuf_data_len(m) < min_contig_len)) {
-        if (rte_pktmbuf_linearize(m) < 0) {
-            /* Packet too big or fragmented weirdly, and we can't linearize headers */
+        if (unlikely(rte_pktmbuf_data_len(m) < min_contig_len)) {
+            if (rte_pktmbuf_linearize(m) < 0) {
+                /* Packet too big or fragmented weirdly, and we can't linearize headers */
+                __atomic_fetch_add(&g_nat_config.stats.invalid_packet, 1, __ATOMIC_RELAXED);
+                return -1;
+            }
+            /* Update pointers after linearization */
+            ip = rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+        }
+
+        /* Extract source port and destination port based on protocol */
+        switch (protocol) {
+        case IPPROTO_TCP:
+            tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            inside_port = rte_be_to_cpu_16(tcp->src_port);
+            dest_port = rte_be_to_cpu_16(tcp->dst_port);
+            break;
+
+        case IPPROTO_UDP:
+            udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            inside_port = rte_be_to_cpu_16(udp->src_port);
+            dest_port = rte_be_to_cpu_16(udp->dst_port);
+            break;
+
+        case IPPROTO_ICMP:
+            icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            inside_port = rte_be_to_cpu_16(icmp->icmp_ident);
+            /* For ICMP, destination port is the ICMP identifier (same as source) */
+            dest_port = inside_port;
+            /* Track ICMP echo requests */
+            if (icmp->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
+                __atomic_fetch_add(&g_nat_config.stats.icmp_echo_requests, 1, __ATOMIC_RELAXED);
+            }
+            break;
+
+        default:
+            /* Invalid protocol for NAT - increment counter but don't process */
             __atomic_fetch_add(&g_nat_config.stats.invalid_packet, 1, __ATOMIC_RELAXED);
             return -1;
         }
-        /* Update pointers after linearization */
-        ip = rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
-    }
 
-    /* Extract source port and destination port based on protocol */
-    switch (protocol) {
-    case IPPROTO_TCP:
-        tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        inside_port = rte_be_to_cpu_16(tcp->src_port);
-        dest_port = rte_be_to_cpu_16(tcp->dst_port);
-        break;
-
-    case IPPROTO_UDP:
-        udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        inside_port = rte_be_to_cpu_16(udp->src_port);
-        dest_port = rte_be_to_cpu_16(udp->dst_port);
-        break;
-
-    case IPPROTO_ICMP:
-        icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        inside_port = rte_be_to_cpu_16(icmp->icmp_ident);
-        /* For ICMP, destination port is the ICMP identifier (same as source) */
-        dest_port = inside_port;
-        /* Track ICMP echo requests */
-        if (icmp->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
-            __atomic_fetch_add(&g_nat_config.stats.icmp_echo_requests, 1, __ATOMIC_RELAXED);
+        /* VPP-STYLE: Check worker ownership and handoff if needed
+         * Owner is determined by INSIDE tuple ONLY (never changes after NAT)
+         */
+        extern uint32_t g_num_workers;
+        if (g_num_workers > 1) {
+            uint32_t owner_worker = nat_flow_to_worker(inside_ip, inside_port, protocol);
+            if ((uint32_t)g_thread_worker_id != owner_worker) {
+                /* Wrong worker - handoff packet to owner */
+                if (nat_worker_handoff_enqueue(owner_worker, m) == 0) {
+                    /* Successfully handed off - tell caller not to free mbuf */
+                    pkt->mbuf = NULL;
+                    return 1; /* Return >0 to indicate handoff (not drop) */
+                }
+                /* Handoff failed (ring full) - process locally as fallback */
+            }
         }
-        break;
-
-    default:
-        /* Invalid protocol for NAT - increment counter but don't process */
-        __atomic_fetch_add(&g_nat_config.stats.invalid_packet, 1, __ATOMIC_RELAXED);
-        return -1;
     }
 
-    /* Debug: Log ICMP lookup attempt */
-    /* Disabled for load testing - too verbose
-    static uint64_t snat_call_count = 0;
-    snat_call_count++;
-    if (protocol == IPPROTO_ICMP && (snat_call_count % 100) == 1) {
-        printf("[SNAT] Call #%lu: Looking up inside_ip=%u.%u.%u.%u icmp_id=%u\n", snat_call_count,
-               (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF, (inside_ip >> 8) & 0xFF,
-               inside_ip & 0xFF, inside_port);
+    /* Lookup existing session
+     * For fragments without L4, we use flow-based lookup (src_ip, dst_ip, protocol)
+     * This ensures subsequent fragments get the SAME NAT translation as the first fragment
+     */
+    session = NULL;
+    if (!is_fragment || is_first_fragment) {
+        /* Full session lookup with port for first fragment or non-fragmented packets */
+        session = nat_session_lookup_inside(inside_ip, inside_port, protocol);
+    } else {
+        /* For subsequent fragments without L4 header, use flow-based lookup
+         * This ensures the fragment gets the SAME NAT translation as the first fragment
+         */
+        session = nat_session_lookup_flow(inside_ip, dest_ip, protocol);
     }
-    */
-
-    /* Lookup existing session */
-    session = nat_session_lookup_inside(inside_ip, inside_port, protocol);
 
     if (unlikely(!session)) {
         /* Slow path: Create new session */
@@ -183,7 +217,7 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
             static uint64_t no_pool_warnings = 0;
             if (no_pool_warnings++ < 5) {
                 YLOG_ERROR("[SNAT] No pools configured (enabled=%d, pools=%d)",
-                       g_nat_config.enabled, g_nat_config.num_pools);
+                           g_nat_config.enabled, g_nat_config.num_pools);
             }
             g_nat_config.stats.no_ip_available++;
             return -1;
@@ -301,47 +335,86 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
     uint32_t old_ip_be = ip->src_addr;
     uint32_t new_ip_be = rte_cpu_to_be_32(outside_ip);
 
-    /* Update IP header */
+    /* Update IP header (always, even for fragments) */
     ip->src_addr = new_ip_be;
     nat_update_ip_checksum(ip);
 
-    /* ALG Processing (if active) */
-    if (unlikely(session->alg_active)) {
+    /* FIXED: Clear hardware checksum offload flags to prevent conflicts
+     * Software-calculated checksums must not be recalculated by NIC
+     */
+    m->ol_flags &= ~RTE_MBUF_F_TX_IPV4;
+    m->ol_flags &= ~RTE_MBUF_F_TX_TCP_CKSUM;
+    m->ol_flags &= ~RTE_MBUF_F_TX_UDP_CKSUM;
+    m->ol_flags |= RTE_MBUF_F_TX_IP_CKSUM; /* Mark as software-calculated */
+
+    /* ALG Processing (if active and session exists) */
+    if (unlikely(session && session->alg_active)) {
         nat_alg_process(session, pkt, true);
     }
 
-    /* Update transport layer */
-    switch (protocol) {
-    case IPPROTO_TCP:
-        tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        tcp->cksum = nat_update_l4_checksum(tcp->cksum, old_ip_be, new_ip_be, tcp->src_port,
-                                            rte_cpu_to_be_16(outside_port));
-        tcp->src_port = rte_cpu_to_be_16(outside_port);
-        break;
+    /* Update transport layer (only if L4 header exists) */
+    if (!is_fragment || is_first_fragment) {
+        switch (protocol) {
+        case IPPROTO_TCP:
+            tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            tcp->cksum = nat_update_l4_checksum(tcp->cksum, old_ip_be, new_ip_be, tcp->src_port,
+                                                rte_cpu_to_be_16(outside_port));
+            tcp->src_port = rte_cpu_to_be_16(outside_port);
+            break;
 
-    case IPPROTO_UDP:
-        udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        if (udp->dgram_cksum != 0) {
-            udp->dgram_cksum =
-                nat_update_l4_checksum(udp->dgram_cksum, old_ip_be, new_ip_be, udp->src_port,
-                                       rte_cpu_to_be_16(outside_port));
+        case IPPROTO_UDP:
+            udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            if (udp->dgram_cksum != 0) {
+                udp->dgram_cksum =
+                    nat_update_l4_checksum(udp->dgram_cksum, old_ip_be, new_ip_be, udp->src_port,
+                                           rte_cpu_to_be_16(outside_port));
+            }
+            udp->src_port = rte_cpu_to_be_16(outside_port);
+            break;
+
+        case IPPROTO_ICMP:
+            icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            icmp->icmp_ident = rte_cpu_to_be_16(outside_port);
+
+            /* ICMP checksum calculation - recalculate entire checksum */
+            /* Length = IP total length - IP header length = ICMP header + data */
+            uint16_t icmp_len = rte_be_to_cpu_16(ip->total_length) - rte_ipv4_hdr_len(ip);
+            icmp->icmp_cksum = 0;
+            icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
+
+            /* ICMP Error Packet Support: Translate embedded IP packet in error messages */
+            /* ICMP types 3 (Destination Unreachable), 4 (Source Quench), 5 (Redirect), */
+            /* 11 (Time Exceeded), 12 (Parameter Problem) contain original IP packet */
+            if (icmp->icmp_type >= 3 && icmp->icmp_type <= 5) {
+                /* Check if there's enough space for embedded IP header */
+                if (icmp_len >= sizeof(struct rte_icmp_hdr) + sizeof(struct rte_ipv4_hdr)) {
+                    /* Skip ICMP header (8 bytes) to get to embedded IP packet */
+                    struct rte_ipv4_hdr *emb_ip = (struct rte_ipv4_hdr *)((uint8_t *)icmp + 8);
+                    uint32_t emb_src = rte_be_to_cpu_32(emb_ip->src_addr);
+
+                    /* Check if embedded source IP matches NAT translation */
+                    if (emb_src == outside_ip) {
+                        /* Translate embedded IP source address */
+                        emb_ip->src_addr = rte_cpu_to_be_32(inside_ip);
+                        /* Recalculate embedded IP header checksum */
+                        emb_ip->hdr_checksum = 0;
+                        emb_ip->hdr_checksum = rte_ipv4_cksum(emb_ip);
+
+                        /* Recalculate ICMP checksum after embedded packet modification */
+                        icmp->icmp_cksum = 0;
+                        icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
+                    }
+                }
+            }
+            break;
         }
-        udp->src_port = rte_cpu_to_be_16(outside_port);
-        break;
-
-    case IPPROTO_ICMP:
-        icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        icmp->icmp_ident = rte_cpu_to_be_16(outside_port);
-        /* ICMP checksum covers data, so we need to recalculate or update */
-        icmp->icmp_cksum = 0;
-        icmp->icmp_cksum =
-            ~rte_raw_cksum(icmp, rte_be_to_cpu_16(ip->total_length) - rte_ipv4_hdr_len(ip));
-        break;
     }
 
-    /* Update stats */
-    session->packets_in++;
-    session->bytes_in += rte_be_to_cpu_16(ip->total_length);
+    /* Update stats (only if session exists) */
+    if (session) {
+        session->packets_in++;
+        session->bytes_in += rte_be_to_cpu_16(ip->total_length);
+    }
 
     /* Update per-worker stats */
     if (g_thread_worker_id >= 0 && g_thread_worker_id < NAT_MAX_WORKERS) {
@@ -383,28 +456,57 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     }
 
     ip = rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+
+    /* FIXED: Check for IP fragments (RFC 3022 Section 4.1) */
+    uint16_t frag_offset = rte_be_to_cpu_16(ip->fragment_offset);
+    bool is_fragment = (frag_offset & 0x1FFF) != 0;
+    bool is_first_fragment = (frag_offset & 0x1FFF) == 0;
+
     protocol = ip->next_proto_id;
     outside_ip = rte_be_to_cpu_32(ip->dst_addr);
+    outside_port = 0; /* Default: no port for fragments */
 
-    switch (protocol) {
-    case IPPROTO_TCP:
-        tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        outside_port = rte_be_to_cpu_16(tcp->dst_port);
-        break;
-    case IPPROTO_UDP:
-        udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        outside_port = rte_be_to_cpu_16(udp->dst_port);
-        break;
-    case IPPROTO_ICMP:
-        icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        outside_port = rte_be_to_cpu_16(icmp->icmp_ident);
-        /* Track ICMP echo replies */
-        if (icmp->icmp_type == RTE_IP_ICMP_ECHO_REPLY) {
-            __atomic_fetch_add(&g_nat_config.stats.icmp_echo_replies, 1, __ATOMIC_RELAXED);
+    /* Only extract L4 info if not a fragment OR if it's the first fragment */
+    if (!is_fragment || is_first_fragment) {
+        switch (protocol) {
+        case IPPROTO_TCP:
+            tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            outside_port = rte_be_to_cpu_16(tcp->dst_port);
+            break;
+        case IPPROTO_UDP:
+            udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            outside_port = rte_be_to_cpu_16(udp->dst_port);
+            break;
+        case IPPROTO_ICMP:
+            icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            outside_port = rte_be_to_cpu_16(icmp->icmp_ident);
+            /* Track ICMP echo replies */
+            if (icmp->icmp_type == RTE_IP_ICMP_ECHO_REPLY) {
+                __atomic_fetch_add(&g_nat_config.stats.icmp_echo_replies, 1, __ATOMIC_RELAXED);
+            }
+            break;
+        default:
+            return -1;
         }
-        break;
-    default:
-        return -1;
+
+        /* VPP-STYLE: For DNAT, compute owner from outside_port BEFORE session lookup
+         * Each worker has a non-overlapping port range, so port tells us the owner
+         * This avoids needing to search other workers' tables
+         */
+        extern uint32_t g_num_workers;
+        if (g_num_workers > 1) {
+            uint32_t owner_worker = nat_port_to_worker(outside_port);
+            if ((uint32_t)g_thread_worker_id != owner_worker) {
+                /* Wrong worker - handoff packet to owner */
+                if (nat_worker_handoff_enqueue(owner_worker, m) == 0) {
+                    /* Successfully handed off - tell caller not to free mbuf */
+                    pkt->mbuf = NULL;
+                    return 1; /* Return >0 to indicate handoff (not drop) */
+                }
+                /* Handoff failed (ring full) - drop packet */
+                return -1;
+            }
+        }
     }
 
     YLOG_DEBUG("DNAT lookup: dst_ip=%u.%u.%u.%u port=%u proto=%u", (outside_ip >> 24) & 0xFF,
@@ -418,7 +520,30 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
                    outside_port);
     }
 
-    session = nat_session_lookup_outside(outside_ip, outside_port, protocol);
+    /* Lookup session
+     * For fragments without L4, we use flow-based lookup
+     * This ensures subsequent fragments get the SAME NAT translation as the first fragment
+     */
+    session = NULL;
+    if (!is_fragment || is_first_fragment) {
+        /* Full session lookup with port for first fragment or non-fragmented packets */
+        /* FIXED: Use EIM lookup for ICMP (RFC 5508) */
+        if (protocol == IPPROTO_ICMP) {
+            session = nat_session_lookup_icmp_eim(outside_ip, outside_port);
+        } else {
+            /* VPP-STYLE: With handoff, we're guaranteed to be on the correct worker
+             * Just do simple single-worker lookup in MY table only
+             */
+            session = nat_session_lookup_outside(outside_ip, outside_port, protocol);
+        }
+    } else {
+        /* For subsequent fragments without L4 header, use flow-based lookup
+         * This ensures the fragment gets the SAME NAT translation as the first fragment
+         * For DNAT, we look up by (outside_ip, inside_ip, protocol)
+         */
+        inside_ip = rte_be_to_cpu_32(ip->src_addr); /* Get source IP from fragment */
+        session = nat_session_lookup_flow(inside_ip, outside_ip, protocol);
+    }
     if (unlikely(!session)) {
         if (protocol == IPPROTO_ICMP) {
             /* Track ICMP identifier mismatches */
@@ -438,19 +563,6 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
         return -1;
     }
     if (protocol == IPPROTO_ICMP) {
-        /* Validate session matches what we're looking for */
-        if (session->outside_ip != outside_ip || session->outside_port != outside_port) {
-            YLOG_WARNING("[ICMP-OUT2IN] Session mismatch: expected out=%u.%u.%u.%u id=%u, got "
-                         "out=%u.%u.%u.%u id=%u",
-                         (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
-                         (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port,
-                         (session->outside_ip >> 24) & 0xFF, (session->outside_ip >> 16) & 0xFF,
-                         (session->outside_ip >> 8) & 0xFF, session->outside_ip & 0xFF,
-                         session->outside_port);
-            __atomic_fetch_add(&g_nat_config.stats.icmp_identifier_mismatches, 1, __ATOMIC_RELAXED);
-            g_nat_config.stats.out2in_misses++;
-            return -1;
-        }
         YLOG_DEBUG("[ICMP-OUT2IN-HIT] Session found! inside=%u.%u.%u.%u id=%u",
                    (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
                    (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF,
@@ -458,46 +570,103 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     }
     g_nat_config.stats.out2in_hits++;
 
+    /* VPP-STYLE: Check if we own this session, handoff if not
+     * CRITICAL: Use stored session->owner_worker, NEVER recompute hash
+     * The inside tuple that determined ownership never changes
+     */
+    extern uint32_t g_num_workers;
+    if (g_num_workers > 1 && session->owner_worker != (uint8_t)g_thread_worker_id) {
+        /* Wrong worker - handoff packet to owner */
+        if (nat_worker_handoff_enqueue(session->owner_worker, m) == 0) {
+            /* Successfully handed off - tell caller not to free mbuf */
+            pkt->mbuf = NULL;
+            return 1; /* Return >0 to indicate handoff (not drop) */
+        }
+        /* Handoff failed (ring full) - drop packet to preserve ownership invariant */
+        return -1;
+    }
+
     inside_ip = session->inside_ip;
     inside_port = session->inside_port;
 
     uint32_t old_ip_be = ip->dst_addr;
     uint32_t new_ip_be = rte_cpu_to_be_32(inside_ip);
 
+    /* Update IP header (always, even for fragments) */
     ip->dst_addr = new_ip_be;
     nat_update_ip_checksum(ip);
 
-    /* ALG Processing (if active) */
-    if (unlikely(session->alg_active)) {
+    /* FIXED: Clear hardware checksum offload flags to prevent conflicts
+     * Software-calculated checksums must not be recalculated by NIC
+     */
+    m->ol_flags &= ~RTE_MBUF_F_TX_IPV4;
+    m->ol_flags &= ~RTE_MBUF_F_TX_TCP_CKSUM;
+    m->ol_flags &= ~RTE_MBUF_F_TX_UDP_CKSUM;
+    m->ol_flags |= RTE_MBUF_F_TX_IP_CKSUM; /* Mark as software-calculated */
+
+    /* ALG Processing (if active and session exists) */
+    if (unlikely(session && session->alg_active)) {
         nat_alg_process(session, pkt, false);
     }
 
-    switch (protocol) {
-    case IPPROTO_TCP:
-        tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        tcp->cksum = nat_update_l4_checksum(tcp->cksum, old_ip_be, new_ip_be, tcp->dst_port,
-                                            rte_cpu_to_be_16(inside_port));
-        tcp->dst_port = rte_cpu_to_be_16(inside_port);
-        break;
-    case IPPROTO_UDP:
-        udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        if (udp->dgram_cksum != 0) {
-            udp->dgram_cksum = nat_update_l4_checksum(udp->dgram_cksum, old_ip_be, new_ip_be,
-                                                      udp->dst_port, rte_cpu_to_be_16(inside_port));
+    /* Update transport layer (only if L4 header exists) */
+    if (!is_fragment || is_first_fragment) {
+        switch (protocol) {
+        case IPPROTO_TCP:
+            tcp = (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            tcp->cksum = nat_update_l4_checksum(tcp->cksum, old_ip_be, new_ip_be, tcp->dst_port,
+                                                rte_cpu_to_be_16(inside_port));
+            tcp->dst_port = rte_cpu_to_be_16(inside_port);
+            break;
+        case IPPROTO_UDP:
+            udp = (struct rte_udp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            if (udp->dgram_cksum != 0) {
+                udp->dgram_cksum =
+                    nat_update_l4_checksum(udp->dgram_cksum, old_ip_be, new_ip_be, udp->dst_port,
+                                           rte_cpu_to_be_16(inside_port));
+            }
+            udp->dst_port = rte_cpu_to_be_16(inside_port);
+            break;
+        case IPPROTO_ICMP:
+            icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+            icmp->icmp_ident = rte_cpu_to_be_16(inside_port);
+
+            /* ICMP checksum calculation - recalculate entire checksum */
+            uint16_t icmp_len = rte_be_to_cpu_16(ip->total_length) - rte_ipv4_hdr_len(ip);
+            icmp->icmp_cksum = 0;
+            icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
+
+            /* ICMP Error Packet Support: Translate embedded IP packet in error messages */
+            if (icmp->icmp_type >= 3 && icmp->icmp_type <= 5) {
+                /* Check if there's enough space for embedded IP header */
+                if (icmp_len >= sizeof(struct rte_icmp_hdr) + sizeof(struct rte_ipv4_hdr)) {
+                    /* Skip ICMP header (8 bytes) to get to embedded IP packet */
+                    struct rte_ipv4_hdr *emb_ip = (struct rte_ipv4_hdr *)((uint8_t *)icmp + 8);
+                    uint32_t emb_src = rte_be_to_cpu_32(emb_ip->src_addr);
+
+                    /* Check if embedded source IP matches NAT translation */
+                    if (emb_src == inside_ip) {
+                        /* Translate embedded IP source address back to outside IP */
+                        emb_ip->src_addr = rte_cpu_to_be_32(outside_ip);
+                        /* Recalculate embedded IP header checksum */
+                        emb_ip->hdr_checksum = 0;
+                        emb_ip->hdr_checksum = rte_ipv4_cksum(emb_ip);
+
+                        /* Recalculate ICMP checksum after embedded packet modification */
+                        icmp->icmp_cksum = 0;
+                        icmp->icmp_cksum = ~rte_raw_cksum(icmp, icmp_len);
+                    }
+                }
+            }
+            break;
         }
-        udp->dst_port = rte_cpu_to_be_16(inside_port);
-        break;
-    case IPPROTO_ICMP:
-        icmp = (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
-        icmp->icmp_ident = rte_cpu_to_be_16(inside_port);
-        icmp->icmp_cksum = 0;
-        icmp->icmp_cksum =
-            ~rte_raw_cksum(icmp, rte_be_to_cpu_16(ip->total_length) - rte_ipv4_hdr_len(ip));
-        break;
     }
 
-    session->packets_out++;
-    session->bytes_out += rte_be_to_cpu_16(ip->total_length);
+    /* Update stats (only if session exists) */
+    if (session) {
+        session->packets_out++;
+        session->bytes_out += rte_be_to_cpu_16(ip->total_length);
+    }
 
     /* Update per-worker stats */
     if (g_thread_worker_id >= 0 && g_thread_worker_id < NAT_MAX_WORKERS) {

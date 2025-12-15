@@ -27,6 +27,9 @@
 #include <string.h>
 #include <sys/time.h>
 
+/* Access to NAT worker count - needed for worker affinity check */
+extern uint32_t g_num_workers;
+
 /* Access NAT config for debugging */
 extern struct nat_config g_nat_config;
 #include <arpa/inet.h>
@@ -753,7 +756,122 @@ static void process_ipv4(struct pkt_buf *pkt)
         return;
     }
 
-    /* Try reassembly first */
+    struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
+    if (!iface) {
+        return;
+    }
+
+    /* FIXED: Apply NAT BEFORE reassembly to handle fragments
+     * RFC 3022 Section 4.1: NAT must translate fragments
+     * Lock-free: Each fragment goes to same worker via RSS
+     */
+#ifdef HAVE_DPDK
+    if (nat_is_enabled() && (iface->config.nat_inside || iface->config.nat_outside)) {
+        struct rte_mbuf *m = pkt->mbuf;
+        struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
+        struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(pkt->data + sizeof(struct rte_ether_hdr));
+        uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
+        uint32_t dst_ip = rte_be_to_cpu_32(ip->dst_addr);
+
+        /* FIXED: Check both directions for asymmetric routing
+         * Determine translation direction based on IP addresses, not just interface
+         */
+        bool src_is_private = ((src_ip & 0xFF000000) == 0x0A000000) || /* 10.0.0.0/8 */
+                              ((src_ip & 0xFFF00000) == 0xAC100000) || /* 172.16.0.0/12 */
+                              ((src_ip & 0xFFFF0000) == 0xC0A80000);   /* 192.168.0.0/16 */
+
+        bool dst_is_private = ((dst_ip & 0xFF000000) == 0x0A000000) ||
+                              ((dst_ip & 0xFFF00000) == 0xAC100000) ||
+                              ((dst_ip & 0xFFFF0000) == 0xC0A80000);
+
+        /* Check if this is a fragment */
+        uint16_t frag_offset = rte_be_to_cpu_16(ip->fragment_offset);
+        bool is_fragment = (frag_offset & 0x1FFF) != 0; /* MF bit or non-zero offset */
+
+        /* Apply NAT based on translation direction (not just interface) */
+        if (src_is_private && !dst_is_private) {
+            /* SNAT: Private → Public (inside to outside) */
+            int nat_result = nat_translate_snat(pkt, iface);
+            if (nat_result < 0 && !is_fragment) {
+                /* Drop non-fragment if NAT fails */
+                return;
+            }
+        } else if (!src_is_private && dst_is_private) {
+            /* DNAT: Public → Private (outside to inside) */
+            int nat_result = nat_translate_dnat(pkt, iface);
+            if (nat_result < 0 && !is_fragment) {
+                return;
+            }
+        } else if (iface->config.nat_inside && src_is_private) {
+            /* Fallback: Interface-based NAT for inside interface */
+            int nat_result = nat_translate_snat(pkt, iface);
+            if (nat_result < 0 && !is_fragment) {
+                return;
+            }
+        } else if (iface->config.nat_outside && dst_is_private) {
+            /* Fallback: Interface-based NAT for outside interface */
+            int nat_result = nat_translate_dnat(pkt, iface);
+            if (nat_result < 0 && !is_fragment) {
+                return;
+            }
+        }
+
+        /* FIXED: Worker Affinity Check for RSS Consistency
+         * RSS may send forward/reverse packets to different workers
+         * Ensure packets go to the worker that owns the NAT session
+         */
+        struct nat_session *session = NULL;
+        uint16_t l4_port = 0;
+        uint8_t proto = ip->next_proto_id;
+
+        /* Extract ports if not a fragment */
+        if (!is_fragment || (rte_be_to_cpu_16(ip->fragment_offset) & 0x1FFF) == 0) {
+            if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+                struct rte_tcp_hdr *tcp_hdr =
+                    (struct rte_tcp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+                l4_port = rte_be_to_cpu_16(tcp_hdr->dst_port);
+            } else if (proto == IPPROTO_ICMP) {
+                struct rte_icmp_hdr *icmp_hdr =
+                    (struct rte_icmp_hdr *)((uint8_t *)ip + rte_ipv4_hdr_len(ip));
+                l4_port = rte_be_to_cpu_16(icmp_hdr->icmp_ident);
+            }
+        }
+
+        /* Lookup session to get worker affinity */
+        if (!is_fragment) {
+            if (src_is_private && !dst_is_private) {
+                /* SNAT - lookup by outside (translated) */
+                session = nat_session_lookup_outside(dst_ip, l4_port, proto);
+            } else if (!src_is_private && dst_is_private) {
+                /* DNAT - lookup by outside (translated) */
+                session = nat_session_lookup_outside(src_ip, l4_port, proto);
+            }
+        }
+
+        /* Check worker affinity and handoff if needed */
+        if (session && g_num_nat_workers > 1) {
+            /* VPP-STYLE: Use stored owner_worker, NEVER recompute hash
+             * The owner was determined at session creation using inside tuple
+             */
+            uint32_t expected_worker = session->owner_worker;
+            extern __thread int g_thread_worker_id;
+            int current_worker = g_thread_worker_id;
+
+            if (current_worker >= 0 && current_worker != (int)expected_worker) {
+                /* Wrong worker! Handoff to correct worker */
+                int ret = nat_worker_handoff_enqueue(expected_worker, pkt->mbuf);
+                if (ret == 0) {
+                    /* Successfully enqueued - don't process this packet */
+                    return;
+                }
+                /* If handoff fails (ring full), continue processing on this worker */
+                /* This is acceptable - packet will be processed, just not ideal */
+            }
+        }
+    }
+#endif
+
+    /* Try reassembly after NAT (handles both translated and non-translated) */
     struct pkt_buf *reassembled = NULL;
     int result = ip_reassembly_process(pkt, &reassembled);
 
@@ -768,12 +886,22 @@ static void process_ipv4(struct pkt_buf *pkt)
 
     /* result == 1: Complete packet (possibly reassembled) */
     pkt = reassembled;
-    struct interface *iface = interface_find_by_index(pkt->meta.ingress_ifindex);
-    if (!iface) {
-        return;
-    }
 
 #ifdef HAVE_DPDK
+    /* Apply post-reassembly NAT if needed (for fragments that arrived after session creation) */
+    if (nat_is_enabled() && (iface->config.nat_inside || iface->config.nat_outside)) {
+        /* Fragment already translated? Check and skip if so */
+        struct rte_mbuf *m = pkt->mbuf;
+        if (m && !(m->ol_flags & RTE_MBUF_F_TX_IP_CKSUM)) {
+            /* Not translated yet - do it now */
+            if (iface->config.nat_inside) {
+                nat_translate_snat(pkt, iface);
+            } else if (iface->config.nat_outside) {
+                nat_translate_dnat(pkt, iface);
+            }
+        }
+    }
+
     /* NAT44 HAIRPIN: Private IP -> NAT -> Same port back (for testing) */
     if (nat_is_enabled()) {
         struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
@@ -786,36 +914,24 @@ static void process_ipv4(struct pkt_buf *pkt)
                           ((src_ip & 0xFFFF0000) == 0xC0A80000);
 
         if (is_private) {
-            /* Apply SNAT translation */
-            int nat_result = nat_translate_snat(pkt, iface);
-            if (nat_result == 0) {
-                /* NAT successful - HAIRPIN: swap MACs and send back same port */
-                struct rte_ether_addr tmp_mac;
-                rte_ether_addr_copy(&eth->src_addr, &tmp_mac);
-                rte_ether_addr_copy(&eth->dst_addr, &eth->src_addr);
-                rte_ether_addr_copy(&tmp_mac, &eth->dst_addr);
+            /* NAT already applied above - just forward */
+            /* Decrement TTL */
+            ip->time_to_live--;
+            ip->hdr_checksum = 0;
+            ip->hdr_checksum = rte_ipv4_cksum(ip);
 
-                /* Decrement TTL */
-                ip->time_to_live--;
-                ip->hdr_checksum = 0;
-                ip->hdr_checksum = rte_ipv4_cksum(ip);
-
-                /* BATCHED HAIRPIN: Enqueue to per-thread TX buffer (CARRIER-GRADE) */
-                struct rte_mbuf *m = pkt->mbuf;
-                if (m) {
-                    uint16_t tx_port = m->port; /* Use ingress port for egress */
-                    uint16_t tx_queue = g_thread_queue_id % env_get_tx_queues();
-                    tx_enqueue(tx_port, tx_queue, m);
-                    g_fwd_stats.packets_forwarded++;
-                    g_fwd_stats.bytes_forwarded += pkt->len;
-                    pkt->mbuf = NULL; /* Mbuf ownership transferred to TX buffer */
-                    return;
-                }
-                /* No mbuf, fall through to drop */
+            /* BATCHED HAIRPIN: Enqueue to per-thread TX buffer (CARRIER-GRADE) */
+            struct rte_mbuf *m = pkt->mbuf;
+            if (m) {
+                uint16_t tx_port = m->port; /* Use ingress port for egress */
+                uint16_t tx_queue = g_thread_queue_id % env_get_tx_queues();
+                tx_enqueue(tx_port, tx_queue, m);
+                g_fwd_stats.packets_forwarded++;
+                g_fwd_stats.bytes_forwarded += pkt->len;
+                pkt->mbuf = NULL; /* Mbuf ownership transferred to TX buffer */
+                return;
             }
-            /* NAT failed - drop packet for private IPs */
-            g_fwd_stats.packets_dropped_no_route++;
-            return;
+            /* No mbuf, fall through to drop */
         }
     }
 #endif
@@ -825,7 +941,8 @@ static void process_ipv4(struct pkt_buf *pkt)
     if (pkt->meta.protocol == IPPROTO_UDP) {
         struct rte_ether_hdr *eth_r = (struct rte_ether_hdr *)pkt->data;
         struct rte_ipv4_hdr *ip_r = (struct rte_ipv4_hdr *)(eth_r + 1);
-        struct rte_udp_hdr *udp_r = (struct rte_udp_hdr *)((uint8_t *)ip_r + (ip_r->version_ihl & 0x0F) * 4);
+        struct rte_udp_hdr *udp_r =
+            (struct rte_udp_hdr *)((uint8_t *)ip_r + (ip_r->version_ihl & 0x0F) * 4);
         uint16_t src_port = rte_be_to_cpu_16(udp_r->src_port);
 
         if (src_port == 1812 || src_port == 1813) {
@@ -836,8 +953,8 @@ static void process_ipv4(struct pkt_buf *pkt)
             extern void radius_lockless_process_dpdk_response(uint8_t *data, uint16_t len);
             YLOG_INFO("RADIUS response intercepted from %u.%u.%u.%u:%d len=%d",
                       (pkt->meta.src_ip >> 24) & 0xFF, (pkt->meta.src_ip >> 16) & 0xFF,
-                      (pkt->meta.src_ip >> 8) & 0xFF, pkt->meta.src_ip & 0xFF,
-                      src_port, radius_len);
+                      (pkt->meta.src_ip >> 8) & 0xFF, pkt->meta.src_ip & 0xFF, src_port,
+                      radius_len);
             radius_lockless_process_dpdk_response(radius_data, radius_len);
             return;
         }
@@ -961,7 +1078,8 @@ static void process_ipv4(struct pkt_buf *pkt)
             /* Check for RADIUS response (from port 1812) */
             struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt->data;
             struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-            struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((uint8_t *)ip + (ip->version_ihl & 0x0F) * 4);
+            struct rte_udp_hdr *udp =
+                (struct rte_udp_hdr *)((uint8_t *)ip + (ip->version_ihl & 0x0F) * 4);
             uint16_t src_port = rte_be_to_cpu_16(udp->src_port);
 
             if (src_port == 1812 || src_port == 1813) {
@@ -1029,7 +1147,8 @@ void packet_rx_process_packet(struct pkt_buf *pkt)
     if (pkt->meta.l3_type == PKT_L3_IPV4 && pkt->meta.protocol == IPPROTO_UDP) {
         struct rte_ether_hdr *eth_chk = (struct rte_ether_hdr *)pkt->data;
         struct rte_ipv4_hdr *ip_chk = (struct rte_ipv4_hdr *)(eth_chk + 1);
-        struct rte_udp_hdr *udp_chk = (struct rte_udp_hdr *)((uint8_t *)ip_chk + (ip_chk->version_ihl & 0x0F) * 4);
+        struct rte_udp_hdr *udp_chk =
+            (struct rte_udp_hdr *)((uint8_t *)ip_chk + (ip_chk->version_ihl & 0x0F) * 4);
         uint16_t src_port = rte_be_to_cpu_16(udp_chk->src_port);
 
         if (src_port == 1812 || src_port == 1813) {
@@ -1126,9 +1245,25 @@ static void *rx_thread_func(void *arg)
             nat_ip = ntohl(wan->config.ipv4_addr.s_addr);
         }
     }
-    nat_worker_port_pool_init(worker_id, nat_ip, 1024, 65535);
-    YLOG_INFO("[NAT] Worker %d: NAT IP pool initialized (IP=%u.%u.%u.%u)", worker_id,
-              (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF, (nat_ip >> 8) & 0xFF, nat_ip & 0xFF);
+
+    /* VPP-STYLE: Allocate NON-OVERLAPPING port blocks per worker
+     * This allows DNAT to determine session owner from outside_port alone
+     * Total usable ports: 65535 - 1024 = 64511
+     * With 8 workers, each gets ~8000 ports
+     */
+    extern uint32_t g_num_workers;
+    uint16_t total_ports = 65535 - 1024;
+    uint16_t ports_per_worker = total_ports / (g_num_workers > 0 ? g_num_workers : 1);
+    uint16_t port_min = 1024 + (worker_id * ports_per_worker);
+    uint16_t port_max = port_min + ports_per_worker - 1;
+    if (worker_id == (int)(g_num_workers - 1)) {
+        port_max = 65535; /* Last worker gets remainder */
+    }
+
+    nat_worker_port_pool_init(worker_id, nat_ip, port_min, port_max);
+    YLOG_INFO("[NAT] Worker %d: NAT port range %u-%u (IP=%u.%u.%u.%u)", worker_id, port_min,
+              port_max, (nat_ip >> 24) & 0xFF, (nat_ip >> 16) & 0xFF, (nat_ip >> 8) & 0xFF,
+              nat_ip & 0xFF);
 #endif
 
     /* Main loop - DPDK DIRECT FAST PATH */
@@ -1172,17 +1307,54 @@ static void *rx_thread_func(void *arg)
 
             /* Poll lockless RADIUS responses - distribute across workers using modulo */
             /* Each worker polls at offset intervals to spread the load */
-            if ((poll_count & 0x3F) == (uint64_t)worker_id) { /* Each worker polls every 64 iterations, staggered */
+            if ((poll_count & 0x3F) ==
+                (uint64_t)worker_id) { /* Each worker polls every 64 iterations, staggered */
                 extern unsigned int radius_lockless_poll_responses(
-                    struct radius_auth_response **responses, unsigned int max);
-                extern void radius_lockless_free_response(struct radius_auth_response *resp);
-                extern void pppoe_handle_radius_response(struct radius_auth_response *resp);
+                    struct radius_auth_response * *responses, unsigned int max);
+                extern void radius_lockless_free_response(struct radius_auth_response * resp);
+                extern void pppoe_handle_radius_response(struct radius_auth_response * resp);
 
                 struct radius_auth_response *resps[8];
                 unsigned int n = radius_lockless_poll_responses(resps, 8);
                 for (unsigned int r = 0; r < n; r++) {
                     pppoe_handle_radius_response(resps[r]);
                     radius_lockless_free_response(resps[r]);
+                }
+            }
+
+            /* VPP-STYLE: Process packets handed off from other workers FIRST
+             * This is critical - without this, handoff rings fill up and packets are lost!
+             */
+            {
+                extern uint16_t nat_worker_handoff_dequeue(
+                    uint32_t worker_id, struct rte_mbuf **pkts, uint16_t max_pkts);
+                extern uint16_t nat_process_burst_dpdk(struct rte_mbuf * *pkts, uint16_t nb_rx,
+                                                       uint32_t worker_id);
+                struct rte_mbuf *handoff_pkts[32];
+                uint16_t nb_handoff = nat_worker_handoff_dequeue(worker_id, handoff_pkts, 32);
+                if (nb_handoff > 0) {
+                    /* Process through NAT (we are now the correct owner) */
+                    uint16_t nb_tx = nat_process_burst_dpdk(handoff_pkts, nb_handoff, worker_id);
+
+                    /* TX the processed packets */
+                    uint16_t num_tx_ports = rte_eth_dev_count_avail();
+                    for (uint16_t tx_port = 0; tx_port < num_tx_ports; tx_port++) {
+                        struct rte_mbuf *port_pkts[32];
+                        uint16_t port_count = 0;
+                        for (uint16_t j = 0; j < nb_tx; j++) {
+                            if (handoff_pkts[j]->port == tx_port) {
+                                port_pkts[port_count++] = handoff_pkts[j];
+                            }
+                        }
+                        if (port_count > 0) {
+                            uint16_t sent =
+                                rte_eth_tx_burst(tx_port, queue_id, port_pkts, port_count);
+                            /* Free unsent packets */
+                            for (uint16_t k = sent; k < port_count; k++) {
+                                rte_pktmbuf_free(port_pkts[k]);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1512,14 +1684,15 @@ static void *rx_thread_func(void *arg)
         /* Poll lockless RADIUS responses ONCE per loop iteration (worker 0 only) */
         if (worker_id == 0) {
             extern unsigned int radius_lockless_poll_responses(
-                struct radius_auth_response **responses, unsigned int max);
-            extern void radius_lockless_free_response(struct radius_auth_response *resp);
-            extern void pppoe_handle_radius_response(struct radius_auth_response *resp);
+                struct radius_auth_response * *responses, unsigned int max);
+            extern void radius_lockless_free_response(struct radius_auth_response * resp);
+            extern void pppoe_handle_radius_response(struct radius_auth_response * resp);
 
             struct radius_auth_response *resps[32];
             unsigned int n = radius_lockless_poll_responses(resps, 32);
             for (unsigned int r = 0; r < n; r++) {
-                YLOG_INFO("RADIUS: Dispatching response to pppoe_handle session=%u", resps[r]->session_id);
+                YLOG_INFO("RADIUS: Dispatching response to pppoe_handle session=%u",
+                          resps[r]->session_id);
                 pppoe_handle_radius_response(resps[r]);
                 radius_lockless_free_response(resps[r]);
             }

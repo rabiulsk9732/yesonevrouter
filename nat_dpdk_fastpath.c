@@ -10,30 +10,30 @@
  * - Prefetching and cache optimization
  */
 
-#include "nat.h"
 #include "log.h"
+#include "nat.h"
 #include <string.h>
 
 #ifdef HAVE_DPDK
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
-#include <rte_mbuf.h>
 #include <rte_ip.h>
-#include <rte_udp.h>
-#include <rte_tcp.h>
-#include <rte_prefetch.h>
-#include <rte_cycles.h>
 #include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_prefetch.h>
+#include <rte_tcp.h>
+#include <rte_udp.h>
 #endif
 
 /* Performance tuning constants */
-#define NAT_BURST_SIZE         64    /* Packets per burst (cache line aligned) */
-#define NAT_PREFETCH_OFFSET    4     /* Prefetch N packets ahead */
-#define NAT_CACHE_LINE_SIZE    64
+#define NAT_BURST_SIZE 64     /* Packets per burst (cache line aligned) */
+#define NAT_PREFETCH_OFFSET 4 /* Prefetch N packets ahead */
+#define NAT_CACHE_LINE_SIZE 64
 
 /* NAT interface direction - port 0 = inside, port 1 = outside */
-#define NAT_INSIDE_PORT        0
-#define NAT_OUTSIDE_PORT       1
+#define NAT_INSIDE_PORT 0
+#define NAT_OUTSIDE_PORT 1
 
 /* Per-lcore statistics for zero contention */
 struct nat_lcore_stats {
@@ -45,8 +45,8 @@ struct nat_lcore_stats {
     uint64_t cache_misses;
     uint64_t cycles_total;
     uint64_t bursts_processed;
-    uint64_t handoff_tx;      /* Packets handed off to other workers */
-    uint64_t handoff_rx;      /* Packets received from other workers */
+    uint64_t handoff_tx; /* Packets handed off to other workers */
+    uint64_t handoff_rx; /* Packets received from other workers */
 } __attribute__((aligned(NAT_CACHE_LINE_SIZE)));
 
 #ifdef HAVE_DPDK
@@ -65,11 +65,9 @@ extern struct nat_worker_data g_nat_workers[];
 
 /* Forward declaration for hash function */
 extern uint32_t nat_hash_inside(uint32_t ip, uint16_t port, uint8_t protocol);
-static inline uint16_t nat_fast_cksum_update(uint16_t old_cksum,
-                                              uint32_t old_addr,
-                                              uint32_t new_addr,
-                                              uint16_t old_port,
-                                              uint16_t new_port)
+static inline uint16_t nat_fast_cksum_update(uint16_t old_cksum, uint32_t old_addr,
+                                             uint32_t new_addr, uint16_t old_port,
+                                             uint16_t new_port)
 {
     uint32_t sum;
 
@@ -105,7 +103,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
     uint64_t start_cycles = rte_rdtsc();
     uint16_t nb_tx = 0;
 
-    if (unlikely(nb_rx == 0)) return 0;
+    if (unlikely(nb_rx == 0))
+        return 0;
 
     stats->bursts_processed++;
 
@@ -136,7 +135,7 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
         /* Handle ARP packets - send to ARP subsystem */
         if (unlikely(ether_type == RTE_ETHER_TYPE_ARP)) {
-            extern int arp_process_packet_dpdk(struct rte_mbuf *mbuf, uint16_t port_id);
+            extern int arp_process_packet_dpdk(struct rte_mbuf * mbuf, uint16_t port_id);
             arp_process_packet_dpdk(pkt, pkt->port);
             continue;
         }
@@ -174,16 +173,22 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             continue;
         }
 
-        /* VPP-STYLE WORKER HANDOFF: Route packet to correct worker */
-        uint32_t target_worker = nat_flow_to_worker(src_ip, src_port, dst_ip, dst_port, proto);
-        if (target_worker != worker_id) {
-            /* This flow belongs to another worker - hand off via ring */
-            if (nat_worker_handoff_enqueue(target_worker, pkt) == 0) {
-                stats->handoff_tx++;
-                continue;  /* Packet handed off successfully */
+        /* VPP-STYLE WORKER HANDOFF:\n         * For SNAT (inside→outside): Use inside tuple to
+         * determine owner\n         * For DNAT (outside→inside): Will check session->owner_worker
+         * after lookup\n         */
+        if (is_inside_to_outside) {
+            /* SNAT: Owner determined by inside (subscriber) tuple */
+            uint32_t target_worker = nat_flow_to_worker(src_ip, src_port, proto);
+            if (target_worker != worker_id) {
+                /* This flow belongs to another worker - hand off via ring */
+                if (nat_worker_handoff_enqueue(target_worker, pkt) == 0) {
+                    stats->handoff_tx++;
+                    continue; /* Packet handed off successfully */
+                }
+                /* Ring full - process locally (fallback) */
             }
-            /* Ring full - process locally (fallback) */
         }
+        /* DNAT handoff handled after session lookup below */
 
         /* Handle based on direction */
         if (is_inside_to_outside) {
@@ -205,7 +210,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 stats->cache_misses++;
                 worker->cache_misses++;
 
-                /* Lookup in per-worker session table (PURE LOCKLESS - guaranteed to be in this worker's table) */
+                /* Lookup in per-worker session table (PURE LOCKLESS - guaranteed to be in this
+                 * worker's table) */
                 session = nat_session_lookup_lockless(src_ip, src_port, proto, worker_id);
 
                 if (!session) {
@@ -224,12 +230,9 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                     }
 
                     /* LOCKLESS session create - each worker owns its session table */
-                    session = nat_session_create_lockless(
-                        worker_id,
-                        src_ip, src_port,
-                        worker->port_pool.nat_ip, nat_port,
-                        proto, dst_ip, dst_port
-                    );
+                    session = nat_session_create_lockless(worker_id, src_ip, src_port,
+                                                          worker->port_pool.nat_ip, nat_port, proto,
+                                                          dst_ip, dst_port);
 
                     if (!session) {
                         /* Session create failed - log once */
@@ -268,18 +271,16 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
                 } else if (udp->dgram_cksum != 0) {
-                    udp->dgram_cksum = nat_fast_cksum_update(
-                        udp->dgram_cksum, old_src, ip->src_addr,
-                        old_port, udp->src_port);
+                    udp->dgram_cksum = nat_fast_cksum_update(udp->dgram_cksum, old_src,
+                                                             ip->src_addr, old_port, udp->src_port);
                 }
             } else {
                 tcp->src_port = rte_cpu_to_be_16(session->outside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
                 } else {
-                    tcp->cksum = nat_fast_cksum_update(
-                        tcp->cksum, old_src, ip->src_addr,
-                        old_port, tcp->src_port);
+                    tcp->cksum = nat_fast_cksum_update(tcp->cksum, old_src, ip->src_addr, old_port,
+                                                       tcp->src_port);
                 }
             }
 
@@ -287,8 +288,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             if (pkt->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
                 ip->hdr_checksum = 0;
             } else {
-                ip->hdr_checksum = nat_fast_cksum_update(
-                    ip->hdr_checksum, old_src, ip->src_addr, 0, 0);
+                ip->hdr_checksum =
+                    nat_fast_cksum_update(ip->hdr_checksum, old_src, ip->src_addr, 0, 0);
             }
         } else {
             /* OUTSIDE -> INSIDE: DNAT (translate destination) */
@@ -298,6 +299,20 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
             if (!session) {
                 /* No session - drop packet (unsolicited inbound) */
+                stats->dropped++;
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            /* VPP-STYLE: Check if we own this session, handoff if not
+             * CRITICAL: Use stored session->owner_worker, NEVER recompute hash
+             */
+            if (session->owner_worker != worker_id) {
+                if (nat_worker_handoff_enqueue(session->owner_worker, pkt) == 0) {
+                    stats->handoff_tx++;
+                    continue; /* Packet handed off successfully */
+                }
+                /* Ring full - drop to preserve ownership invariant */
                 stats->dropped++;
                 rte_pktmbuf_free(pkt);
                 continue;
@@ -314,18 +329,16 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
                 if (pkt->ol_flags & RTE_MBUF_F_TX_UDP_CKSUM) {
                     udp->dgram_cksum = 0;
                 } else if (udp->dgram_cksum != 0) {
-                    udp->dgram_cksum = nat_fast_cksum_update(
-                        udp->dgram_cksum, old_dst, ip->dst_addr,
-                        old_port, udp->dst_port);
+                    udp->dgram_cksum = nat_fast_cksum_update(udp->dgram_cksum, old_dst,
+                                                             ip->dst_addr, old_port, udp->dst_port);
                 }
             } else {
                 tcp->dst_port = rte_cpu_to_be_16(session->inside_port);
                 if (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) {
                     tcp->cksum = 0;
                 } else {
-                    tcp->cksum = nat_fast_cksum_update(
-                        tcp->cksum, old_dst, ip->dst_addr,
-                        old_port, tcp->dst_port);
+                    tcp->cksum = nat_fast_cksum_update(tcp->cksum, old_dst, ip->dst_addr, old_port,
+                                                       tcp->dst_port);
                 }
             }
 
@@ -333,8 +346,8 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             if (pkt->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
                 ip->hdr_checksum = 0;
             } else {
-                ip->hdr_checksum = nat_fast_cksum_update(
-                    ip->hdr_checksum, old_dst, ip->dst_addr, 0, 0);
+                ip->hdr_checksum =
+                    nat_fast_cksum_update(ip->hdr_checksum, old_dst, ip->dst_addr, 0, 0);
             }
         }
 
@@ -358,12 +371,11 @@ int nat_dpdk_worker_loop(void *arg)
     uint16_t queue_id = rte_lcore_id();
     struct rte_mbuf *pkts[NAT_BURST_SIZE];
 
-    LOG_INFO("[NAT-DPDK] Worker %u starting on lcore %u, port %u queue %u",
-             g_thread_worker_id, rte_lcore_id(), port_id, queue_id);
+    LOG_INFO("[NAT-DPDK] Worker %u starting on lcore %u, port %u queue %u", g_thread_worker_id,
+             rte_lcore_id(), port_id, queue_id);
 
     /* Initialize per-worker port pool */
-    nat_worker_port_pool_init(g_thread_worker_id,
-                              0xCB007100 + g_thread_worker_id,  /* 203.0.113.X */
+    nat_worker_port_pool_init(g_thread_worker_id, 0xCB007100 + g_thread_worker_id, /* 203.0.113.X */
                               1024, 65535);
 
     while (1) {
@@ -394,8 +406,8 @@ int nat_dpdk_worker_loop(void *arg)
 /**
  * Get DPDK NAT statistics for a specific lcore
  */
-void nat_dpdk_get_stats(uint32_t lcore_id, uint64_t *rx, uint64_t *tx,
-                        uint64_t *dropped, double *cycles_per_pkt)
+void nat_dpdk_get_stats(uint32_t lcore_id, uint64_t *rx, uint64_t *tx, uint64_t *dropped,
+                        double *cycles_per_pkt)
 {
     struct nat_lcore_stats *stats = &g_lcore_stats[lcore_id];
 
@@ -431,9 +443,8 @@ void nat_dpdk_print_stats(void)
         if (stats->rx_packets > 0) {
             double cpp = (double)stats->cycles_total / stats->rx_packets;
             (void)cpp; /* Silence warning when LOG is no-op */
-            LOG_INFO("  |   %2u   | %10lu | %10lu | %8lu |   %6.1f   |",
-                     i, stats->rx_packets, stats->tx_packets,
-                     stats->dropped, cpp);
+            LOG_INFO("  |   %2u   | %10lu | %10lu | %8lu |   %6.1f   |", i, stats->rx_packets,
+                     stats->tx_packets, stats->dropped, cpp);
 
             total_rx += stats->rx_packets;
             total_tx += stats->tx_packets;
@@ -445,19 +456,19 @@ void nat_dpdk_print_stats(void)
 
     LOG_INFO("  |--------|------------|------------|----------|------------|");
     double total_cpp = total_rx > 0 ? (double)total_cycles / total_rx : 0;
-    LOG_INFO("  | TOTAL  | %10lu | %10lu | %8lu |   %6.1f   |",
-             total_rx, total_tx, total_dropped, total_cpp);
+    LOG_INFO("  | TOTAL  | %10lu | %10lu | %8lu |   %6.1f   |", total_rx, total_tx, total_dropped,
+             total_cpp);
     LOG_INFO("  ------------------------------------------------");
 
     /* Calculate throughput estimate */
-    double avg_pkt_size = 400;  /* IMIX average */
-    double cpu_ghz = 2.5;       /* Assumed CPU frequency */
+    double avg_pkt_size = 400; /* IMIX average */
+    double cpu_ghz = 2.5;      /* Assumed CPU frequency */
     double pps_per_core = (cpu_ghz * 1e9) / (total_cpp > 0 ? total_cpp : 1);
     double gbps_per_core = (pps_per_core * avg_pkt_size * 8) / 1e9;
 
     LOG_INFO("  Estimated performance at %.1f GHz:", cpu_ghz);
     LOG_INFO("    %.2f Mpps/core, %.2f Gbps/core", pps_per_core / 1e6, gbps_per_core);
-    (void)total_bursts; /* Mark as used */
+    (void)total_bursts;  /* Mark as used */
     (void)gbps_per_core; /* Mark as used */
 }
 
@@ -466,7 +477,9 @@ void nat_dpdk_print_stats(void)
 /* Stub implementations when DPDK is not available */
 uint16_t nat_process_burst_dpdk(void **pkts, uint16_t nb_rx, uint32_t worker_id)
 {
-    (void)pkts; (void)nb_rx; (void)worker_id;
+    (void)pkts;
+    (void)nb_rx;
+    (void)worker_id;
     return 0;
 }
 

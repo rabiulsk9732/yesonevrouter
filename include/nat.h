@@ -30,10 +30,10 @@
 #define NAT_ICMP_TIMEOUT 60  /* ICMP session timeout (1 minute) */
 
 /* Per-Worker Session Tables */
-#define NAT_MAX_WORKERS 64    /* Supports up to 64 worker cores */
-#define NAT_WORKER_TABLE_SIZE 65536 /* 64K per worker */
+#define NAT_MAX_WORKERS 64              /* Supports up to 64 worker cores */
+#define NAT_WORKER_TABLE_SIZE 4194304   /* 4M base (multiplied by 4 = 16M for 10M sessions, 0.625 load factor) */
 #define NAT_WORKER_TABLE_MASK (NAT_WORKER_TABLE_SIZE - 1)
-#define NAT_SESSION_CACHE_SIZE 256 /* Per-worker cache for hot sessions */
+#define NAT_SESSION_CACHE_SIZE 256      /* Per-worker cache for hot sessions */
 
 /* Forward declaration */
 /* Forward declaration */
@@ -82,10 +82,10 @@ struct nat_worker_data {
     uint64_t out2in_misses;
     uint64_t sessions_created;
     uint64_t sessions_deleted;
-    uint64_t sessions_failed;     /* Session creation failures */
-    uint64_t port_alloc_failed;   /* Port allocation failures */
-    uint64_t cache_hits;   /* Fast cache hits */
-    uint64_t cache_misses; /* Cache misses - fell through to hash */
+    uint64_t sessions_failed;   /* Session creation failures */
+    uint64_t port_alloc_failed; /* Port allocation failures */
+    uint64_t cache_hits;        /* Fast cache hits */
+    uint64_t cache_misses;      /* Cache misses - fell through to hash */
 
     /* Packet Translation Stats (Per-Worker) */
     uint64_t packets_translated;
@@ -103,29 +103,29 @@ struct nat_worker_data {
 
     /* Per-worker port pool for LOCKLESS port allocation */
     struct {
-        uint32_t nat_ip;               /* NAT IP assigned to this worker */
-        uint32_t port_bitmap[2048];    /* 64K ports / 32 bits = 2048 words */
-        uint16_t next_hint;            /* Next port to try (for cache locality) */
-        uint16_t ports_allocated;      /* Count of allocated ports */
-        uint16_t port_min;             /* Minimum port (default: 1024) */
-        uint16_t port_max;             /* Maximum port (default: 65535) */
-        uint64_t alloc_success;        /* Allocation success counter */
-        uint64_t alloc_fail;           /* Allocation failure counter */
+        uint32_t nat_ip;            /* NAT IP assigned to this worker */
+        uint32_t port_bitmap[2048]; /* 64K ports / 32 bits = 2048 words */
+        uint16_t next_hint;         /* Next port to try (for cache locality) */
+        uint16_t ports_allocated;   /* Count of allocated ports */
+        uint16_t port_min;          /* Minimum port (default: 1024) */
+        uint16_t port_max;          /* Maximum port (default: 65535) */
+        uint64_t alloc_success;     /* Allocation success counter */
+        uint64_t alloc_fail;        /* Allocation failure counter */
     } port_pool;
 
     /* Per-worker session pool for LOCKLESS session allocation */
     struct {
-        uint32_t *free_stack;          /* Stack of free session indices */
-        uint32_t free_top;             /* Top of free stack */
-        uint32_t capacity;             /* Total sessions in this worker's pool */
-        uint64_t alloc_success;        /* Allocation success counter */
-        uint64_t alloc_fail;           /* Allocation failure counter */
+        uint32_t *free_stack;   /* Stack of free session indices */
+        uint32_t free_top;      /* Top of free stack */
+        uint32_t capacity;      /* Total sessions in this worker's pool */
+        uint64_t alloc_success; /* Allocation success counter */
+        uint64_t alloc_fail;    /* Allocation failure counter */
     } session_pool;
 
     /* VPP-STYLE: Worker handoff ring for lockless cross-worker packet routing */
-    struct rte_ring *handoff_ring;     /* Incoming packets from other workers */
-    uint64_t handoff_enqueue;          /* Packets sent to other workers */
-    uint64_t handoff_dequeue;          /* Packets received from other workers */
+    struct rte_ring *handoff_ring; /* Incoming packets from other workers */
+    uint64_t handoff_enqueue;      /* Packets sent to other workers */
+    uint64_t handoff_dequeue;      /* Packets received from other workers */
 
     uint8_t pad[40]; /* Avoid false sharing (adjusted for new fields) */
 } __attribute__((aligned(64)));
@@ -151,9 +151,9 @@ struct nat_session {
     uint16_t _pad1;        /* 16 */
 
     /* Hot Write Fields (Timestamp) */
-    uint64_t last_used_ts; /* 24 */
-    uint32_t timeout;      /* 28 */
-    uint32_t session_index;/* 32: Index in Slab (0 = invalid) */
+    uint64_t last_used_ts;  /* 24 */
+    uint32_t timeout;       /* 28 */
+    uint32_t session_index; /* 32: Index in Slab (0 = invalid) */
 
     /* Hash Table Linkage (Hot for lookup) */
     struct nat_session *next;         /* 40: Next in In2Out bucket */
@@ -165,12 +165,12 @@ struct nat_session {
     uint16_t _pad2;         /* 56 */
 
     /* Pre-computed hashes for fast deletion and cross-worker lookup */
-    uint32_t inside_hash;   /* 60: Hash for inside (LAN) lookup */
-    uint32_t outside_hash;  /* 64: Hash for outside (WAN) lookup - End of CL 0 */
+    uint32_t inside_hash;  /* 60: Hash for inside (LAN) lookup */
+    uint32_t outside_hash; /* 64: Hash for outside (WAN) lookup - End of CL 0 */
 
     /* Cacheline 1: Cold / Stats / Management */
     uint64_t created_ts;
-    uint32_t dest_ip;       /* For NetFlow */
+    uint32_t dest_ip; /* For NetFlow */
     uint16_t dest_port;
     uint16_t _pad4;
 
@@ -191,15 +191,16 @@ struct nat_session {
     uint8_t exported;
     uint8_t alg_active;
     uint8_t alg_type;
-    uint8_t _pad5[5];
+    uint8_t owner_worker; /* Worker ID that owns this session (for handoff) */
+    uint8_t _pad5[4];
 } __attribute__((aligned(64)));
 
 /* Flags definitions */
-#define NAT_SESSION_FLAG_EIM           (1 << 0)
-#define NAT_SESSION_FLAG_HAIRPIN       (1 << 1)
+#define NAT_SESSION_FLAG_EIM (1 << 0)
+#define NAT_SESSION_FLAG_HAIRPIN (1 << 1)
 #define NAT_SESSION_FLAG_DETERMINISTIC (1 << 2)
-#define NAT_SESSION_FLAG_STATIC        (1 << 3)
-#define NAT_SESSION_FLAG_LOGGED        (1 << 4)
+#define NAT_SESSION_FLAG_STATIC (1 << 3)
+#define NAT_SESSION_FLAG_LOGGED (1 << 4)
 
 /* Global Session Slab */
 extern struct nat_session *g_session_slab;
@@ -236,7 +237,7 @@ struct nat_pool {
 
     /* Port Allocation Logic (Thread-Safe via Atomic Bitmaps) */
     /* pthread_spinlock_t lock; REMOVED in V2 */
-    uint64_t *port_bitmap;        /* Bitmap for port tracking (1 bit per port) */
+    uint64_t *port_bitmap; /* Bitmap for port tracking (1 bit per port) */
     /* Note: We allocate this dynamically. 65536 bits = 8KB per IP?
        Wait, if pool has multiple IPs, do we need one bitmap PER IP?
        Yes. Or we alloc (Pool_Size * 65536) bits.
@@ -422,8 +423,8 @@ uint16_t nat_allocate_port(struct nat_pool *pool, uint32_t public_ip, uint8_t pr
  * @param preferred_port Preferred port (usually the internal port)
  * @return Port number (same as preferred if available), 0 on error
  */
-uint16_t nat_allocate_port_with_parity(struct nat_pool *pool, uint32_t public_ip,
-                                       uint8_t protocol, uint16_t preferred_port);
+uint16_t nat_allocate_port_with_parity(struct nat_pool *pool, uint32_t public_ip, uint8_t protocol,
+                                       uint16_t preferred_port);
 
 /**
  * Release public port
@@ -462,8 +463,8 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface);
  * @return NAT session pointer, NULL on error
  */
 struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
-                                       uint32_t outside_ip, uint16_t outside_port,
-                                       uint8_t protocol, uint32_t dest_ip, uint16_t dest_port);
+                                       uint32_t outside_ip, uint16_t outside_port, uint8_t protocol,
+                                       uint32_t dest_ip, uint16_t dest_port);
 
 /**
  * Create NAT session - LOCKLESS PATH
@@ -478,10 +479,10 @@ struct nat_session *nat_session_create(uint32_t inside_ip, uint16_t inside_port,
  * @param dest_port Destination port
  * @return NAT session pointer, NULL on error
  */
-struct nat_session *nat_session_create_lockless(uint32_t worker_id,
-                                                 uint32_t inside_ip, uint16_t inside_port,
-                                                 uint32_t outside_ip, uint16_t outside_port,
-                                                 uint8_t protocol, uint32_t dest_ip, uint16_t dest_port);
+struct nat_session *nat_session_create_lockless(uint32_t worker_id, uint32_t inside_ip,
+                                                uint16_t inside_port, uint32_t outside_ip,
+                                                uint16_t outside_port, uint8_t protocol,
+                                                uint32_t dest_ip, uint16_t dest_port);
 
 /**
  * Lookup NAT session by inside (private) 5-tuple
@@ -514,6 +515,37 @@ struct nat_session *nat_session_lookup_lockless(uint32_t inside_ip, uint16_t ins
  */
 struct nat_session *nat_session_lookup_outside(uint32_t outside_ip, uint16_t outside_port,
                                                uint8_t protocol);
+
+/**
+ * VPP-STYLE: Cross-worker session lookup for DNAT
+ * Searches ALL worker tables when current worker doesn't have the session
+ * This handles RSS asymmetry where reverse packet lands on different worker
+ * @param outside_ip Public IP
+ * @param outside_port Public port
+ * @param protocol Protocol
+ * @param out_owner_worker Output: worker ID that owns the session (may be NULL)
+ * @return NAT session pointer, NULL if not found
+ */
+struct nat_session *nat_session_lookup_outside_any_worker(uint32_t outside_ip,
+                                                          uint16_t outside_port, uint8_t protocol,
+                                                          uint32_t *out_owner_worker);
+
+/**
+ * ICMP EIM (Endpoint-Independent Mapping) Lookup
+ * RFC 5508: ICMP sessions use identifier-based mapping
+ * @param outside_ip Public IP
+ * @param icmp_id ICMP identifier
+ * @return NAT session pointer, NULL if not found
+ */
+struct nat_session *nat_session_lookup_icmp_eim(uint32_t outside_ip, uint16_t icmp_id);
+
+/**
+ * Flow-based NAT session lookup for IP fragments
+ * Used when L4 header is not available (subsequent fragments)
+ * Looks up session using only (inside_ip, outside_ip, protocol)
+ */
+struct nat_session *nat_session_lookup_flow(uint32_t inside_ip, uint32_t outside_ip,
+                                            uint8_t protocol);
 
 /**
  * Delete a NAT session
@@ -621,8 +653,8 @@ uint32_t nat_get_num_workers(void);
  * @param port_min Minimum port (typically 1024)
  * @param port_max Maximum port (typically 65535)
  */
-void nat_worker_port_pool_init(uint32_t worker_id, uint32_t nat_ip,
-                               uint16_t port_min, uint16_t port_max);
+void nat_worker_port_pool_init(uint32_t worker_id, uint32_t nat_ip, uint16_t port_min,
+                               uint16_t port_max);
 
 /**
  * Allocate port from worker's pool (LOCKLESS - no locks!)
@@ -682,11 +714,19 @@ int nat_worker_handoff_init(uint32_t num_workers);
 
 /**
  * Map flow to worker ID (deterministic - same flow always maps to same worker)
+ * VPP-STYLE: Uses ONLY inside tuple (inside_ip, inside_port, proto)
+ * NEVER hash on outside tuple - it changes after NAT translation!
  * @return Worker ID that should handle this flow
  */
-uint32_t nat_flow_to_worker(uint32_t src_ip, uint16_t src_port,
-                            uint32_t dst_ip, uint16_t dst_port,
-                            uint8_t proto);
+uint32_t nat_flow_to_worker(uint32_t inside_ip, uint16_t inside_port, uint8_t proto);
+
+/**
+ * Determine session owner from NAT outside port
+ * VPP-STYLE: Each worker has a non-overlapping port range
+ * This allows DNAT to find owner WITHOUT searching session tables
+ * @return Worker ID that owns sessions with this outside port
+ */
+uint32_t nat_port_to_worker(uint16_t outside_port);
 
 /**
  * Enqueue packet to target worker's handoff ring
@@ -699,6 +739,12 @@ int nat_worker_handoff_enqueue(uint32_t target_worker, struct rte_mbuf *pkt);
  * @return Number of packets dequeued
  */
 uint16_t nat_worker_handoff_dequeue(uint32_t worker_id, struct rte_mbuf **pkts, uint16_t max_pkts);
+
+/**
+ * Print worker load balance statistics
+ * Shows session distribution and handoff statistics across workers
+ */
+void nat_worker_print_load_balance(void);
 #endif /* HAVE_DPDK */
 
 /* NAT64 API (RFC 6146/6145) */
@@ -714,9 +760,8 @@ void nat64_print_config(void);
 
 /* NAT RSS API (Receive Side Scaling for lockless operation) */
 int nat_rss_configure(uint16_t port_id, uint16_t num_workers);
-uint32_t nat_rss_get_worker_id(uint32_t src_ip, uint32_t dst_ip,
-                               uint16_t src_port, uint16_t dst_port,
-                               uint8_t protocol);
+uint32_t nat_rss_get_worker_id(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
+                               uint16_t dst_port, uint8_t protocol);
 bool nat_rss_is_enabled(void);
 uint16_t nat_rss_get_num_queues(void);
 void nat_rss_print_config(void);
