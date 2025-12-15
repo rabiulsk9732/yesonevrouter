@@ -16,9 +16,11 @@
 #include <string.h>
 
 #ifdef HAVE_DPDK
+#include "alg.h"
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_icmp.h>
 #include <rte_ip.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -106,6 +108,7 @@ struct nat_lcore_stats {
     uint64_t cache_misses;
     uint64_t cycles_total;
     uint64_t bursts_processed;
+    uint64_t icmp_alg; /* ICMP ALG processing counter */
 } __attribute__((aligned(NAT_CACHE_LINE_SIZE)));
 
 #ifdef HAVE_DPDK
@@ -312,8 +315,9 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
         if (is_inside_to_outside) {
             /* HYBRID-STYLE: Allow RSS to place packets on any worker
              * Each worker creates sessions in its own table (lockless)
-             * DNAT uses cross-worker lookup to find sessions regardless of which worker created them
-             * This handles RSS asymmetry: outbound on worker A, inbound on worker B works correctly
+             * DNAT uses cross-worker lookup to find sessions regardless of which worker created
+             * them This handles RSS asymmetry: outbound on worker A, inbound on worker B works
+             * correctly
              */
 
             /* INSIDE -> OUTSIDE: SNAT (translate source) */
@@ -458,16 +462,143 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             /* Debug: Track cross-worker hits for observability */
             if (session && owner_worker != worker_id) {
                 static __thread uint64_t cross_worker_hits = 0;
-                if ((cross_worker_hits++ & 0xFF) == 0) {  /* Log every 256th */
-                    YLOG_DEBUG("[NAT-DNAT] Cross-worker session: owner=%u current=%u (RST asymmetry)",
-                               owner_worker, worker_id);
+                if ((cross_worker_hits++ & 0xFF) == 0) { /* Log every 256th */
+                    YLOG_DEBUG(
+                        "[NAT-DNAT] Cross-worker session: owner=%u current=%u (RST asymmetry)",
+                        owner_worker, worker_id);
                 }
-                worker->cross_worker_hits++;  /* Per-worker counter */
+                worker->cross_worker_hits++; /* Per-worker counter */
             }
 #endif
 
             if (!session) {
+                /* No session found - check if this is an ICMP error message */
+                if (proto == IPPROTO_ICMP) {
+                    struct rte_icmp_hdr *icmp =
+                        (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+
+                    /* Check for ICMP error types that need ALG processing */
+                    if (icmp->icmp_type == 3 ||  /* Destination Unreachable */
+                        icmp->icmp_type == 4 ||  /* Source Quench */
+                        icmp->icmp_type == 11 || /* Time Exceeded */
+                        icmp->icmp_type == 12) { /* Parameter Problem */
+                        /* This is an ICMP error - try ALG processing */
+                        YLOG_DEBUG("[NAT-ICMP] ICMP error type %u from outside - ALG processing",
+                                   icmp->icmp_type);
+                        stats->icmp_alg++;
+                        worker->icmp_alg++;
+
+                        /* Call ALG to translate embedded IP header */
+                        /* For outside->inside, outbound=false */
+                        if (alg_icmp_process_error(pkt, false) == 0) {
+                            /* ALG succeeded - now we need to route the packet to inside client
+                             * The ALG translated the embedded packet, but we also need to:
+                             * 1. Rewrite outer IP destination to inside IP
+                             * 2. Rewrite L2 headers for routing to inside client
+                             */
+
+                            /* Get embedded IP header to find the inside IP */
+                            struct rte_icmp_hdr *icmp_hdr =
+                                (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+                            struct rte_ipv4_hdr *inner_ip = (struct rte_ipv4_hdr *)(icmp_hdr + 1);
+
+                            /* The embedded packet's src_addr is now the INSIDE IP (translated by
+                             * ALG) */
+                            uint32_t inside_ip_addr = rte_be_to_cpu_32(inner_ip->src_addr);
+
+                            /* Rewrite outer IP destination to inside client */
+                            ip->dst_addr = inner_ip->src_addr;
+
+                            /* Recalculate outer IP checksum */
+                            ip->hdr_checksum = 0;
+                            ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+                            /* Route to LAN port (1) */
+                            uint16_t egress_port = 1;
+
+                            /* Get egress interface MAC */
+                            struct rte_ether_addr egress_mac;
+                            rte_eth_macaddr_get(egress_port, &egress_mac);
+
+                            /* Lookup client MAC via ARP */
+                            uint8_t dst_mac[6];
+                            extern int arp_lookup_lockless(uint32_t ip_address,
+                                                           uint8_t *mac_address);
+
+                            if (arp_lookup_lockless(inside_ip_addr, dst_mac) == 0) {
+                                /* ARP hit - rewrite L2 headers */
+                                rte_ether_addr_copy(&egress_mac, &eth->src_addr);
+                                memcpy(&eth->dst_addr, dst_mac, 6);
+
+                                /* Set egress port */
+                                pkt->port = egress_port;
+
+                                /* Decrement TTL */
+                                ip->time_to_live--;
+                                ip->hdr_checksum = 0;
+                                ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+                                YLOG_DEBUG("[NAT-ICMP] ALG success: routing to inside %u.%u.%u.%u",
+                                           (inside_ip_addr >> 24) & 0xFF,
+                                           (inside_ip_addr >> 16) & 0xFF,
+                                           (inside_ip_addr >> 8) & 0xFF, inside_ip_addr & 0xFF);
+
+                                pkts[nb_tx++] = pkt;
+                                stats->tx_packets++;
+                            } else {
+                                /* ARP miss for inside client - trigger ARP and drop */
+                                YLOG_DEBUG("[NAT-ICMP] ARP miss for inside client %u.%u.%u.%u",
+                                           (inside_ip_addr >> 24) & 0xFF,
+                                           (inside_ip_addr >> 16) & 0xFF,
+                                           (inside_ip_addr >> 8) & 0xFF, inside_ip_addr & 0xFF);
+
+                                struct interface *egress_iface =
+                                    interface_find_by_dpdk_port(egress_port);
+                                if (egress_iface) {
+                                    extern int arp_send_request(
+                                        uint32_t target_ip, uint32_t source_ip,
+                                        const uint8_t *source_mac, uint32_t ifindex);
+                                    uint32_t src_ip_arp =
+                                        ntohl(egress_iface->config.ipv4_addr.s_addr);
+                                    arp_send_request(inside_ip_addr, src_ip_arp,
+                                                     egress_iface->mac_addr, egress_iface->ifindex);
+                                }
+                                stats->dropped++;
+                                rte_pktmbuf_free(pkt);
+                            }
+                            continue;
+                        } else {
+                            /* ALG failed - drop the packet */
+                            YLOG_DEBUG("[NAT-ICMP] ICMP ALG failed - dropping packet");
+                            stats->dropped++;
+                            rte_pktmbuf_free(pkt);
+                            continue;
+                        }
+                    }
+                }
+
                 /* No session - drop packet (unsolicited inbound or ED filtering) */
+                /* Log first few drops for debugging */
+                static __thread uint64_t drop_log_count = 0;
+                if (drop_log_count < 3) {
+                    if (proto == IPPROTO_ICMP) {
+                        struct rte_icmp_hdr *icmp =
+                            (struct rte_icmp_hdr *)((uint8_t *)ip + (ip->ihl << 2));
+                        YLOG_DEBUG(
+                            "[NAT-DROP] ICMP type %u from %u.%u.%u.%u to %u.%u.%u.%u - no session",
+                            icmp->icmp_type, (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                            (src_ip >> 8) & 0xFF, src_ip & 0xFF, (dst_ip >> 24) & 0xFF,
+                            (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF);
+                    } else {
+                        YLOG_DEBUG("[NAT-DROP] Proto %u from %u.%u.%u.%u:%u to %u.%u.%u.%u:%u - no "
+                                   "session",
+                                   proto, (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                                   (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                                   (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF,
+                                   (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port);
+                    }
+                    drop_log_count++;
+                }
                 stats->dropped++;
                 rte_pktmbuf_free(pkt);
                 continue;
@@ -545,6 +676,13 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
 
                 pkts[nb_tx++] = pkt;
                 stats->tx_packets++;
+
+                /* Update per-worker SNAT/DNAT packet counters */
+                if (is_inside_to_outside) {
+                    worker->snat_packets++;
+                } else {
+                    worker->dnat_packets++;
+                }
             } else {
                 /* ARP miss - need to send ARP request and queue packet */
                 /* For now, drop packet (VPP queues it) */

@@ -2,33 +2,38 @@
  * @file env_config.c
  * @brief Bison-Style Environment Configuration Parser
  *
- * Validates every parameter. Rejects missing/invalid values.
- * All parameters from .env file - no hardcoded defaults.
+ * Minimal .env file for essential DPDK infrastructure parameters.
+ * Sensible defaults applied for optional parameters.
  */
 
 #include "env_config.h"
 #include "log.h"
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <errno.h>
-#include <arpa/inet.h>
 
 /* Global config instance */
 struct env_config g_env_config;
 
 /* Parse helpers */
-static char *trim(char *str) {
-    while (isspace(*str)) str++;
-    if (*str == 0) return str;
+static char *trim(char *str)
+{
+    while (isspace(*str))
+        str++;
+    if (*str == 0)
+        return str;
     char *end = str + strlen(str) - 1;
-    while (end > str && isspace(*end)) end--;
+    while (end > str && isspace(*end))
+        end--;
     *(end + 1) = '\0';
     return str;
 }
 
-static int parse_int(const char *str, int *out, int min, int max) {
+static int parse_int(const char *str, int *out, int min, int max)
+{
     char *endptr;
     errno = 0;
     long val = strtol(str, &endptr, 10);
@@ -39,18 +44,8 @@ static int parse_int(const char *str, int *out, int min, int max) {
     return 0;
 }
 
-static int parse_uint32(const char *str, uint32_t *out) {
-    char *endptr;
-    errno = 0;
-    unsigned long val = strtoul(str, &endptr, 10);
-    if (errno || *endptr != '\0' || val > UINT32_MAX) {
-        return -1;
-    }
-    *out = (uint32_t)val;
-    return 0;
-}
-
-static int parse_bool(const char *str, bool *out) {
+static int parse_bool(const char *str, bool *out)
+{
     if (strcasecmp(str, "true") == 0 || strcmp(str, "1") == 0) {
         *out = true;
         return 0;
@@ -62,16 +57,19 @@ static int parse_bool(const char *str, bool *out) {
     return -1;
 }
 
-static int parse_lcores(const char *str, int *lcores, int *count) {
+static int parse_lcores(const char *str, int *lcores, int *count)
+{
     char buf[256];
     strncpy(buf, str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     /* Remove quotes */
     char *p = buf;
-    if (*p == '"') p++;
+    if (*p == '"')
+        p++;
     char *end = p + strlen(p) - 1;
-    if (*end == '"') *end = '\0';
+    if (*end == '"')
+        *end = '\0';
 
     *count = 0;
     char *token = strtok(p, ",");
@@ -85,16 +83,19 @@ static int parse_lcores(const char *str, int *lcores, int *count) {
     return (*count > 0) ? 0 : -1;
 }
 
-static int parse_ports(const char *str, char ports[][32], int *count) {
+static int parse_ports(const char *str, char ports[][32], int *count)
+{
     char buf[256];
     strncpy(buf, str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     /* Remove quotes */
     char *p = buf;
-    if (*p == '"') p++;
+    if (*p == '"')
+        p++;
     char *end = p + strlen(p) - 1;
-    if (*end == '"') *end = '\0';
+    if (*end == '"')
+        *end = '\0';
 
     *count = 0;
     char *token = strtok(p, " ,");
@@ -107,7 +108,8 @@ static int parse_ports(const char *str, char ports[][32], int *count) {
     return (*count > 0) ? 0 : -1;
 }
 
-int env_config_load(const char *path) {
+int env_config_load(const char *path)
+{
     FILE *f;
     char line[512];
     int errors = 0;
@@ -130,135 +132,90 @@ int env_config_load(const char *path) {
         char *p = trim(line);
 
         /* Skip comments and empty lines */
-        if (*p == '\0' || *p == '#') continue;
+        if (*p == '\0' || *p == '#')
+            continue;
 
         /* Parse KEY=VALUE */
         char *eq = strchr(p, '=');
-        if (!eq) continue;
+        if (!eq)
+            continue;
 
         *eq = '\0';
         char *key = trim(p);
         char *value = trim(eq + 1);
 
+        /* Strip inline comments (everything after # in the value) */
+        char *comment_start = strchr(value, '#');
+        if (comment_start) {
+            *comment_start = '\0';
+            value = trim(value); /* Re-trim after removing comment */
+        }
+
         /* Remove quotes from value */
         if (*value == '"') {
             value++;
             char *vend = value + strlen(value) - 1;
-            if (*vend == '"') *vend = '\0';
+            if (*vend == '"')
+                *vend = '\0';
         }
 
-        /* SIMPLIFIED: Core Configuration (Bison-style) */
-        if (strcmp(key, "MAIN_LCORE") == 0 || strcmp(key, "DPDK_MAIN_LCORE") == 0) {
+        /* Core Configuration */
+        if (strcmp(key, "MAIN_LCORE") == 0) {
             parse_int(value, &g_env_config.dpdk.main_lcore, 0, 127);
-        }
-        else if (strcmp(key, "WORKER_LCORES") == 0 || strcmp(key, "DPDK_WORKER_LCORES") == 0) {
-            parse_lcores(value, g_env_config.dpdk.worker_lcores,
-                        &g_env_config.dpdk.num_workers);
-        }
-        else if (strcmp(key, "DPDK_NUMA_NODE") == 0) {
+        } else if (strcmp(key, "WORKER_LCORES") == 0) {
+            parse_lcores(value, g_env_config.dpdk.worker_lcores, &g_env_config.dpdk.num_workers);
+        } else if (strcmp(key, "NUMA_NODE") == 0) {
             parse_int(value, &g_env_config.dpdk.numa_node, 0, 7);
         }
-        /* SIMPLIFIED: Memory */
-        else if (strcmp(key, "MEMORY_MB") == 0 || strcmp(key, "DPDK_SOCKET_MEM_MB") == 0) {
+        /* Memory */
+        else if (strcmp(key, "MEMORY_MB") == 0) {
             parse_int(value, &g_env_config.dpdk.socket_mem_mb, 256, 65536);
-        }
-        else if (strcmp(key, "DPDK_MBUF_COUNT") == 0) {
+        } else if (strcmp(key, "MBUF_COUNT") == 0) {
             parse_int(value, &g_env_config.dpdk.mbuf_count, 8192, 16777216);
-        }
-        else if (strcmp(key, "DPDK_MBUF_CACHE_SIZE") == 0) {
+        } else if (strcmp(key, "MBUF_CACHE_SIZE") == 0) {
             parse_int(value, &g_env_config.dpdk.mbuf_cache_size, 0, 1024);
-        }
-        else if (strcmp(key, "DPDK_HUGEPAGES") == 0) {
+        } else if (strcmp(key, "HUGEPAGES") == 0) {
             parse_int(value, &g_env_config.dpdk.hugepages, 64, 65536);
         }
-        /* NIC Configuration */
-        else if (strcmp(key, "DPDK_PORTS") == 0) {
+        /* Port Configuration */
+        else if (strcmp(key, "PORTS") == 0) {
             parse_ports(value, g_env_config.dpdk.ports, &g_env_config.dpdk.num_ports);
-        }
-        else if (strcmp(key, "DPDK_DRIVER") == 0) {
+        } else if (strcmp(key, "DRIVER") == 0) {
             strncpy(g_env_config.dpdk.driver, value, 63);
-        }
-        else if (strcmp(key, "DPDK_PORT_MTU") == 0) {
+        } else if (strcmp(key, "PORT_MTU") == 0) {
             parse_int(value, &g_env_config.dpdk.port_mtu, 64, 9216);
         }
-        /* SIMPLIFIED: Queue Configuration */
-        else if (strcmp(key, "RX_QUEUES") == 0 || strcmp(key, "DPDK_RX_QUEUES") == 0) {
+        /* Queue Configuration */
+        else if (strcmp(key, "RX_QUEUES") == 0) {
             parse_int(value, &g_env_config.dpdk.rx_queues, 1, 64);
-        }
-        else if (strcmp(key, "TX_QUEUES") == 0 || strcmp(key, "DPDK_TX_QUEUES") == 0) {
+        } else if (strcmp(key, "TX_QUEUES") == 0) {
             parse_int(value, &g_env_config.dpdk.tx_queues, 1, 64);
-        }
-        else if (strcmp(key, "DPDK_RX_DESC") == 0) {
+        } else if (strcmp(key, "RX_DESC") == 0) {
             parse_int(value, &g_env_config.dpdk.rx_desc, 64, 8192);
-        }
-        else if (strcmp(key, "DPDK_TX_DESC") == 0) {
+        } else if (strcmp(key, "TX_DESC") == 0) {
             parse_int(value, &g_env_config.dpdk.tx_desc, 64, 8192);
-        }
-        /* Burst Sizes */
-        else if (strcmp(key, "DPDK_RX_BURST_SIZE") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.rx_burst_size, 1, 256) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_RX_BURST_SIZE: %s\n", value);
-                errors++;
-            }
-        }
-        else if (strcmp(key, "DPDK_TX_BURST_SIZE") == 0) {
-            if (parse_int(value, &g_env_config.dpdk.tx_burst_size, 1, 256) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_TX_BURST_SIZE: %s\n", value);
-                errors++;
-            }
+        } else if (strcmp(key, "RX_BURST_SIZE") == 0) {
+            parse_int(value, &g_env_config.dpdk.rx_burst_size, 1, 256);
+        } else if (strcmp(key, "TX_BURST_SIZE") == 0) {
+            parse_int(value, &g_env_config.dpdk.tx_burst_size, 1, 256);
         }
         /* RSS */
-        else if (strcmp(key, "DPDK_RSS_ENABLE") == 0) {
-            if (parse_bool(value, &g_env_config.dpdk.rss_enable) != 0) {
-                fprintf(stderr, "ERROR: Invalid DPDK_RSS_ENABLE: %s\n", value);
-                errors++;
-            }
+        else if (strcmp(key, "RSS_ENABLE") == 0) {
+            parse_bool(value, &g_env_config.dpdk.rss_enable);
         }
-        /* Worker Threads */
-        else if (strcmp(key, "WORKER_RX_COUNT") == 0) {
-            if (parse_int(value, &g_env_config.workers.rx_count, 1, 32) != 0) {
-                fprintf(stderr, "ERROR: Invalid WORKER_RX_COUNT: %s\n", value);
-                errors++;
-            }
-        }
-        else if (strcmp(key, "WORKER_NAT_COUNT") == 0) {
-            if (parse_int(value, &g_env_config.workers.nat_count, 1, 32) != 0) {
-                fprintf(stderr, "ERROR: Invalid WORKER_NAT_COUNT: %s\n", value);
-                errors++;
-            }
-        }
-        /* NAT Performance Tuning */
-        else if (strcmp(key, "NAT44_MAX_SESSIONS") == 0) {
-            if (parse_uint32(value, &g_env_config.nat44.max_sessions) != 0) {
-                fprintf(stderr, "ERROR: Invalid NAT44_MAX_SESSIONS: %s\n", value);
-                errors++;
-            }
-        }
-        else if (strcmp(key, "NAT44_LOCKLESS_ENABLE") == 0) {
-            if (parse_bool(value, &g_env_config.nat44.lockless_enable) != 0) {
-                fprintf(stderr, "ERROR: Invalid NAT44_LOCKLESS_ENABLE: %s\n", value);
-                errors++;
-            }
-        }
-        else if (strcmp(key, "NAT44_SESSION_CACHE_SIZE") == 0) {
-            if (parse_int(value, &g_env_config.nat44.session_cache_size, 0, 4096) != 0) {
-                fprintf(stderr, "ERROR: Invalid NAT44_SESSION_CACHE_SIZE: %s\n", value);
-                errors++;
-            }
-        }
-        else if (strcmp(key, "NAT44_PREFETCH_LOOKAHEAD") == 0) {
-            if (parse_int(value, &g_env_config.nat44.prefetch_lookahead, 0, 16) != 0) {
-                fprintf(stderr, "ERROR: Invalid NAT44_PREFETCH_LOOKAHEAD: %s\n", value);
-                errors++;
-            }
-        }
+
         /* Logging - accept string or int */
         else if (strcmp(key, "LOG_LEVEL") == 0) {
-            if (strcmp(value, "debug") == 0) g_env_config.log.level = 7;
-            else if (strcmp(value, "info") == 0) g_env_config.log.level = 6;
-            else if (strcmp(value, "warn") == 0) g_env_config.log.level = 4;
-            else if (strcmp(value, "error") == 0) g_env_config.log.level = 3;
-            else parse_int(value, &g_env_config.log.level, 0, 7);
+            if (strcmp(value, "debug") == 0)
+                g_env_config.log.level = 7;
+            else if (strcmp(value, "info") == 0)
+                g_env_config.log.level = 6;
+            else if (strcmp(value, "warn") == 0)
+                g_env_config.log.level = 4;
+            else if (strcmp(value, "error") == 0)
+                g_env_config.log.level = 3;
+            else
+                parse_int(value, &g_env_config.log.level, 0, 7);
         }
     }
 
@@ -299,7 +256,8 @@ int env_config_load(const char *path) {
     return 0;
 }
 
-void env_config_print(void) {
+void env_config_print(void)
+{
     printf("=== YESRouter Configuration ===\n");
     printf("DPDK:\n");
     printf("  main_lcore: %d\n", g_env_config.dpdk.main_lcore);
@@ -311,24 +269,43 @@ void env_config_print(void) {
     printf("  tx_queues: %d\n", g_env_config.dpdk.tx_queues);
     printf("  rx_burst_size: %d\n", g_env_config.dpdk.rx_burst_size);
     printf("  rss_enable: %s\n", g_env_config.dpdk.rss_enable ? "true" : "false");
-    printf("NAT44:\n");
-    printf("  max_sessions: %u\n", g_env_config.nat44.max_sessions);
-    printf("  lockless_enable: %s\n", g_env_config.nat44.lockless_enable ? "true" : "false");
-    printf("  session_cache_size: %d\n", g_env_config.nat44.session_cache_size);
     printf("================================\n");
 }
 
 /* Getters */
-int env_get_rx_queues(void) { return g_env_config.dpdk.rx_queues; }
-int env_get_tx_queues(void) { return g_env_config.dpdk.tx_queues; }
-int env_get_rx_burst_size(void) { return g_env_config.dpdk.rx_burst_size; }
-int env_get_tx_burst_size(void) { return g_env_config.dpdk.tx_burst_size; }
-int env_get_rx_desc(void) { return g_env_config.dpdk.rx_desc; }
-int env_get_tx_desc(void) { return g_env_config.dpdk.tx_desc; }
-int env_get_num_workers(void) { return g_env_config.dpdk.num_workers; }
-int env_get_numa_node(void) { return g_env_config.dpdk.numa_node; }
-bool env_get_rss_enable(void) { return g_env_config.dpdk.rss_enable; }
-bool env_get_nat44_lockless(void) { return g_env_config.nat44.lockless_enable; }
-uint32_t env_get_nat44_max_sessions(void) { return g_env_config.nat44.max_sessions; }
-int env_get_nat44_cache_size(void) { return g_env_config.nat44.session_cache_size; }
-int env_get_nat44_prefetch(void) { return g_env_config.nat44.prefetch_lookahead; }
+int env_get_rx_queues(void)
+{
+    return g_env_config.dpdk.rx_queues;
+}
+int env_get_tx_queues(void)
+{
+    return g_env_config.dpdk.tx_queues;
+}
+int env_get_rx_burst_size(void)
+{
+    return g_env_config.dpdk.rx_burst_size;
+}
+int env_get_tx_burst_size(void)
+{
+    return g_env_config.dpdk.tx_burst_size;
+}
+int env_get_rx_desc(void)
+{
+    return g_env_config.dpdk.rx_desc;
+}
+int env_get_tx_desc(void)
+{
+    return g_env_config.dpdk.tx_desc;
+}
+int env_get_num_workers(void)
+{
+    return g_env_config.dpdk.num_workers;
+}
+int env_get_numa_node(void)
+{
+    return g_env_config.dpdk.numa_node;
+}
+bool env_get_rss_enable(void)
+{
+    return g_env_config.dpdk.rss_enable;
+}

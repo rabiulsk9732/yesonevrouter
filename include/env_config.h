@@ -2,16 +2,16 @@
  * @file env_config.h
  * @brief Bison-Style Environment Configuration Parser
  *
- * Single authoritative .env file drives ALL runtime parameters.
- * No hardcoded values. All parameters validated at startup.
+ * Minimal .env file for essential DPDK infrastructure parameters.
+ * Sensible defaults applied for optional parameters.
  */
 
 #ifndef ENV_CONFIG_H
 #define ENV_CONFIG_H
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <netinet/in.h>
 
 #define ENV_MAX_PORTS 8
 #define ENV_MAX_LCORES 32
@@ -34,7 +34,7 @@ struct env_dpdk_config {
     int hugepages;
 
     /* Ports */
-    char ports[ENV_MAX_PORTS][32];  /* PCI addresses */
+    char ports[ENV_MAX_PORTS][32]; /* PCI addresses */
     int num_ports;
     char driver[64];
     int port_mtu;
@@ -54,29 +54,10 @@ struct env_dpdk_config {
 };
 
 /**
- * Worker Configuration (from .env)
- */
-struct env_worker_config {
-    int rx_count;
-    int nat_count;
-};
-
-/**
- * NAT44 Performance Tuning (from .env - hardware level)
- * Runtime config (pools, timeouts, enable) is in startup.json
- */
-struct env_nat44_config {
-    uint32_t max_sessions;       /* Session table size */
-    bool lockless_enable;        /* Per-core lockless mode */
-    int session_cache_size;      /* Per-worker L1 cache */
-    int prefetch_lookahead;      /* Prefetch depth */
-};
-
-/**
  * Logging Configuration (from .env)
  */
 struct env_log_config {
-    int level;  /* 0=emerg, 7=debug */
+    int level; /* 0=emerg, 7=debug */
 };
 
 /**
@@ -85,11 +66,9 @@ struct env_log_config {
  */
 struct env_config {
     struct env_dpdk_config dpdk;
-    struct env_worker_config workers;
-    struct env_nat44_config nat44;
     struct env_log_config log;
 
-    bool validated;  /* Set true after successful parse */
+    bool validated; /* Set true after successful parse */
     char env_path[ENV_MAX_PATH];
 };
 
@@ -120,9 +99,5 @@ int env_get_tx_desc(void);
 int env_get_num_workers(void);
 int env_get_numa_node(void);
 bool env_get_rss_enable(void);
-bool env_get_nat44_lockless(void);
-uint32_t env_get_nat44_max_sessions(void);
-int env_get_nat44_cache_size(void);
-int env_get_nat44_prefetch(void);
 
 #endif /* ENV_CONFIG_H */

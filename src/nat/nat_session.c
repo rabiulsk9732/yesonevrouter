@@ -151,7 +151,10 @@ static inline uint32_t get_worker_id(uint32_t hash)
 int nat_session_init(void)
 {
     /* VPP-STYLE: Per-worker hash tables - NO GLOBAL LOCKS */
-    for (int i = 0; i < NAT_MAX_WORKERS; i++) {
+    /* Only allocate for configured number of workers, not NAT_MAX_WORKERS */
+    uint32_t num_workers_to_init = g_num_workers > 0 ? g_num_workers : 1;
+    YLOG_INFO("NAT: Initializing hash tables for %u workers", num_workers_to_init);
+    for (uint32_t i = 0; i < num_workers_to_init; i++) {
         memset(&g_nat_workers[i], 0, sizeof(g_nat_workers[i]));
 
         uint32_t table_size = NAT_WORKER_TABLE_SIZE * 4;
@@ -176,8 +179,8 @@ int nat_session_init(void)
     YLOG_INFO("NAT: VPP-style per-worker hash tables initialized (size %u, workers=%u)",
               NAT_WORKER_TABLE_SIZE * 4, g_num_workers);
 
-    /* Initialize session slab allocator */
-    if (nat_session_slab_init(10000000) != 0) {
+    /* Initialize session slab allocator (reduced to 1M for memory constraints) */
+    if (nat_session_slab_init(1000000) != 0) {
         YLOG_ERROR("Failed to initialize NAT session slab");
         return -1;
     }
@@ -190,7 +193,7 @@ int nat_session_init(void)
     uint32_t sessions_per_worker = g_max_sessions / actual_workers;
     YLOG_INFO("NAT: Allocating %u sessions per worker (%u workers)", sessions_per_worker,
               actual_workers);
-    for (int i = 0; i < NAT_MAX_WORKERS; i++) {
+    for (uint32_t i = 0; i < actual_workers; i++) {
         g_nat_workers[i].session_pool.capacity = sessions_per_worker;
 #ifdef HAVE_DPDK
         g_nat_workers[i].session_pool.free_stack = rte_zmalloc_socket(
@@ -220,7 +223,6 @@ int nat_session_init(void)
 
 /* Session ID counter */
 static uint64_t session_id_counter = 0;
-static pthread_mutex_t session_id_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Statistics */
 extern struct nat_config g_nat_config;
@@ -1195,8 +1197,8 @@ struct nat_session *nat_session_lookup_flow(uint32_t inside_ip, uint32_t outside
      * We'll use a hash that's based on inside_ip + protocol only
      */
     uint32_t hash_base = nat_hash_5tuple(inside_ip, 0, protocol);
-    uint32_t partition = get_partition_id(hash_base);
     struct nat_session *session;
+    (void)outside_ip; /* Unused parameter */
 
     /* Try per-worker fast path first */
     extern __thread int g_thread_worker_id;
@@ -1371,7 +1373,7 @@ int nat_session_timeout_check(void)
     /* Each worker gets a portion of partitions based on worker_id */
     uint32_t partitions_per_worker = NAT_NUM_PARTITIONS / g_num_workers;
     uint32_t start_partition = worker_id * partitions_per_worker;
-    uint32_t end_partition = (worker_id == g_num_workers - 1)
+    uint32_t end_partition = ((uint32_t)worker_id == g_num_workers - 1)
                                  ? NAT_NUM_PARTITIONS
                                  : (worker_id + 1) * partitions_per_worker;
 

@@ -98,9 +98,7 @@ static void print_usage(const char *prog)
 int main(int argc, char *argv[])
 {
 
-    const char *config_file = NULL;
     bool daemon_mode = false;
-    bool client_mode = false; /* Connect to running daemon as CLI client */
     char *dpdk_argv[32];
     int dpdk_argc = 0;
 
@@ -324,9 +322,11 @@ int main(int argc, char *argv[])
     }
 
     /* Set NAT workers BEFORE nat_init (fixes g_num_workers=1 bug) */
+    /* Use DPDK worker lcore count, not optional nat_count which may not be set */
     extern void nat_set_num_workers(uint32_t num_workers);
-    int nat_workers = g_env_config.workers.nat_count > 0 ? g_env_config.workers.nat_count : 4;
-    YLOG_INFO("Setting NAT workers to %d before nat_init", nat_workers);
+    int nat_workers = g_env_config.dpdk.num_workers > 0 ? g_env_config.dpdk.num_workers : 4;
+    YLOG_INFO("Setting NAT workers to %d before nat_init (from %d DPDK worker lcores)", nat_workers,
+              g_env_config.dpdk.num_workers);
     nat_set_num_workers(nat_workers);
 
     /* Initialize NAT subsystem */
@@ -429,7 +429,7 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* User DB, Session, and Telnet removed    /* Parse arguments */
+    /* Initialize CLI */
     setvbuf(stdout, NULL, _IONBF, 0);
     if (cli_init() != 0) {
         YLOG_ERROR("Failed to initialize CLI");

@@ -35,6 +35,17 @@
 #define NAT_INSIDE_PORT 0
 #define NAT_OUTSIDE_PORT 1
 
+/* Debug trace - rate limited to avoid log spam */
+static __thread uint64_t nat_trace_counter = 0;
+#define NAT_TRACE_RATE 100 /* Log 1 in N packets */
+#define NAT_TRACE(fmt, ...)                                                                        \
+    do {                                                                                           \
+        if ((nat_trace_counter++ % NAT_TRACE_RATE) == 0) {                                         \
+            YLOG_INFO("[NAT-TRACE] " fmt, ##__VA_ARGS__);                                          \
+        }                                                                                          \
+    } while (0)
+#define NAT_TRACE_ALWAYS(fmt, ...) YLOG_INFO("[NAT-TRACE] " fmt, ##__VA_ARGS__)
+
 /* Per-lcore statistics for zero contention */
 struct nat_lcore_stats {
     uint64_t rx_packets;
@@ -173,6 +184,13 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
             continue;
         }
 
+        /* Log packet details for debugging */
+        NAT_TRACE("W%u port=%u %s: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u", worker_id,
+                  ingress_port, is_inside_to_outside ? "SNAT" : "DNAT", (src_ip >> 24) & 0xFF,
+                  (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                  (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF,
+                  dst_port, proto);
+
         /* VPP-STYLE WORKER HANDOFF:\n         * For SNAT (inside→outside): Use inside tuple to
          * determine owner\n         * For DNAT (outside→inside): Will check session->owner_worker
          * after lookup\n         */
@@ -294,7 +312,25 @@ uint16_t nat_process_burst_dpdk(struct rte_mbuf **pkts, uint16_t nb_rx, uint32_t
         } else {
             /* OUTSIDE -> INSIDE: DNAT (translate destination) */
 
-            /* Lookup session by outside (public) IP:port */
+            /* VPP-STYLE: Handoff based on outside_port BEFORE session lookup
+             * The session is stored in the owner worker's table, not ours!
+             * Each worker has a non-overlapping port range so we can compute owner from port
+             */
+            uint32_t owner_worker = nat_port_to_worker(dst_port);
+            if (owner_worker != worker_id) {
+                /* Wrong worker - handoff to session owner */
+                if (nat_worker_handoff_enqueue(owner_worker, pkt) == 0) {
+                    stats->handoff_tx++;
+                    continue; /* Packet handed off successfully */
+                }
+                /* Ring full - drop to preserve ownership invariant */
+                stats->dropped++;
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            /* Lookup session by outside (public) IP:port - NOW we're guaranteed to be on owner
+             * worker */
             session = nat_session_lookup_outside(dst_ip, dst_port, proto);
 
             if (!session) {

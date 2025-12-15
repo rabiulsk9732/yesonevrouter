@@ -1,14 +1,14 @@
 {
   "_comment": "YESRouter vBNG Production Config",
   "interfaces": {
-    "Gi0/1": {
+    "eth0": {
       "description": "WAN Interface",
       "ipv4_address": "103.181.65.166",
       "ipv4_mask": "255.255.255.248",
       "nat_inside": false,
       "nat_outside": true
     },
-    "Gi0/2": {
+    "eth1": {
       "description": "LAN Interface - PPPoE",
       "ipv4_address": "172.16.17.1",
       "ipv4_mask": "255.255.255.0",

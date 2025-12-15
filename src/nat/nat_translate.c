@@ -268,6 +268,9 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
 
         /* Allocate public IP/Port from selected pool */
         outside_ip = nat_pool_allocate_ip(selected_pool);
+        YLOG_INFO("[NAT-DEBUG] Pool '%s': allocated outside_ip = %u.%u.%u.%u", selected_pool->name,
+                  (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF,
+                  outside_ip & 0xFF);
         if (unlikely(!outside_ip)) {
             // YLOG_WARNING("[SNAT FAIL] Pool %s exhausted", selected_pool->name);
             g_nat_config.stats.no_ip_available++;
@@ -284,9 +287,15 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
             return -1;
         }
 
-        /* For ICMP, use EIM (Endpoint Independent Mapping) */
+        /* For ICMP, use EIM (Endpoint Independent Mapping) with identifier translation */
         if (protocol == IPPROTO_ICMP) {
-            outside_port = inside_port;
+            /* Allocate a different ICMP identifier for the outside */
+            outside_port = nat_allocate_port(selected_pool, outside_ip, protocol);
+            if (unlikely(!outside_port)) {
+                g_nat_config.stats.no_port_available++;
+                nat_pool_release_ip(selected_pool, outside_ip);
+                return -1;
+            }
         } else {
             outside_port = nat_allocate_port(selected_pool, outside_ip, protocol);
             if (unlikely(!outside_port)) {
@@ -296,13 +305,16 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
             }
         }
 
+        YLOG_INFO("[NAT-DEBUG] Creating session: inside=%u.%u.%u.%u:%u -> outside=%u.%u.%u.%u:%u",
+                  (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF, (inside_ip >> 8) & 0xFF,
+                  inside_ip & 0xFF, inside_port, (outside_ip >> 24) & 0xFF,
+                  (outside_ip >> 16) & 0xFF, (outside_ip >> 8) & 0xFF, outside_ip & 0xFF,
+                  outside_port);
         session = nat_session_create(inside_ip, inside_port, outside_ip, outside_port, protocol,
                                      dest_ip, dest_port);
         if (unlikely(!session)) {
             /* Cleanup allocated resources */
-            if (protocol != IPPROTO_ICMP) {
-                nat_release_port(selected_pool, outside_ip, outside_port, protocol);
-            }
+            nat_release_port(selected_pool, outside_ip, outside_port, protocol);
             nat_pool_release_ip(selected_pool, outside_ip);
 
             if (protocol == IPPROTO_ICMP) {
@@ -315,6 +327,16 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
             return -1;
         }
 
+        /* Track ICMP session creation success */
+        if (protocol == IPPROTO_ICMP) {
+            __atomic_fetch_add(&g_nat_config.stats.icmp_sessions_created, 1, __ATOMIC_RELAXED);
+            YLOG_INFO("[ICMP-IN2OUT] Session created: in=%u.%u.%u.%u:%u -> out=%u.%u.%u.%u:%u",
+                      (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF,
+                      (inside_ip >> 8) & 0xFF, inside_ip & 0xFF, inside_port,
+                      (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
+                      (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port);
+        }
+
         /* FAST PATH: No logging in hot path - stats only */
         g_nat_config.stats.in2out_misses++;
     } else {
@@ -322,6 +344,16 @@ int nat_translate_snat(struct pkt_buf *pkt, struct interface *iface)
         __atomic_fetch_add(&g_nat_config.stats.in2out_hits, 1, __ATOMIC_RELAXED);
         outside_ip = session->outside_ip;
         outside_port = session->outside_port;
+
+        /* Track ICMP session lookup hits */
+        if (protocol == IPPROTO_ICMP) {
+            __atomic_fetch_add(&g_nat_config.stats.icmp_sessions_lookup_hits, 1, __ATOMIC_RELAXED);
+            YLOG_INFO("[ICMP-IN2OUT-HIT] Session cache hit: in=%u.%u.%u.%u:%u -> out=%u.%u.%u.%u:%u",
+                      (inside_ip >> 24) & 0xFF, (inside_ip >> 16) & 0xFF,
+                      (inside_ip >> 8) & 0xFF, inside_ip & 0xFF, inside_port,
+                      (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
+                      (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port);
+        }
 
         /* Update destination IP/port for NetFlow logging */
         /* This ensures we capture the latest destination for EIM sessions */
@@ -443,7 +475,7 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     struct rte_ipv4_hdr *ip;
     struct rte_tcp_hdr *tcp;
     struct rte_udp_hdr *udp;
-    struct rte_icmp_hdr *icmp;
+    struct rte_icmp_hdr *icmp = NULL; /* Initialize to suppress warning */
     struct nat_session *session;
     uint32_t outside_ip, inside_ip;
     uint16_t outside_port, inside_port;
@@ -546,9 +578,10 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
     }
     if (unlikely(!session)) {
         if (protocol == IPPROTO_ICMP) {
-            /* Track ICMP identifier mismatches */
+            /* Track ICMP identifier mismatches and lookup misses */
             __atomic_fetch_add(&g_nat_config.stats.icmp_identifier_mismatches, 1, __ATOMIC_RELAXED);
-            YLOG_DEBUG("[ICMP-OUT2IN-MISS] No session for dst=%u.%u.%u.%u id=%u type=%u",
+            __atomic_fetch_add(&g_nat_config.stats.icmp_sessions_lookup_misses, 1, __ATOMIC_RELAXED);
+            YLOG_WARNING("[ICMP-OUT2IN-MISS] No session for dst=%u.%u.%u.%u id=%u type=%u",
                        (outside_ip >> 24) & 0xFF, (outside_ip >> 16) & 0xFF,
                        (outside_ip >> 8) & 0xFF, outside_ip & 0xFF, outside_port,
                        icmp ? icmp->icmp_type : 0xFF);
@@ -563,10 +596,12 @@ int nat_translate_dnat(struct pkt_buf *pkt, struct interface *iface)
         return -1;
     }
     if (protocol == IPPROTO_ICMP) {
-        YLOG_DEBUG("[ICMP-OUT2IN-HIT] Session found! inside=%u.%u.%u.%u id=%u",
-                   (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
-                   (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF,
-                   session->inside_port);
+        __atomic_fetch_add(&g_nat_config.stats.icmp_sessions_lookup_hits, 1, __ATOMIC_RELAXED);
+        YLOG_INFO("[ICMP-OUT2IN-HIT] Session found! in=%u.%u.%u.%u:%u -> out=%u.%u.%u.%u:%u",
+                  (session->inside_ip >> 24) & 0xFF, (session->inside_ip >> 16) & 0xFF,
+                  (session->inside_ip >> 8) & 0xFF, session->inside_ip & 0xFF, session->inside_port,
+                  (session->outside_ip >> 24) & 0xFF, (session->outside_ip >> 16) & 0xFF,
+                  (session->outside_ip >> 8) & 0xFF, session->outside_ip & 0xFF, session->outside_port);
     }
     g_nat_config.stats.out2in_hits++;
 

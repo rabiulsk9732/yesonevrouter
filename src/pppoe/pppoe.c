@@ -110,6 +110,21 @@ static const char *pppoe_get_profile_pool(const char *iface_name, uint16_t vlan_
     return NULL;
 }
 
+/**
+ * Check if a service profile exists for the given interface and VLAN
+ * Returns true if profile found, false otherwise
+ */
+static bool pppoe_profile_exists(const char *iface_name, uint16_t vlan_id)
+{
+    for (int i = 0; i < g_num_profiles; i++) {
+        if (g_profiles[i].vlan_id == vlan_id &&
+            strncmp(g_profiles[i].iface_name, iface_name, 32) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void pppoe_add_profile(const char *iface_name, uint16_t vlan_id, const char *pool_name)
 {
     if (g_num_profiles >= MAX_PROFILES)
@@ -525,14 +540,10 @@ static int pppoe_send_pado(struct interface *iface, const struct rte_ether_addr 
         payload += sizeof(struct pppoe_tag) + svc_name_len;
         payload_len += sizeof(struct pppoe_tag) + svc_name_len;
     } else {
-        /* Default Service Name */
-        const char *def_svc =
-            (g_pppoe_ctx.service_name[0]) ? g_pppoe_ctx.service_name : g_pppoe_ctx.ac_name;
-        uint16_t def_len = strlen(def_svc);
-        tag->length = rte_cpu_to_be_16(def_len);
-        memcpy(tag->value, def_svc, def_len);
-        payload += sizeof(struct pppoe_tag) + def_len;
-        payload_len += sizeof(struct pppoe_tag) + def_len;
+        /* RFC 2516: Echo empty Service-Name when client requests "any service" */
+        tag->length = 0;
+        payload += sizeof(struct pppoe_tag);
+        payload_len += sizeof(struct pppoe_tag);
     }
 
     /* Add Host-Uniq Tag if present in PADI */
@@ -956,6 +967,13 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
                   eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
                   eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
                   eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
+
+        /* CRITICAL FIX: Only respond if a service profile exists for this interface/VLAN */
+        if (iface && !pppoe_profile_exists(iface->name, vlan_id)) {
+            YLOG_INFO("PPPoE: No service profile for %s VLAN %u - ignoring PADI",
+                      iface->name, vlan_id);
+            return 0;
+        }
 
         /* Send PADO with VLAN tag if received on VLAN */
         YLOG_INFO("PPPoE: Sending PADO to %02x:%02x:%02x:%02x:%02x:%02x vlan=%u",

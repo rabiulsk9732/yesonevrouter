@@ -92,6 +92,7 @@ struct nat_worker_data {
     uint64_t packets_translated;
     uint64_t snat_packets;
     uint64_t dnat_packets;
+    uint64_t icmp_alg;            /* ICMP ALG processing counter */
 
     /* Cross-Worker Lookup Stats (RSS Asymmetry Handling) */
     uint64_t cross_worker_lookups; /* DNAT searched other workers' tables */

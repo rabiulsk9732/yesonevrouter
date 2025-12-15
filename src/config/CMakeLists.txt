@@ -1,8 +1,8 @@
 # Configuration Module CMakeLists.txt
+# Using only env_config.c (.env Bison-style) - removed legacy yesrouter_config.c
 
 set(CONFIG_SOURCES
     config.c
-    yesrouter_config.c
     env_config.c
     startup_json.c
 )
