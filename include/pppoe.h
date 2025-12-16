@@ -6,25 +6,25 @@
 #ifndef PPPOE_H
 #define PPPOE_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <rte_ether.h>
-#include <time.h>
-#include "qos.h"
 #include "pppoe_defs.h"
+#include "qos.h"
+#include <rte_ether.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
 
 /* Global PPP Settings (set once, apply to all sessions) */
 struct pppoe_global_settings {
-    uint16_t mtu;                /* Default: 1492 */
-    uint16_t mru;                /* Default: 1492 */
-    uint16_t lcp_echo_interval;  /* Default: 30 sec */
-    uint8_t  lcp_echo_failure;   /* Default: 3 */
-    uint32_t idle_timeout;       /* Default: 0 (disabled) */
-    uint32_t session_timeout;    /* Default: 0 (disabled) */
-    uint16_t pado_delay_ms;      /* PADO delay in milliseconds (0-2000) */
-    uint32_t padi_rate_limit;    /* Max PADI per second (0 = unlimited) */
-    char     ac_name[64];
-    char     service_name[64];
+    uint16_t mtu;               /* Default: 1492 */
+    uint16_t mru;               /* Default: 1492 */
+    uint16_t lcp_echo_interval; /* Default: 30 sec */
+    uint8_t lcp_echo_failure;   /* Default: 3 */
+    uint32_t idle_timeout;      /* Default: 0 (disabled) */
+    uint32_t session_timeout;   /* Default: 0 (disabled) */
+    uint16_t pado_delay_ms;     /* PADO delay in milliseconds (0-2000) */
+    uint32_t padi_rate_limit;   /* Max PADI per second (0 = unlimited) */
+    char ac_name[64];
+    char service_name[64];
 };
 
 /* Global settings accessor */
@@ -43,15 +43,15 @@ struct interface;
 /* PPPoE Header (packed) */
 struct pppoe_hdr {
 #if RTE_BYTE_ORDER == RTE_LITTLE_ENDIAN
-    uint8_t ver:4;      /* Version (must be 1) */
-    uint8_t type:4;     /* Type (must be 1) */
+    uint8_t ver : 4;  /* Version (must be 1) */
+    uint8_t type : 4; /* Type (must be 1) */
 #elif RTE_BYTE_ORDER == RTE_BIG_ENDIAN
-    uint8_t type:4;
-    uint8_t ver:4;
+    uint8_t type : 4;
+    uint8_t ver : 4;
 #endif
-    uint8_t code;       /* Code (PADI/PADO/etc) */
-    uint16_t session_id;/* Session ID */
-    uint16_t length;    /* Payload length */
+    uint8_t code;        /* Code (PADI/PADO/etc) */
+    uint16_t session_id; /* Session ID */
+    uint16_t length;     /* Payload length */
 } __attribute__((packed));
 
 /* PPPoE Tag Header */
@@ -92,10 +92,10 @@ enum ppp_lcp_state {
 struct pppoe_session {
     /* Cacheline 0: Hot Path (Data/Encapsulation) */
     uint16_t session_id;
-    uint8_t state;         /* enum pppoe_state */
-    uint8_t lcp_state;     /* enum ppp_lcp_state */
-    uint8_t ipcp_state;    /* enum ppp_ipcp_state */
-    uint32_t client_ip;    /* Host Order */
+    uint8_t state;      /* enum pppoe_state */
+    uint8_t lcp_state;  /* enum ppp_lcp_state */
+    uint8_t ipcp_state; /* enum ppp_ipcp_state */
+    uint32_t client_ip; /* Host Order */
 
     struct rte_ether_addr client_mac;
     struct interface *iface;
@@ -112,7 +112,13 @@ struct pppoe_session {
     uint32_t server_ip;
     uint8_t next_lcp_identifier;
     uint8_t echo_failures;
-    uint8_t auth_complete;     /* 1 if RADIUS auth completed */
+    uint8_t auth_complete; /* 1 if RADIUS auth completed */
+
+    /* RFC 1661: LCP OPENED requires bidirectional Config-Ack */
+    uint8_t lcp_peer_acked_us : 1; /* We received Config-Ack for our Config-Request */
+    uint8_t lcp_we_acked_peer : 1; /* We sent Config-Ack for peer's Config-Request */
+    uint8_t lcp_auth_started : 1;  /* Auth phase started (prevent double-start) */
+    uint8_t _lcp_flags_pad : 5;
 
     uint32_t magic_number;
     uint32_t peer_magic_number;
@@ -147,7 +153,7 @@ struct pppoe_session {
 
     /* Profile */
     uint16_t vlan_id;
-    uint16_t auth_protocol;  /* Negotiated auth: PPP_PROTO_PAP or PPP_PROTO_CHAP */
+    uint16_t auth_protocol; /* Negotiated auth: PPP_PROTO_PAP or PPP_PROTO_CHAP */
     char pool_name[32];
 } __attribute__((aligned(64)));
 

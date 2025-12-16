@@ -251,7 +251,7 @@ int pppoe_init(void)
         .key_len = sizeof(struct session_key_id),
         .hash_func = rte_jhash,
         .hash_func_init_val = 0,
-        .socket_id = rte_socket_id(),
+        .socket_id = 0, /* Force socket 0 instead of rte_socket_id() which may be -1 */
     };
     g_pppoe_ctx.session_id_hash = rte_hash_create(&id_hash_params);
     if (!g_pppoe_ctx.session_id_hash) {
@@ -266,7 +266,7 @@ int pppoe_init(void)
         .key_len = sizeof(uint32_t),
         .hash_func = rte_jhash,
         .hash_func_init_val = 0,
-        .socket_id = rte_socket_id(),
+        .socket_id = 0, /* Force socket 0 */
     };
     g_pppoe_ctx.session_ip_hash = rte_hash_create(&ip_hash_params);
     if (!g_pppoe_ctx.session_ip_hash) {
@@ -281,7 +281,7 @@ int pppoe_init(void)
         .key_len = sizeof(struct rte_ether_addr),
         .hash_func = rte_jhash,
         .hash_func_init_val = 0,
-        .socket_id = rte_socket_id(),
+        .socket_id = 0, /* Force socket 0 */
     };
     g_padi_hash = rte_hash_create(&padi_hash_params);
 
@@ -371,6 +371,7 @@ static struct pppoe_session *pppoe_find_session(uint16_t session_id,
     }
 
     struct session_key_id key;
+    memset(&key, 0, sizeof(key)); /* Zero-init to avoid padding bytes affecting hash */
     rte_ether_addr_copy(mac, &key.mac);
     key.session_id = session_id;
 
@@ -380,6 +381,11 @@ static struct pppoe_session *pppoe_find_session(uint16_t session_id,
     if (ret >= 0) {
         return &g_pppoe_session_slab[idx];
     }
+
+    /* Debug: Log lookup failure with details */
+    YLOG_DEBUG("PPPoE: Session lookup FAILED - id=%u mac=%02x:%02x:%02x:%02x:%02x:%02x ret=%d",
+               session_id, mac->addr_bytes[0], mac->addr_bytes[1], mac->addr_bytes[2],
+               mac->addr_bytes[3], mac->addr_bytes[4], mac->addr_bytes[5], ret);
     return NULL;
 }
 
@@ -470,15 +476,35 @@ static struct pppoe_session *pppoe_create_session(const struct rte_ether_addr *m
 
     /* 3. Add to ID Hash */
     struct session_key_id key;
+    memset(&key, 0, sizeof(key)); /* Zero-init to avoid padding bytes affecting hash */
     key.session_id = id;
     rte_ether_addr_copy(mac, &key.mac);
 
     int ret = rte_hash_add_key_data(g_pppoe_ctx.session_id_hash, &key, (void *)(uintptr_t)id);
     if (ret < 0) {
         rte_spinlock_unlock(&g_pppoe_ctx.alloc_lock);
-        YLOG_ERROR("PPPoE: Failed to add to ID hash");
+        YLOG_ERROR("PPPoE: Failed to add to ID hash (ret=%d)", ret);
         rte_bitmap_clear(g_pppoe_ctx.session_bitmap, id);
         return NULL;
+    }
+
+    /* Memory barrier to ensure session data visible to all workers before releasing lock */
+    rte_wmb();
+
+    YLOG_INFO("PPPoE: Session %u added to hash SUCCESS (mac=%02x:%02x:%02x:%02x:%02x:%02x) ret=%d",
+              id, mac->addr_bytes[0], mac->addr_bytes[1], mac->addr_bytes[2],
+              mac->addr_bytes[3], mac->addr_bytes[4], mac->addr_bytes[5], ret);
+
+    /* Memory barrier to ensure session data visible to all workers before releasing lock */
+    rte_wmb();
+
+    /* Verify the entry was added by doing a lookup */
+    uint64_t test_idx = 0;
+    int verify_ret = rte_hash_lookup_data(g_pppoe_ctx.session_id_hash, &key, (void **)&test_idx);
+    if (verify_ret < 0) {
+        YLOG_ERROR("PPPoE: IMMEDIATE VERIFY FAILED after add! session=%u ret=%d", id, verify_ret);
+    } else {
+        YLOG_INFO("PPPoE: Session %u verified in hash (idx=%lu)", id, test_idx);
     }
 
     /* Release lock before calling subsystem init functions
@@ -922,8 +948,7 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
                                g_padi_nodes[oldest_idx].mac.addr_bytes[2],
                                g_padi_nodes[oldest_idx].mac.addr_bytes[3],
                                g_padi_nodes[oldest_idx].mac.addr_bytes[4],
-                               g_padi_nodes[oldest_idx].mac.addr_bytes[5],
-                               time(NULL) - oldest_ts);
+                               g_padi_nodes[oldest_idx].mac.addr_bytes[5], time(NULL) - oldest_ts);
                 }
             }
 
@@ -970,8 +995,8 @@ int pppoe_process_discovery(struct pkt_buf *pkt, struct interface *iface)
 
         /* CRITICAL FIX: Only respond if a service profile exists for this interface/VLAN */
         if (iface && !pppoe_profile_exists(iface->name, vlan_id)) {
-            YLOG_INFO("PPPoE: No service profile for %s VLAN %u - ignoring PADI",
-                      iface->name, vlan_id);
+            YLOG_INFO("PPPoE: No service profile for %s VLAN %u - ignoring PADI", iface->name,
+                      vlan_id);
             return 0;
         }
 
@@ -1128,6 +1153,11 @@ int pppoe_process_session(struct pkt_buf *pkt, struct interface *iface)
     uint16_t ether_type = rte_be_to_cpu_16(eth->ether_type);
     struct pppoe_hdr *pppoe;
 
+    YLOG_DEBUG("PPPoE SESS RX: len=%u from %02x:%02x:%02x:%02x:%02x:%02x",
+               m->data_len, eth->src_addr.addr_bytes[0], eth->src_addr.addr_bytes[1],
+               eth->src_addr.addr_bytes[2], eth->src_addr.addr_bytes[3],
+               eth->src_addr.addr_bytes[4], eth->src_addr.addr_bytes[5]);
+
     /* Handle VLAN tagged packets */
     if (ether_type == RTE_ETHER_TYPE_VLAN) {
         struct rte_vlan_hdr *vlan = (struct rte_vlan_hdr *)(eth + 1);
@@ -1281,7 +1311,9 @@ void pppoe_terminate_session(struct pppoe_session *session, const char *reason)
                  session->state);
 
     /* Remove from Hash Tables */
-    struct session_key_id key = {.session_id = session->session_id};
+    struct session_key_id key;
+    memset(&key, 0, sizeof(key)); /* Zero-init to match insertion */
+    key.session_id = session->session_id;
     rte_ether_addr_copy(&session->client_mac, &key.mac);
 
     rte_hash_del_key(g_pppoe_ctx.session_id_hash, &key);
@@ -1436,14 +1468,14 @@ void pppoe_update_qos(const uint8_t *mac, uint64_t rate_bps)
     YLOG_WARNING("PPPoE: Session not found for QoS update");
 }
 
-
 /**
  * Handle RADIUS response from lockless RADIUS client
  * Called from packet processing loop when responses arrive
  */
 void pppoe_handle_radius_response(struct radius_auth_response *resp)
 {
-    if (!resp) return;
+    if (!resp)
+        return;
 
     struct pppoe_session *session = pppoe_find_session(resp->session_id, NULL);
     if (!session) {
@@ -1475,10 +1507,9 @@ void pppoe_handle_radius_response(struct radius_auth_response *resp)
         /* Use RADIUS Framed-IP if provided, otherwise keep pool-allocated IP */
         uint32_t assigned_ip = (resp->framed_ip != 0) ? resp->framed_ip : session->client_ip;
 
-        YLOG_INFO("PPPoE: Auth success session=%u IP=%u.%u.%u.%u",
-                  resp->session_id,
-                  (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
-                  (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF);
+        YLOG_INFO("PPPoE: Auth success session=%u IP=%u.%u.%u.%u", resp->session_id,
+                  (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF, (assigned_ip >> 8) & 0xFF,
+                  assigned_ip & 0xFF);
 
         /* Update session */
         if (resp->framed_ip != 0)
@@ -1492,8 +1523,8 @@ void pppoe_handle_radius_response(struct radius_auth_response *resp)
         }
 
         /* Send Accounting Start */
-        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id,
-                            session->username, session->client_ip);
+        radius_acct_request(RADIUS_ACCT_STATUS_START, session->session_id, session->username,
+                            session->client_ip);
         session->last_acct_ts = time(NULL);
         session->start_ts = time(NULL);
 
@@ -1516,29 +1547,29 @@ void pppoe_handle_radius_response(struct radius_auth_response *resp)
         ppp_ipcp_open(session);
 
         /* HA Sync */
-        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id,
-                     session->client_mac.addr_bytes, 0, session->state);
+        ha_send_sync(HA_MSG_SESSION_UPDATE, session->session_id, session->client_mac.addr_bytes, 0,
+                     session->state);
 
     } else {
         /* Auth failed (reject, timeout, or error) */
-        YLOG_INFO("PPPoE: Auth failed session=%u result=%d msg='%s'",
-                  resp->session_id, resp->result, resp->reply_message);
+        YLOG_INFO("PPPoE: Auth failed session=%u result=%d msg='%s'", resp->session_id,
+                  resp->result, resp->reply_message);
 
         const char *msg = resp->reply_message[0] ? resp->reply_message : "Auth Failed";
         if (session->chap_challenge_len > 0) {
-            ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE,
-                          session->next_lcp_identifier, (const uint8_t *)msg, strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_CHAP, CHAP_CODE_FAILURE, session->next_lcp_identifier,
+                          (const uint8_t *)msg, strlen(msg));
         } else {
             uint8_t reply_data[256];
             reply_data[0] = strlen(msg);
             memcpy(reply_data + 1, msg, strlen(msg));
-            ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK,
-                          session->next_lcp_identifier, reply_data, 1 + strlen(msg));
+            ppp_auth_send(session, PPP_PROTO_PAP, PAP_CODE_AUTH_NAK, session->next_lcp_identifier,
+                          reply_data, 1 + strlen(msg));
         }
 
         session->state = PPPOE_STATE_TERMINATED;
-        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id,
-                     session->client_mac.addr_bytes, 0, session->state);
+        ha_send_sync(HA_MSG_SESSION_DEL, session->session_id, session->client_mac.addr_bytes, 0,
+                     session->state);
     }
 }
 

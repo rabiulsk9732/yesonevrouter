@@ -6,66 +6,65 @@
  * while DPDK lcores use lockless rings for communication.
  */
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <errno.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <poll.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <net/route.h>
 
 #include <rte_common.h>
-#include <rte_ring.h>
-#include <rte_mempool.h>
-#include <rte_malloc.h>
 #include <rte_cycles.h>
-#include <rte_lcore.h>
-#include <rte_mbuf.h>
+#include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_lcore.h>
+#include <rte_malloc.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_ring.h>
 #include <rte_udp.h>
-#include <rte_ethdev.h>
 
-#include "radius_lockless.h"
-#include "log.h"
-#include "interface.h"
 #include "arp.h"
-
-/* DPDK TX for RADIUS */
-static struct rte_mempool *g_radius_pktmbuf_pool = NULL;
-static uint16_t g_radius_src_port = 1645; /* Source port for RADIUS packets */
+#include "interface.h"
+#include "log.h"
+#include "radius_lockless.h"
 
 /* Global context */
 struct radius_lockless_ctx *g_radius_ll_ctx = NULL;
 
 /* RADIUS packet codes */
-#define RADIUS_CODE_ACCESS_REQUEST      1
-#define RADIUS_CODE_ACCESS_ACCEPT       2
-#define RADIUS_CODE_ACCESS_REJECT       3
-#define RADIUS_CODE_ACCOUNTING_REQUEST  4
+#define RADIUS_CODE_ACCESS_REQUEST 1
+#define RADIUS_CODE_ACCESS_ACCEPT 2
+#define RADIUS_CODE_ACCESS_REJECT 3
+#define RADIUS_CODE_ACCOUNTING_REQUEST 4
 #define RADIUS_CODE_ACCOUNTING_RESPONSE 5
 
 /* RADIUS attribute types */
-#define RADIUS_ATTR_USER_NAME           1
-#define RADIUS_ATTR_USER_PASSWORD       2
-#define RADIUS_ATTR_CHAP_PASSWORD       3
-#define RADIUS_ATTR_NAS_IP_ADDRESS      4
-#define RADIUS_ATTR_NAS_PORT            5
-#define RADIUS_ATTR_SERVICE_TYPE        6
-#define RADIUS_ATTR_FRAMED_PROTOCOL     7
-#define RADIUS_ATTR_FRAMED_IP_ADDRESS   8
-#define RADIUS_ATTR_FRAMED_IP_NETMASK   9
-#define RADIUS_ATTR_FRAMED_MTU          12
-#define RADIUS_ATTR_REPLY_MESSAGE       18
-#define RADIUS_ATTR_SESSION_TIMEOUT     27
-#define RADIUS_ATTR_IDLE_TIMEOUT        28
-#define RADIUS_ATTR_CALLING_STATION_ID  31
-#define RADIUS_ATTR_NAS_IDENTIFIER      32
-#define RADIUS_ATTR_CHAP_CHALLENGE      60
-#define RADIUS_ATTR_NAS_PORT_TYPE       61
+#define RADIUS_ATTR_USER_NAME 1
+#define RADIUS_ATTR_USER_PASSWORD 2
+#define RADIUS_ATTR_CHAP_PASSWORD 3
+#define RADIUS_ATTR_NAS_IP_ADDRESS 4
+#define RADIUS_ATTR_NAS_PORT 5
+#define RADIUS_ATTR_SERVICE_TYPE 6
+#define RADIUS_ATTR_FRAMED_PROTOCOL 7
+#define RADIUS_ATTR_FRAMED_IP_ADDRESS 8
+#define RADIUS_ATTR_FRAMED_IP_NETMASK 9
+#define RADIUS_ATTR_FRAMED_MTU 12
+#define RADIUS_ATTR_REPLY_MESSAGE 18
+#define RADIUS_ATTR_SESSION_TIMEOUT 27
+#define RADIUS_ATTR_IDLE_TIMEOUT 28
+#define RADIUS_ATTR_CALLING_STATION_ID 31
+#define RADIUS_ATTR_NAS_IDENTIFIER 32
+#define RADIUS_ATTR_CHAP_CHALLENGE 60
+#define RADIUS_ATTR_NAS_PORT_TYPE 61
 
 /* Pending request tracking in control thread */
 #define MAX_PENDING_REQUESTS 256
@@ -105,10 +104,8 @@ int radius_lockless_init(int numa_socket)
     }
 
     /* Allocate context */
-    g_radius_ll_ctx = rte_zmalloc_socket("radius_ll_ctx",
-                                          sizeof(struct radius_lockless_ctx),
-                                          RTE_CACHE_LINE_SIZE,
-                                          numa_socket);
+    g_radius_ll_ctx = rte_zmalloc_socket("radius_ll_ctx", sizeof(struct radius_lockless_ctx),
+                                         RTE_CACHE_LINE_SIZE, numa_socket);
     if (!g_radius_ll_ctx) {
         YLOG_ERROR("RADIUS lockless: Failed to allocate context");
         return -1;
@@ -129,61 +126,39 @@ int radius_lockless_init(int numa_socket)
     rte_atomic64_init(&ctx->stats.errors);
     rte_atomic64_init(&ctx->stats.ring_full_drops);
 
-    /* Create DPDK packet mbuf pool for RADIUS TX */
-    g_radius_pktmbuf_pool = rte_pktmbuf_pool_create("radius_pkt_pool",
-                                                     256, 32, 0,
-                                                     RTE_MBUF_DEFAULT_BUF_SIZE,
-                                                     numa_socket);
-    if (!g_radius_pktmbuf_pool) {
-        YLOG_ERROR("RADIUS lockless: Failed to create packet mbuf pool");
-        goto fail;
-    }
-
     /* Create request ring (MPSC - multiple DPDK lcores, single control thread) */
-    ctx->request_ring = rte_ring_create("radius_req_ring",
-                                         RADIUS_REQUEST_RING_SIZE,
-                                         numa_socket,
-                                         RING_F_SC_DEQ); /* Single consumer */
+    ctx->request_ring = rte_ring_create("radius_req_ring", RADIUS_REQUEST_RING_SIZE, numa_socket,
+                                        RING_F_SC_DEQ); /* Single consumer */
     if (!ctx->request_ring) {
         YLOG_ERROR("RADIUS lockless: Failed to create request ring");
         goto fail;
     }
 
     /* Create response ring (SPMC - single control thread producer, multiple lcore consumers) */
-    ctx->response_ring = rte_ring_create("radius_resp_ring",
-                                          RADIUS_RESPONSE_RING_SIZE,
-                                          numa_socket,
-                                          RING_F_SP_ENQ); /* Single producer, default multi consumer */
+    ctx->response_ring =
+        rte_ring_create("radius_resp_ring", RADIUS_RESPONSE_RING_SIZE, numa_socket,
+                        RING_F_SP_ENQ); /* Single producer, default multi consumer */
     if (!ctx->response_ring) {
         YLOG_ERROR("RADIUS lockless: Failed to create response ring");
         goto fail;
     }
 
     /* Create request mempool */
-    ctx->req_pool = rte_mempool_create("radius_req_pool",
-                                        RADIUS_MEMPOOL_SIZE,
-                                        sizeof(struct radius_auth_request),
-                                        RADIUS_MEMPOOL_CACHE_SIZE,
-                                        0, /* No private data */
-                                        NULL, NULL, /* No init */
-                                        NULL, NULL, /* No obj init */
-                                        numa_socket,
-                                        0); /* No flags */
+    ctx->req_pool = rte_mempool_create("radius_req_pool", RADIUS_MEMPOOL_SIZE,
+                                       sizeof(struct radius_auth_request),
+                                       RADIUS_MEMPOOL_CACHE_SIZE, 0, /* No private data */
+                                       NULL, NULL,                   /* No init */
+                                       NULL, NULL,                   /* No obj init */
+                                       numa_socket, 0);              /* No flags */
     if (!ctx->req_pool) {
         YLOG_ERROR("RADIUS lockless: Failed to create request mempool");
         goto fail;
     }
 
     /* Create response mempool */
-    ctx->resp_pool = rte_mempool_create("radius_resp_pool",
-                                         RADIUS_MEMPOOL_SIZE,
-                                         sizeof(struct radius_auth_response),
-                                         RADIUS_MEMPOOL_CACHE_SIZE,
-                                         0,
-                                         NULL, NULL,
-                                         NULL, NULL,
-                                         numa_socket,
-                                         0);
+    ctx->resp_pool = rte_mempool_create(
+        "radius_resp_pool", RADIUS_MEMPOOL_SIZE, sizeof(struct radius_auth_response),
+        RADIUS_MEMPOOL_CACHE_SIZE, 0, NULL, NULL, NULL, NULL, numa_socket, 0);
     if (!ctx->resp_pool) {
         YLOG_ERROR("RADIUS lockless: Failed to create response mempool");
         goto fail;
@@ -208,7 +183,7 @@ int radius_lockless_init(int numa_socket)
     }
 
     /* Set socket timeouts for non-blocking behavior in poll */
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 }; /* 100ms */
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000}; /* 100ms */
     setsockopt(ctx->auth_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     /* Note: Source IP binding done via radius_lockless_bind_source() after config */
@@ -282,6 +257,121 @@ void radius_lockless_cleanup(void)
     YLOG_INFO("RADIUS lockless: Cleanup complete");
 }
 
+/*
+ * ==========================================================================
+ * Source IP Validation
+ * ==========================================================================
+ */
+
+/**
+ * Validate that an IP address exists in kernel routing table
+ * @param ip IP address in host order (e.g., 0x67B5A1A6 for 103.181.65.166)
+ * @return 1 if IP exists in kernel, 0 if not
+ */
+static int radius_ip_exists_in_kernel(uint32_t ip)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        YLOG_ERROR("RADIUS: Failed to create socket for IP validation: %s", strerror(errno));
+        return 0;
+    }
+
+    uint32_t target_ip = htonl(ip);
+
+    // Try checking specific interfaces
+    const char *ifaces[] = {"dummy0", "eth0", "eth1", "lo", NULL};
+
+    for (int i = 0; ifaces[i] != NULL; i++) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, ifaces[i], IFNAMSIZ - 1);
+
+        // Get interface flags
+        if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+            continue;  // Interface doesn't exist
+        }
+
+        // Get IP address for this interface
+        if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+            continue;  // No IP on this interface
+        }
+
+        struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+        if (ipaddr->sin_addr.s_addr == target_ip) {
+            // Found the IP on this interface
+            close(fd);
+            return 1;
+        }
+    }
+
+    // Also try SIOCGIFCONF as fallback to catch any IPs we might have missed
+    struct ifconf ifc;
+    char buf[4096];
+    memset(&ifc, 0, sizeof(ifc));
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+
+    if (ioctl(fd, SIOCGIFCONF, &ifc) == 0) {
+        struct ifreq *ifr = ifc.ifc_req;
+        int ifc_len = ifc.ifc_len;
+
+        for (int i = 0; i < ifc_len; ) {
+            struct ifreq *item = &ifr[i];
+#ifdef __linux__
+            i += sizeof(struct ifreq);
+#else
+            i += sizeof(struct ifreq);
+#endif
+
+            if (item->ifr_addr.sa_family == AF_INET) {
+                struct sockaddr_in *ipaddr = (struct sockaddr_in *)&item->ifr_addr;
+                if (ipaddr->sin_addr.s_addr == target_ip) {
+                    close(fd);
+                    return 1;
+                }
+            }
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
+/**
+ * Setup dummy interface for RADIUS source IP (if not already configured)
+ * @param ip IP address in host order
+ * @return 0 on success, -1 on failure
+ */
+static int radius_setup_dummy_interface(uint32_t ip)
+{
+    char ip_str[16];
+    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
+             (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+             (ip >> 8) & 0xFF, ip & 0xFF);
+
+    // Try to create dummy interface
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ip link add dummy0 type dummy 2>/dev/null");
+    int ret = system(cmd);
+
+    // Add IP to dummy interface
+    snprintf(cmd, sizeof(cmd), "ip addr add %s/32 dev dummy0 2>/dev/null", ip_str);
+    ret = system(cmd);
+
+    // Bring interface up
+    snprintf(cmd, sizeof(cmd), "ip link set dummy0 up 2>/dev/null");
+    ret = system(cmd);
+
+    // Verify
+    if (radius_ip_exists_in_kernel(ip)) {
+        YLOG_INFO("RADIUS: Source IP %s configured on dummy0", ip_str);
+        return 0;
+    }
+
+    YLOG_ERROR("RADIUS: Failed to configure dummy interface for IP %s", ip_str);
+    return -1;
+}
+
 int radius_lockless_bind_source(void)
 {
     if (!g_radius_ll_ctx || g_radius_ll_ctx->nas_ip == 0)
@@ -289,25 +379,73 @@ int radius_lockless_bind_source(void)
 
     struct radius_lockless_ctx *ctx = g_radius_ll_ctx;
 
+    char ip_str[16];
+    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
+             (ctx->nas_ip >> 24) & 0xFF, (ctx->nas_ip >> 16) & 0xFF,
+             (ctx->nas_ip >> 8) & 0xFF, ctx->nas_ip & 0xFF);
+
+    // Step 1: Validate source IP exists in kernel
+    if (!radius_ip_exists_in_kernel(ctx->nas_ip)) {
+        YLOG_WARNING("RADIUS: Source IP %s does not exist in kernel, trying to create dummy interface", ip_str);
+
+        // Try to setup dummy interface
+        if (radius_setup_dummy_interface(ctx->nas_ip) < 0) {
+            YLOG_ERROR("RADIUS: CRITICAL - Source IP %s not available in kernel!", ip_str);
+            YLOG_ERROR("RADIUS: Please create dummy interface or assign IP to physical interface:");
+            YLOG_ERROR("RADIUS:   ip link add dummy0 type dummy");
+            YLOG_ERROR("RADIUS:   ip addr add %s/32 dev dummy0", ip_str);
+            YLOG_ERROR("RADIUS:   ip link set dummy0 up");
+            return -1;
+        }
+    }
+
+    // Step 2: Verify socket options
+    int opt = 1;
+    if (setsockopt(ctx->auth_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        YLOG_ERROR("RADIUS: Failed to set SO_REUSEADDR: %s", strerror(errno));
+        return -1;
+    }
+
+    // Set send/receive timeouts
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};  // 5 second send timeout
+    if (setsockopt(ctx->auth_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        YLOG_ERROR("RADIUS: Failed to set SO_SNDTIMEO: %s", strerror(errno));
+        return -1;
+    }
+    tv.tv_sec = 1;  // 1 second receive timeout
+    if (setsockopt(ctx->auth_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        YLOG_ERROR("RADIUS: Failed to set SO_RCVTIMEO: %s", strerror(errno));
+        return -1;
+    }
+
+    // Step 3: Bind to source IP
     struct sockaddr_in bind_addr = {
         .sin_family = AF_INET,
-        .sin_port = 0, /* Let kernel pick ephemeral port */
+        .sin_port = 0,  // Let kernel pick ephemeral port
         .sin_addr.s_addr = htonl(ctx->nas_ip)
     };
 
     if (bind(ctx->auth_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        YLOG_ERROR("RADIUS lockless: Failed to bind auth socket to source IP: %s", strerror(errno));
+        YLOG_ERROR("RADIUS: Failed to bind auth socket to %s: %s", ip_str, strerror(errno));
+        YLOG_ERROR("RADIUS: The IP must exist in kernel routing table!");
         return -1;
     }
 
-    struct in_addr addr = { .s_addr = htonl(ctx->nas_ip) };
-    YLOG_INFO("RADIUS lockless: Auth socket bound to source IP %s", inet_ntoa(addr));
+    // Step 4: Verify bind
+    socklen_t addr_len = sizeof(bind_addr);
+    if (getsockname(ctx->auth_sock, (struct sockaddr *)&bind_addr, &addr_len) < 0) {
+        YLOG_ERROR("RADIUS: getsockname failed: %s", strerror(errno));
+        return -1;
+    }
+
+    YLOG_INFO("RADIUS: Auth socket bound successfully to %s:%d (kernel socket, not DPDK)",
+              inet_ntoa(bind_addr.sin_addr), ntohs(bind_addr.sin_port));
+
     return 0;
 }
 
-int radius_lockless_add_server(uint32_t ip, uint16_t auth_port,
-                                uint16_t acct_port, const char *secret,
-                                int priority)
+int radius_lockless_add_server(uint32_t ip, uint16_t auth_port, uint16_t acct_port,
+                               const char *secret, int priority)
 {
     if (!g_radius_ll_ctx)
         return -1;
@@ -329,9 +467,9 @@ int radius_lockless_add_server(uint32_t ip, uint16_t auth_port,
 
     ctx->num_servers++;
 
-    struct in_addr addr = { .s_addr = htonl(ip) };
-    YLOG_INFO("RADIUS lockless: Added server %s:%d (priority %d)",
-              inet_ntoa(addr), auth_port, priority);
+    struct in_addr addr = {.s_addr = htonl(ip)};
+    YLOG_INFO("RADIUS lockless: Added server %s:%d (priority %d)", inet_ntoa(addr), auth_port,
+              priority);
 
     return ctx->num_servers - 1;
 }
@@ -362,12 +500,9 @@ void radius_lockless_set_timeout(uint32_t timeout_ms, uint8_t retries)
  * ==========================================================================
  */
 
-uint64_t radius_lockless_auth_pap(uint16_t session_id,
-                                   const char *username,
-                                   const char *password,
-                                   const struct rte_ether_addr *client_mac,
-                                   uint16_t vlan_id,
-                                   uint32_t ifindex)
+uint64_t radius_lockless_auth_pap(uint16_t session_id, const char *username, const char *password,
+                                  const struct rte_ether_addr *client_mac, uint16_t vlan_id,
+                                  uint32_t ifindex)
 {
     if (!g_radius_ll_ctx || !g_radius_ll_ctx->running)
         return 0;
@@ -397,10 +532,9 @@ uint64_t radius_lockless_auth_pap(uint16_t session_id,
 
     rte_ether_addr_copy(client_mac, &req->client_mac);
     snprintf(req->calling_station_id, sizeof(req->calling_station_id),
-             "%02X:%02X:%02X:%02X:%02X:%02X",
-             client_mac->addr_bytes[0], client_mac->addr_bytes[1],
-             client_mac->addr_bytes[2], client_mac->addr_bytes[3],
-             client_mac->addr_bytes[4], client_mac->addr_bytes[5]);
+             "%02X:%02X:%02X:%02X:%02X:%02X", client_mac->addr_bytes[0], client_mac->addr_bytes[1],
+             client_mac->addr_bytes[2], client_mac->addr_bytes[3], client_mac->addr_bytes[4],
+             client_mac->addr_bytes[5]);
 
     /* Enqueue to request ring (non-blocking) */
     if (rte_ring_enqueue(ctx->request_ring, req) != 0) {
@@ -418,16 +552,11 @@ uint64_t radius_lockless_auth_pap(uint16_t session_id,
     return req->request_id;
 }
 
-uint64_t radius_lockless_auth_chap(uint16_t session_id,
-                                    const char *username,
-                                    uint8_t chap_id,
-                                    const uint8_t *chap_challenge,
-                                    uint8_t chap_challenge_len,
-                                    const uint8_t *chap_response,
-                                    uint8_t chap_response_len,
-                                    const struct rte_ether_addr *client_mac,
-                                    uint16_t vlan_id,
-                                    uint32_t ifindex)
+uint64_t radius_lockless_auth_chap(uint16_t session_id, const char *username, uint8_t chap_id,
+                                   const uint8_t *chap_challenge, uint8_t chap_challenge_len,
+                                   const uint8_t *chap_response, uint8_t chap_response_len,
+                                   const struct rte_ether_addr *client_mac, uint16_t vlan_id,
+                                   uint32_t ifindex)
 {
     if (!g_radius_ll_ctx || !g_radius_ll_ctx->running)
         return 0;
@@ -468,10 +597,9 @@ uint64_t radius_lockless_auth_chap(uint16_t session_id,
 
     rte_ether_addr_copy(client_mac, &req->client_mac);
     snprintf(req->calling_station_id, sizeof(req->calling_station_id),
-             "%02X:%02X:%02X:%02X:%02X:%02X",
-             client_mac->addr_bytes[0], client_mac->addr_bytes[1],
-             client_mac->addr_bytes[2], client_mac->addr_bytes[3],
-             client_mac->addr_bytes[4], client_mac->addr_bytes[5]);
+             "%02X:%02X:%02X:%02X:%02X:%02X", client_mac->addr_bytes[0], client_mac->addr_bytes[1],
+             client_mac->addr_bytes[2], client_mac->addr_bytes[3], client_mac->addr_bytes[4],
+             client_mac->addr_bytes[5]);
 
     /* Enqueue to request ring */
     if (rte_ring_enqueue(ctx->request_ring, req) != 0) {
@@ -489,17 +617,14 @@ uint64_t radius_lockless_auth_chap(uint16_t session_id,
     return req->request_id;
 }
 
-unsigned int radius_lockless_poll_responses(
-    struct radius_auth_response **responses,
-    unsigned int max_responses)
+unsigned int radius_lockless_poll_responses(struct radius_auth_response **responses,
+                                            unsigned int max_responses)
 {
     if (!g_radius_ll_ctx)
         return 0;
 
-    return rte_ring_dequeue_burst(g_radius_ll_ctx->response_ring,
-                                   (void **)responses,
-                                   max_responses,
-                                   NULL);
+    return rte_ring_dequeue_burst(g_radius_ll_ctx->response_ring, (void **)responses, max_responses,
+                                  NULL);
 }
 
 void radius_lockless_free_response(struct radius_auth_response *resp)
@@ -524,16 +649,12 @@ static void *radius_control_thread(void *arg)
     ctx->thread_ready = true;
 
     /* Set up poll for socket */
-    struct pollfd pfd = {
-        .fd = ctx->auth_sock,
-        .events = POLLIN
-    };
+    struct pollfd pfd = {.fd = ctx->auth_sock, .events = POLLIN};
 
     while (ctx->running) {
         /* 1. Dequeue auth requests from ring (non-blocking batch) */
         void *reqs[32];
-        unsigned int n_req = rte_ring_dequeue_burst(ctx->request_ring,
-                                                     reqs, 32, NULL);
+        unsigned int n_req = rte_ring_dequeue_burst(ctx->request_ring, reqs, 32, NULL);
 
         for (unsigned int i = 0; i < n_req; i++) {
             req = (struct radius_auth_request *)reqs[i];
@@ -569,6 +690,22 @@ static void *radius_control_thread(void *arg)
             ssize_t len = recvfrom(ctx->auth_sock, recv_buf, sizeof(recv_buf), 0,
                                    (struct sockaddr *)&from, &from_len);
             if (len > 0) {
+                /* Validate source IP matches configured RADIUS server */
+                bool valid_source = false;
+                for (int i = 0; i < ctx->num_servers; i++) {
+                    if (from.sin_addr.s_addr == htonl(ctx->servers[i].ip)) {
+                        valid_source = true;
+                        break;
+                    }
+                }
+
+                if (!valid_source) {
+                    char from_ip_str[16];
+                    inet_ntop(AF_INET, &from.sin_addr, from_ip_str, sizeof(from_ip_str));
+                    YLOG_WARNING("RADIUS: Received response from unexpected source %s", from_ip_str);
+                    continue;
+                }
+
                 radius_process_response(recv_buf, len);
             }
         }
@@ -582,8 +719,7 @@ static void *radius_control_thread(void *arg)
 }
 
 /* Helper: Add attribute to RADIUS packet */
-static int radius_add_attr(uint8_t *pkt, int offset, uint8_t type,
-                           const uint8_t *data, uint8_t len)
+static int radius_add_attr(uint8_t *pkt, int offset, uint8_t type, const uint8_t *data, uint8_t len)
 {
     pkt[offset] = type;
     pkt[offset + 1] = len + 2;
@@ -593,12 +729,12 @@ static int radius_add_attr(uint8_t *pkt, int offset, uint8_t type,
 
 /* Helper: Encode PAP password per RFC 2865 */
 static void encode_pap_password(const char *password, const char *secret,
-                                const uint8_t *authenticator,
-                                uint8_t *out, int *out_len)
+                                const uint8_t *authenticator, uint8_t *out, int *out_len)
 {
     int pass_len = strlen(password);
     int padded_len = ((pass_len + 15) / 16) * 16;
-    if (padded_len == 0) padded_len = 16;
+    if (padded_len == 0)
+        padded_len = 16;
 
     memset(out, 0, padded_len);
     memcpy(out, password, pass_len);
@@ -628,6 +764,12 @@ static void encode_pap_password(const char *password, const char *secret,
     *out_len = padded_len;
 }
 
+/*
+ * ==========================================================================
+ * RADIUS Send (Kernel Socket)
+ * ==========================================================================
+ */
+
 static int radius_send_access_request(struct radius_auth_request *req)
 {
     struct radius_lockless_ctx *ctx = g_radius_ll_ctx;
@@ -648,63 +790,54 @@ static int radius_send_access_request(struct radius_auth_request *req)
         authenticator[i] = rand() & 0xFF;
 
     /* User-Name */
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_USER_NAME,
-                              (uint8_t *)req->username, strlen(req->username));
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_USER_NAME, (uint8_t *)req->username,
+                             strlen(req->username));
 
     if (req->auth_type == RADIUS_AUTH_PAP) {
         /* PAP: Encode password */
         uint8_t enc_pass[128];
         int enc_len;
-        encode_pap_password((char *)req->password, srv->secret, authenticator,
-                            enc_pass, &enc_len);
-        offset = radius_add_attr(pkt, offset, RADIUS_ATTR_USER_PASSWORD,
-                                  enc_pass, enc_len);
+        encode_pap_password((char *)req->password, srv->secret, authenticator, enc_pass, &enc_len);
+        offset = radius_add_attr(pkt, offset, RADIUS_ATTR_USER_PASSWORD, enc_pass, enc_len);
     } else if (req->auth_type == RADIUS_AUTH_CHAP) {
         /* CHAP-Password: ID + Response */
-        offset = radius_add_attr(pkt, offset, RADIUS_ATTR_CHAP_PASSWORD,
-                                  req->password, req->password_len);
+        offset = radius_add_attr(pkt, offset, RADIUS_ATTR_CHAP_PASSWORD, req->password,
+                                 req->password_len);
 
         /* CHAP-Challenge */
         if (req->chap_challenge_len > 0) {
-            offset = radius_add_attr(pkt, offset, RADIUS_ATTR_CHAP_CHALLENGE,
-                                      req->chap_challenge, req->chap_challenge_len);
+            offset = radius_add_attr(pkt, offset, RADIUS_ATTR_CHAP_CHALLENGE, req->chap_challenge,
+                                     req->chap_challenge_len);
         }
     }
 
     /* NAS-IP-Address */
     uint32_t nas_ip = htonl(ctx->nas_ip);
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_IP_ADDRESS,
-                              (uint8_t *)&nas_ip, 4);
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_IP_ADDRESS, (uint8_t *)&nas_ip, 4);
 
     /* NAS-Identifier */
     offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_IDENTIFIER,
-                              (uint8_t *)ctx->nas_identifier,
-                              strlen(ctx->nas_identifier));
+                             (uint8_t *)ctx->nas_identifier, strlen(ctx->nas_identifier));
 
     /* Calling-Station-Id */
     offset = radius_add_attr(pkt, offset, RADIUS_ATTR_CALLING_STATION_ID,
-                              (uint8_t *)req->calling_station_id,
-                              strlen(req->calling_station_id));
+                             (uint8_t *)req->calling_station_id, strlen(req->calling_station_id));
 
     /* NAS-Port */
     uint32_t nas_port = htonl(req->session_id);
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_PORT,
-                              (uint8_t *)&nas_port, 4);
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_PORT, (uint8_t *)&nas_port, 4);
 
     /* NAS-Port-Type = Ethernet (15) */
     uint32_t port_type = htonl(15);
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_PORT_TYPE,
-                              (uint8_t *)&port_type, 4);
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_NAS_PORT_TYPE, (uint8_t *)&port_type, 4);
 
     /* Service-Type = Framed (2) */
     uint32_t service_type = htonl(2);
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_SERVICE_TYPE,
-                              (uint8_t *)&service_type, 4);
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_SERVICE_TYPE, (uint8_t *)&service_type, 4);
 
     /* Framed-Protocol = PPP (1) */
     uint32_t framed_proto = htonl(1);
-    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_FRAMED_PROTOCOL,
-                              (uint8_t *)&framed_proto, 4);
+    offset = radius_add_attr(pkt, offset, RADIUS_ATTR_FRAMED_PROTOCOL, (uint8_t *)&framed_proto, 4);
 
     /* Build header */
     uint8_t radius_id = g_next_radius_id++;
@@ -725,33 +858,36 @@ static int radius_send_access_request(struct radius_auth_request *req)
     memcpy(g_pending[pending_idx].authenticator, authenticator, 16);
     g_pending[pending_idx].orig_request = req;
 
-    /* Send packet via kernel socket */
-    struct sockaddr_in dest = {
+    /* Send packet via kernel UDP socket (not DPDK) */
+    struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(srv->auth_port),
         .sin_addr.s_addr = htonl(srv->ip)
     };
 
-    ssize_t sent = sendto(ctx->auth_sock, pkt, offset, 0,
-                          (struct sockaddr *)&dest, sizeof(dest));
+    ssize_t sent = sendto(g_radius_ll_ctx->auth_sock, pkt, offset, 0,
+                          (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (sent < 0) {
-        YLOG_ERROR("RADIUS lockless: sendto failed: %s", strerror(errno));
+        YLOG_ERROR("RADIUS lockless: sendto() failed for user '%s': %s", req->username, strerror(errno));
         g_pending[pending_idx].active = false;
         return -1;
     }
 
-    YLOG_INFO("RADIUS lockless: Sent Access-Request id=%u user='%s' to %s:%d",
-              radius_id, req->username, inet_ntoa(dest.sin_addr), srv->auth_port);
+    YLOG_INFO("RADIUS lockless: Sent Access-Request id=%u user='%s' to %u.%u.%u.%u:%d via kernel socket (%zd bytes)",
+              radius_id, req->username,
+              (srv->ip >> 24) & 0xFF, (srv->ip >> 16) & 0xFF,
+              (srv->ip >> 8) & 0xFF, srv->ip & 0xFF,
+              srv->auth_port, sent);
 
     return 0;
 }
 
 /* Helper: Verify response authenticator */
 static bool verify_response_authenticator(const uint8_t *response, ssize_t len,
-                                          const uint8_t *req_auth,
-                                          const char *secret)
+                                          const uint8_t *req_auth, const char *secret)
 {
-    if (len < 20) return false;
+    if (len < 20)
+        return false;
 
     uint8_t verify_buf[4096];
     memcpy(verify_buf, response, len);
@@ -772,7 +908,8 @@ static void radius_process_response(uint8_t *buf, ssize_t len);
 /* Process RADIUS response received via DPDK RX path */
 void radius_lockless_process_dpdk_response(uint8_t *data, uint16_t len)
 {
-    if (!g_radius_ll_ctx) return;
+    if (!g_radius_ll_ctx)
+        return;
     YLOG_INFO("RADIUS DPDK RX: Processing response len=%d", len);
     radius_process_response(data, (ssize_t)len);
 }
@@ -833,58 +970,58 @@ static void radius_process_response(uint8_t *buf, ssize_t len)
         while (offset < len) {
             uint8_t attr_type = buf[offset];
             uint8_t attr_len = buf[offset + 1];
-            if (attr_len < 2) break;
+            if (attr_len < 2)
+                break;
 
             uint8_t *attr_val = &buf[offset + 2];
             int val_len = attr_len - 2;
 
             switch (attr_type) {
-                case RADIUS_ATTR_FRAMED_IP_ADDRESS:
-                    if (val_len >= 4) {
-                        uint32_t ip;
-                        memcpy(&ip, attr_val, 4);
-                        resp->framed_ip = ntohl(ip);
-                    }
-                    break;
-                case RADIUS_ATTR_FRAMED_IP_NETMASK:
-                    if (val_len >= 4) {
-                        uint32_t mask;
-                        memcpy(&mask, attr_val, 4);
-                        resp->framed_netmask = ntohl(mask);
-                    }
-                    break;
-                case RADIUS_ATTR_SESSION_TIMEOUT:
-                    if (val_len >= 4) {
-                        uint32_t timeout;
-                        memcpy(&timeout, attr_val, 4);
-                        resp->session_timeout = ntohl(timeout);
-                    }
-                    break;
-                case RADIUS_ATTR_IDLE_TIMEOUT:
-                    if (val_len >= 4) {
-                        uint32_t timeout;
-                        memcpy(&timeout, attr_val, 4);
-                        resp->idle_timeout = ntohl(timeout);
-                    }
-                    break;
-                case RADIUS_ATTR_FRAMED_MTU:
-                    if (val_len >= 4) {
-                        uint32_t mtu;
-                        memcpy(&mtu, attr_val, 4);
-                        resp->framed_mtu = (uint16_t)ntohl(mtu);
-                    }
-                    break;
-                case RADIUS_ATTR_REPLY_MESSAGE:
-                    if (val_len < sizeof(resp->reply_message)) {
-                        memcpy(resp->reply_message, attr_val, val_len);
-                    }
-                    break;
+            case RADIUS_ATTR_FRAMED_IP_ADDRESS:
+                if (val_len >= 4) {
+                    uint32_t ip;
+                    memcpy(&ip, attr_val, 4);
+                    resp->framed_ip = ntohl(ip);
+                }
+                break;
+            case RADIUS_ATTR_FRAMED_IP_NETMASK:
+                if (val_len >= 4) {
+                    uint32_t mask;
+                    memcpy(&mask, attr_val, 4);
+                    resp->framed_netmask = ntohl(mask);
+                }
+                break;
+            case RADIUS_ATTR_SESSION_TIMEOUT:
+                if (val_len >= 4) {
+                    uint32_t timeout;
+                    memcpy(&timeout, attr_val, 4);
+                    resp->session_timeout = ntohl(timeout);
+                }
+                break;
+            case RADIUS_ATTR_IDLE_TIMEOUT:
+                if (val_len >= 4) {
+                    uint32_t timeout;
+                    memcpy(&timeout, attr_val, 4);
+                    resp->idle_timeout = ntohl(timeout);
+                }
+                break;
+            case RADIUS_ATTR_FRAMED_MTU:
+                if (val_len >= 4) {
+                    uint32_t mtu;
+                    memcpy(&mtu, attr_val, 4);
+                    resp->framed_mtu = (uint16_t)ntohl(mtu);
+                }
+                break;
+            case RADIUS_ATTR_REPLY_MESSAGE:
+                if (val_len < sizeof(resp->reply_message)) {
+                    memcpy(resp->reply_message, attr_val, val_len);
+                }
+                break;
             }
             offset += attr_len;
         }
 
-        YLOG_INFO("RADIUS lockless: Access-Accept session=%u IP=%u.%u.%u.%u",
-                  resp->session_id,
+        YLOG_INFO("RADIUS lockless: Access-Accept session=%u IP=%u.%u.%u.%u", resp->session_id,
                   (resp->framed_ip >> 24) & 0xFF, (resp->framed_ip >> 16) & 0xFF,
                   (resp->framed_ip >> 8) & 0xFF, resp->framed_ip & 0xFF);
 
@@ -897,7 +1034,8 @@ static void radius_process_response(uint8_t *buf, ssize_t len)
         while (offset < len) {
             uint8_t attr_type = buf[offset];
             uint8_t attr_len = buf[offset + 1];
-            if (attr_len < 2) break;
+            if (attr_len < 2)
+                break;
 
             if (attr_type == RADIUS_ATTR_REPLY_MESSAGE) {
                 int val_len = attr_len - 2;
@@ -909,13 +1047,12 @@ static void radius_process_response(uint8_t *buf, ssize_t len)
             offset += attr_len;
         }
 
-        YLOG_INFO("RADIUS lockless: Access-Reject session=%u msg='%s'",
-                  resp->session_id, resp->reply_message);
+        YLOG_INFO("RADIUS lockless: Access-Reject session=%u msg='%s'", resp->session_id,
+                  resp->reply_message);
     } else {
         resp->result = RADIUS_RESULT_ERROR;
         rte_atomic64_inc(&ctx->stats.errors);
-        snprintf(resp->reply_message, sizeof(resp->reply_message),
-                 "Unknown RADIUS code %d", code);
+        snprintf(resp->reply_message, sizeof(resp->reply_message), "Unknown RADIUS code %d", code);
     }
 
     /* Enqueue response to DPDK */
@@ -946,8 +1083,8 @@ static void radius_check_timeouts(void)
             if (pending->retries < ctx->max_retries) {
                 /* Retry */
                 pending->retries++;
-                YLOG_WARNING("RADIUS lockless: Timeout id=%d, retrying (%d/%d)",
-                             pending->radius_id, pending->retries, ctx->max_retries);
+                YLOG_WARNING("RADIUS lockless: Timeout id=%d, retrying (%d/%d)", pending->radius_id,
+                             pending->retries, ctx->max_retries);
 
                 /* Resend - reuse the original request */
                 pending->send_tsc = now_tsc;
@@ -963,10 +1100,8 @@ static void radius_check_timeouts(void)
                     resp->request_id = pending->request_id;
                     resp->session_id = pending->session_id;
                     resp->result = RADIUS_RESULT_TIMEOUT;
-                    rte_ether_addr_copy(&pending->orig_request->client_mac,
-                                        &resp->client_mac);
-                    strncpy(resp->reply_message, "RADIUS timeout",
-                            sizeof(resp->reply_message) - 1);
+                    rte_ether_addr_copy(&pending->orig_request->client_mac, &resp->client_mac);
+                    strncpy(resp->reply_message, "RADIUS timeout", sizeof(resp->reply_message) - 1);
                     resp->complete_tsc = now_tsc;
 
                     rte_ring_enqueue(ctx->response_ring, resp);
@@ -986,30 +1121,38 @@ static void radius_check_timeouts(void)
  * ==========================================================================
  */
 
-void radius_lockless_get_stats(uint64_t *submitted, uint64_t *sent,
-                                uint64_t *received, uint64_t *accepts,
-                                uint64_t *rejects, uint64_t *timeouts,
-                                uint64_t *errors, uint64_t *drops)
+void radius_lockless_get_stats(uint64_t *submitted, uint64_t *sent, uint64_t *received,
+                               uint64_t *accepts, uint64_t *rejects, uint64_t *timeouts,
+                               uint64_t *errors, uint64_t *drops)
 {
-    if (!g_radius_ll_ctx) return;
+    if (!g_radius_ll_ctx)
+        return;
 
     struct radius_lockless_ctx *ctx = g_radius_ll_ctx;
 
-    if (submitted) *submitted = rte_atomic64_read(&ctx->stats.requests_submitted);
-    if (sent) *sent = rte_atomic64_read(&ctx->stats.requests_sent);
-    if (received) *received = rte_atomic64_read(&ctx->stats.responses_received);
-    if (accepts) *accepts = rte_atomic64_read(&ctx->stats.accepts);
-    if (rejects) *rejects = rte_atomic64_read(&ctx->stats.rejects);
-    if (timeouts) *timeouts = rte_atomic64_read(&ctx->stats.timeouts);
-    if (errors) *errors = rte_atomic64_read(&ctx->stats.errors);
-    if (drops) *drops = rte_atomic64_read(&ctx->stats.ring_full_drops);
+    if (submitted)
+        *submitted = rte_atomic64_read(&ctx->stats.requests_submitted);
+    if (sent)
+        *sent = rte_atomic64_read(&ctx->stats.requests_sent);
+    if (received)
+        *received = rte_atomic64_read(&ctx->stats.responses_received);
+    if (accepts)
+        *accepts = rte_atomic64_read(&ctx->stats.accepts);
+    if (rejects)
+        *rejects = rte_atomic64_read(&ctx->stats.rejects);
+    if (timeouts)
+        *timeouts = rte_atomic64_read(&ctx->stats.timeouts);
+    if (errors)
+        *errors = rte_atomic64_read(&ctx->stats.errors);
+    if (drops)
+        *drops = rte_atomic64_read(&ctx->stats.ring_full_drops);
 }
 
 void radius_lockless_print_stats(void)
 {
     uint64_t submitted, sent, received, accepts, rejects, timeouts, errors, drops;
-    radius_lockless_get_stats(&submitted, &sent, &received, &accepts,
-                               &rejects, &timeouts, &errors, &drops);
+    radius_lockless_get_stats(&submitted, &sent, &received, &accepts, &rejects, &timeouts, &errors,
+                              &drops);
 
     printf("RADIUS Lockless Statistics:\n");
     printf("  Requests Submitted: %lu\n", submitted);

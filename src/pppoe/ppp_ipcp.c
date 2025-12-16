@@ -41,6 +41,23 @@
 static int ppp_ipcp_send(struct pppoe_session *session, uint8_t code, uint8_t identifier,
                          const uint8_t *data, uint16_t len)
 {
+    /* RFC 1661 STRICT FSM GATING:
+     * IPCP packets MUST NOT be sent until:
+     * 1. LCP is OPENED
+     * 2. Authentication is COMPLETE (if required)
+     * This prevents "PPP received non-LCP packet" errors on Mikrotik.
+     */
+    if (session->lcp_state != LCP_STATE_OPENED) {
+        YLOG_WARNING("IPCP: Blocked TX (code=%u) - LCP not OPENED (state=%d)", code,
+                     session->lcp_state);
+        return -1;
+    }
+
+    if (!session->auth_complete) {
+        YLOG_WARNING("IPCP: Blocked TX (code=%u) - Auth not COMPLETE", code);
+        return -1;
+    }
+
     /* Build PPPoE + PPP + IPCP payload */
     uint8_t pppoe_buf[1500];
     struct pppoe_hdr *pppoe = (struct pppoe_hdr *)pppoe_buf;
@@ -180,6 +197,16 @@ void ppp_ipcp_close(struct pppoe_session *session)
 
 int ppp_ipcp_process_packet(struct pppoe_session *session, const uint8_t *packet, uint16_t len)
 {
+    /* RFC 1661 STRICT FSM GATING:
+     * IPCP packets are ONLY valid after LCP is OPENED.
+     * Reject any IPCP traffic if LCP negotiation is not complete.
+     * This prevents the "PPP received non-LCP packet when LCP not open" error.
+     */
+    if (session->lcp_state != LCP_STATE_OPENED) {
+        YLOG_WARNING("IPCP: Dropping packet - LCP not OPENED (state=%d)", session->lcp_state);
+        return -1;
+    }
+
     const struct lcp_hdr *ipcp = (const struct lcp_hdr *)packet;
     if (len < sizeof(struct lcp_hdr))
         return -1;

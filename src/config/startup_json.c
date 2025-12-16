@@ -449,9 +449,32 @@ int startup_json_load(const char *path) {
             if (inet_pton(AF_INET, source_ip_str, &src_addr) == 1) {
                 extern void radius_lockless_set_nas(uint32_t nas_ip, const char *nas_identifier);
                 extern int radius_lockless_bind_source(void);
-                radius_lockless_set_nas(ntohl(src_addr.s_addr), "yesrouter");
+
+                uint32_t nas_ip = ntohl(src_addr.s_addr);
+                radius_lockless_set_nas(nas_ip, "yesrouter");
+
+                /* Setup dummy interface for RADIUS source IP if needed */
+                char cmd[256];
+                char ip_str[16];
+                snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
+                         (nas_ip >> 24) & 0xFF, (nas_ip >> 16) & 0xFF,
+                         (nas_ip >> 8) & 0xFF, nas_ip & 0xFF);
+
+                YLOG_INFO("[STARTUP] Configuring RADIUS source IP: %s", ip_str);
+
+                /* Try to setup dummy interface */
+                snprintf(cmd, sizeof(cmd), "ip link add dummy0 type dummy 2>/dev/null || true");
+                system(cmd);
+                snprintf(cmd, sizeof(cmd), "ip addr add %s/32 dev dummy0 2>/dev/null || true", ip_str);
+                system(cmd);
+                snprintf(cmd, sizeof(cmd), "ip link set dummy0 up 2>/dev/null || true");
+                system(cmd);
+
+                /* Now bind the socket */
                 if (radius_lockless_bind_source() == 0) {
-                    YLOG_INFO("[STARTUP] RADIUS source IP: %s", source_ip_str);
+                    YLOG_INFO("[STARTUP] RADIUS source IP configured: %s", source_ip_str);
+                } else {
+                    YLOG_ERROR("[STARTUP] RADIUS bind failed for IP: %s", source_ip_str);
                 }
             }
         }

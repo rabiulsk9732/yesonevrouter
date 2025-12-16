@@ -5,9 +5,9 @@
 
 #define _GNU_SOURCE
 #include "cpu_scheduler.h"
+#include "env_config.h"
 #include "interface.h"
 #include "log.h"
-#include "env_config.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -34,22 +34,18 @@
 #include <rte_spinlock.h>
 #endif
 
-
 /* Symmetric Toeplitz RSS Key (52 bytes max - supports all NICs)
  * ixgbe: uses 40 bytes, i40e: uses 52 bytes, mlx5: uses 40 bytes
  * Key length is dynamically set from dev_info.hash_key_size
  */
 static uint8_t symmetric_rss_key[52] = {
-    0x6D, 0x5A, 0x56, 0xDA, 0x25, 0x5B, 0x0E, 0xC2,
-    0x41, 0x67, 0x25, 0x3D, 0x43, 0xA3, 0x8F, 0xB0,
-    0xD0, 0xCA, 0x2B, 0xCB, 0xAE, 0x7B, 0x30, 0xB4,
-    0x77, 0xCB, 0x2D, 0xA3, 0x80, 0x30, 0xF2, 0x0C,
-    0x6A, 0x42, 0xB7, 0x3B, 0xBE, 0xAC, 0x01, 0xFA,
-    0x6D, 0x5A, 0x56, 0xDA, 0x25, 0x5B, 0x0E, 0xC2,  /* Extra 12 bytes for i40e */
-    0x41, 0x67, 0x25, 0x3D
-};
+    0x6D, 0x5A, 0x56, 0xDA, 0x25, 0x5B, 0x0E, 0xC2, 0x41, 0x67, 0x25, 0x3D, 0x43,
+    0xA3, 0x8F, 0xB0, 0xD0, 0xCA, 0x2B, 0xCB, 0xAE, 0x7B, 0x30, 0xB4, 0x77, 0xCB,
+    0x2D, 0xA3, 0x80, 0x30, 0xF2, 0x0C, 0x6A, 0x42, 0xB7, 0x3B, 0xBE, 0xAC, 0x01,
+    0xFA, 0x6D, 0x5A, 0x56, 0xDA, 0x25, 0x5B, 0x0E, 0xC2, /* Extra 12 bytes for i40e */
+    0x41, 0x67, 0x25, 0x3D};
 /* DPDK burst size - loaded from .env (no hardcoded values) */
-#define DPDK_RX_BURST_SIZE_MAX 256  /* Buffer size, actual from env_get_rx_burst_size() */
+#define DPDK_RX_BURST_SIZE_MAX 256 /* Buffer size, actual from env_get_rx_burst_size() */
 
 /* Private data for physical interface */
 struct physical_priv {
@@ -117,8 +113,8 @@ static int physical_init(struct interface *iface)
         /* Register for O(1) fast lookup (VPP-style) */
         interface_register_fast_lookup(iface, port_id);
 
-        printf("Physical interface %s initialized (index %u, DPDK port %u)\n",
-               iface->name, iface->ifindex, port_id);
+        printf("Physical interface %s initialized (index %u, DPDK port %u)\n", iface->name,
+               iface->ifindex, port_id);
         return 0;
     }
 #endif
@@ -202,8 +198,8 @@ static int physical_up(struct interface *iface)
         int num_rx_desc = env_get_rx_desc();
         int num_tx_desc = env_get_tx_desc();
 
-        printf("[ENV] Port %s: rx_queues=%d tx_queues=%d rx_desc=%d tx_desc=%d\n",
-               iface->name, num_rx_queues, num_tx_queues, num_rx_desc, num_tx_desc);
+        printf("[ENV] Port %s: rx_queues=%d tx_queues=%d rx_desc=%d tx_desc=%d\n", iface->name,
+               num_rx_queues, num_tx_queues, num_rx_desc, num_tx_desc);
 
         /* Get device info FIRST to know device capabilities */
         ret = rte_eth_dev_info_get(priv->port_id, &dev_info);
@@ -244,15 +240,30 @@ static int physical_up(struct interface *iface)
             port_conf.rx_adv_conf.rss_conf.rss_key = symmetric_rss_key;
             /* Use device-reported key size (ixgbe=40, i40e=52, mlx5=40) */
             uint8_t key_len = dev_info.hash_key_size;
-            if (key_len == 0 || key_len > 52) key_len = 40;  /* Default fallback */
+            if (key_len == 0 || key_len > 52)
+                key_len = 40; /* Default fallback */
             port_conf.rx_adv_conf.rss_conf.rss_key_len = key_len;
             printf("DPDK port %u: RSS key length=%u (from dev_info)\n", priv->port_id, key_len);
 
-            /* Request IP/TCP/UDP RSS */
-            uint64_t rss_hf_wanted = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP;
+            /* Request L2+IP/TCP/UDP RSS for complete affinity
+             * L2_SRC_ONLY ensures PPPoE packets from same MAC go to same worker
+             * IP/TCP/UDP provides further distribution for tunneled traffic
+             */
+            uint64_t rss_hf_wanted = 0;
+
+            /* CRITICAL FOR PPPoE: Hash on source MAC for consistent worker affinity
+             * Without this, Configure-Req and Configure-Ack go to different workers!
+             */
+#ifdef RTE_ETH_RSS_L2_SRC_ONLY
+            if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_L2_SRC_ONLY) {
+                rss_hf_wanted |= RTE_ETH_RSS_L2_SRC_ONLY;
+                printf("DPDK port %u: RSS L2_SRC_ONLY enabled for PPPoE affinity\n", priv->port_id);
+            }
+#endif
+            /* Also add standard IP/TCP/UDP for IP traffic */
+            rss_hf_wanted |= (RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP);
 
             /* If NIC supports PPPoE RSS (rare), try it */
-            /* Note: RTE_ETH_RSS_PPPOE might not be defined in older DPDK */
 #ifdef RTE_ETH_RSS_PPPOE
             if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_PPPOE) {
                 rss_hf_wanted |= RTE_ETH_RSS_PPPOE;
@@ -261,13 +272,12 @@ static int physical_up(struct interface *iface)
             /* Mask against what device actually supports */
             port_conf.rx_adv_conf.rss_conf.rss_hf = rss_hf_wanted & dev_info.flow_type_rss_offloads;
 
-            printf("DPDK port %u: RSS Enabled (Symmetric Key, HF=0x%lx)\n",
-                   priv->port_id, port_conf.rx_adv_conf.rss_conf.rss_hf);
+            printf("DPDK port %u: RSS Enabled (Symmetric Key, HF=0x%lx)\n", priv->port_id,
+                   port_conf.rx_adv_conf.rss_conf.rss_hf);
         } else {
-             /* Single queue or no RSS support */
-             port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+            /* Single queue or no RSS support */
+            port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
         }
-
 
         bool port_already_configured = false;
         ret = rte_eth_dev_configure(priv->port_id, num_rx_queues, num_tx_queues, &port_conf);
@@ -322,10 +332,10 @@ static int physical_up(struct interface *iface)
         /* CRITICAL for virtio: Set TX thresholds to ensure descriptors are freed */
         /* Without these, rte_eth_tx_burst succeeds but packets never transmit */
         if (txq_conf.tx_rs_thresh == 0) {
-            txq_conf.tx_rs_thresh = 32;  /* Report status every 32 descriptors */
+            txq_conf.tx_rs_thresh = 32; /* Report status every 32 descriptors */
         }
         if (txq_conf.tx_free_thresh == 0) {
-            txq_conf.tx_free_thresh = 32;  /* Free descriptors when 32 pending */
+            txq_conf.tx_free_thresh = 32; /* Free descriptors when 32 pending */
         }
 
         printf("[TX_DIAG] Port %u TX config: tx_rs_thresh=%u tx_free_thresh=%u offloads=0x%lx\n",
@@ -394,7 +404,8 @@ static int physical_up(struct interface *iface)
         /* Initialize HQoS for this port if link is up */
         if (link.link_status == RTE_ETH_LINK_UP) {
             uint64_t link_speed_bps = (uint64_t)link.link_speed * 1000000;
-            if (link_speed_bps == 0) link_speed_bps = 1000000000; /* Default 1G if unknown */
+            if (link_speed_bps == 0)
+                link_speed_bps = 1000000000; /* Default 1G if unknown */
             hqos_port_init(priv->port_id, link_speed_bps);
         }
 
@@ -585,7 +596,7 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
         mbuf->nb_segs = 1;
         mbuf->pkt_len = final_len;
         mbuf->data_len = final_len;
-        mbuf->ol_flags = 0;  /* No offloads for control packets */
+        mbuf->ol_flags = 0; /* No offloads for control packets */
 
         /* Debug: Check mbuf state and lcore context */
         {
@@ -593,8 +604,8 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             uint16_t chk_type = rte_be_to_cpu_16(chk_eth->ether_type);
             if (chk_type == 0x8863 || (chk_type == RTE_ETHER_TYPE_VLAN)) {
                 unsigned lcore = rte_lcore_id();
-                YLOG_INFO("[MBUF_DBG] lcore=%u data_off=%u pkt_len=%u data_len=%u pool=%p",
-                          lcore, mbuf->data_off, mbuf->pkt_len, mbuf->data_len, (void*)mbuf->pool);
+                YLOG_INFO("[MBUF_DBG] lcore=%u data_off=%u pkt_len=%u data_len=%u pool=%p", lcore,
+                          mbuf->data_off, mbuf->pkt_len, mbuf->data_len, (void *)mbuf->pool);
             }
         }
 
@@ -613,10 +624,10 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             /* This is a workaround for virtio DPDK TX not reaching wire */
             if (d_type == 0x8863 && priv->rx_sock_fd >= 0) {
                 YLOG_INFO("[RAW_TX] PPPoE DISC: len=%u vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
-                          final_len, vlan_id,
-                          d_eth->dst_addr.addr_bytes[0], d_eth->dst_addr.addr_bytes[1],
-                          d_eth->dst_addr.addr_bytes[2], d_eth->dst_addr.addr_bytes[3],
-                          d_eth->dst_addr.addr_bytes[4], d_eth->dst_addr.addr_bytes[5]);
+                          final_len, vlan_id, d_eth->dst_addr.addr_bytes[0],
+                          d_eth->dst_addr.addr_bytes[1], d_eth->dst_addr.addr_bytes[2],
+                          d_eth->dst_addr.addr_bytes[3], d_eth->dst_addr.addr_bytes[4],
+                          d_eth->dst_addr.addr_bytes[5]);
 
                 /* Send via raw socket */
                 ssize_t raw_sent = send(priv->rx_sock_fd, data, final_len, 0);
@@ -636,11 +647,12 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
 
             /* Log PPPoE Session (LCP/IPCP) - still use DPDK */
             if (d_type == 0x8864) {
-                YLOG_INFO("[PHYS_TX] PPPoE SESS: port=%u len=%u vlan=%u dst=%02x:%02x:%02x:%02x:%02x:%02x",
-                          priv->port_id, final_len, vlan_id,
-                          d_eth->dst_addr.addr_bytes[0], d_eth->dst_addr.addr_bytes[1],
-                          d_eth->dst_addr.addr_bytes[2], d_eth->dst_addr.addr_bytes[3],
-                          d_eth->dst_addr.addr_bytes[4], d_eth->dst_addr.addr_bytes[5]);
+                YLOG_INFO("[PHYS_TX] PPPoE SESS: port=%u len=%u vlan=%u "
+                          "dst=%02x:%02x:%02x:%02x:%02x:%02x",
+                          priv->port_id, final_len, vlan_id, d_eth->dst_addr.addr_bytes[0],
+                          d_eth->dst_addr.addr_bytes[1], d_eth->dst_addr.addr_bytes[2],
+                          d_eth->dst_addr.addr_bytes[3], d_eth->dst_addr.addr_bytes[4],
+                          d_eth->dst_addr.addr_bytes[5]);
             }
         }
 
@@ -675,7 +687,8 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
                 /* Then payload starts. First 2 bytes of payload = PPP Protocol */
 
                 uint16_t *proto_ptr = (uint16_t *)((uint8_t *)pppoe + 6);
-                uint16_t ppp_proto = rte_be_to_cpu_16(*proto_ptr); // 0th byte of payload? No struct pppoe_hdr is 6 bytes.
+                uint16_t ppp_proto = rte_be_to_cpu_16(
+                    *proto_ptr); // 0th byte of payload? No struct pppoe_hdr is 6 bytes.
 
                 if (ppp_proto == 0x0021 || ppp_proto == 0x0057) {
                     /* IPv4 (0021) or IPv6 (0057) -> Subscriber Data -> HQoS */
@@ -686,19 +699,19 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             /* Non-PPPoE (ARP, ICMP, etc) -> BYPASS (use_hqos stays false) */
 
             if (use_hqos) {
-                 /* Classify Packet (TODO: Flow based classification) */
-                 uint8_t class_id = 2; /* Default: Best Effort (Class 2) */
+                /* Classify Packet (TODO: Flow based classification) */
+                uint8_t class_id = 2; /* Default: Best Effort (Class 2) */
 
-                 /* Enqueue to HQoS */
-                 if (hqos_enqueue(priv->port_id, class_id, mbuf) == 0) {
-                      iface->stats.tx_packets++;
-                      iface->stats.tx_bytes += pkt->len;
-                      return 0; /* Enqueued successfully */
-                 } else {
-                      rte_pktmbuf_free(mbuf);
-                      iface->stats.tx_dropped++;
-                      return -1;
-                 }
+                /* Enqueue to HQoS */
+                if (hqos_enqueue(priv->port_id, class_id, mbuf) == 0) {
+                    iface->stats.tx_packets++;
+                    iface->stats.tx_bytes += pkt->len;
+                    return 0; /* Enqueued successfully */
+                } else {
+                    rte_pktmbuf_free(mbuf);
+                    iface->stats.tx_dropped++;
+                    return -1;
+                }
             }
             /* If !use_hqos, Fallthrough to Direct TX (Bypass) */
         }
@@ -706,7 +719,8 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
         /* Direct Send (Non-HQoS) */
         /* Send packet using thread-local queue ID, clamped to configured TX queues */
         uint16_t num_tx_queues = (priv->num_tx_queues > 0) ? priv->num_tx_queues : 1;
-        uint16_t queue_id = 0; /* Default to 0 for PoC/Simple Worker (Assuming single worker per port logic or locked) */
+        uint16_t queue_id = 0; /* Default to 0 for PoC/Simple Worker (Assuming single worker per
+                                  port logic or locked) */
 
         /* Note: rte_eth_tx_burst is not thread safe on same queue! */
         /* Assuming Worker 0 (which runs both RX and HQoS) is the only one sending on Queue 0 */
@@ -726,8 +740,8 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
                 tx_type = rte_be_to_cpu_16(tx_vlan->eth_proto);
             }
             if (tx_type == 0x8863) {
-                YLOG_INFO("[PHYS_TX_RESULT] PPPoE DISC: port=%u queue=%u sent=%zd",
-                          priv->port_id, queue_id, sent);
+                YLOG_INFO("[PHYS_TX_RESULT] PPPoE DISC: port=%u queue=%u sent=%zd", priv->port_id,
+                          queue_id, sent);
             }
         }
 
@@ -740,8 +754,9 @@ static int physical_send(struct interface *iface, struct pkt_buf *pkt)
             static uint64_t last_log = 0;
             uint64_t now = rte_get_timer_cycles();
             if (now - last_log > rte_get_timer_hz()) {
-                 YLOG_INFO("TX-BYPASS DROP: Port %u Queue %d burst returned 0", priv->port_id, queue_id);
-                 last_log = now;
+                YLOG_INFO("TX-BYPASS DROP: Port %u Queue %d burst returned 0", priv->port_id,
+                          queue_id);
+                last_log = now;
             }
             rte_pktmbuf_free(mbuf);
             iface->stats.tx_dropped++;
@@ -835,8 +850,8 @@ static int physical_recv(struct interface *iface, struct pkt_buf **pkt)
             /* Bison-style: Each lcore polls its own dedicated queue (LOCKLESS) */
             /* Queue ID = Worker ID (1:1 mapping for maximum performance) */
             uint16_t num_rx_queues = (priv->num_rx_queues > 0) ? priv->num_rx_queues : 1;
-            uint16_t safe_queue_id = (g_thread_queue_id >= 0) ?
-                                     (g_thread_queue_id % num_rx_queues) : 0;
+            uint16_t safe_queue_id =
+                (g_thread_queue_id >= 0) ? (g_thread_queue_id % num_rx_queues) : 0;
 
             /* Safety: validate port_id before calling DPDK function */
             if (priv->port_id >= RTE_MAX_ETHPORTS) {
@@ -866,8 +881,8 @@ static int physical_recv(struct interface *iface, struct pkt_buf **pkt)
             /* Debug: Log when we receive packets */
             static uint64_t rx_debug_count = 0;
             if (rx_debug_count++ < 10) {
-                YLOG_INFO("DPDK RX: port=%u queue=%u burst=%u",
-                          priv->port_id, safe_queue_id, tl_rx_burst_count);
+                YLOG_INFO("DPDK RX: port=%u queue=%u burst=%u", priv->port_id, safe_queue_id,
+                          tl_rx_burst_count);
             }
 
             /* Safety: validate burst count doesn't exceed buffer size */

@@ -109,13 +109,9 @@ int ppp_pap_process_packet(struct pppoe_session *session, const uint8_t *packet,
         YLOG_INFO("PAP: User='%s'", peer_id);
 
         /* Send to RADIUS via lockless DPDK interface */
-        uint64_t req_id = radius_lockless_auth_pap(
-            session->session_id,
-            peer_id,
-            passwd,
-            &session->client_mac,
-            session->vlan_id,
-            session->iface ? session->iface->ifindex : 0);
+        uint64_t req_id = radius_lockless_auth_pap(session->session_id, peer_id, passwd,
+                                                   &session->client_mac, session->vlan_id,
+                                                   session->iface ? session->iface->ifindex : 0);
 
         if (req_id > 0) {
             YLOG_INFO("PAP: Auth submitted to lockless RADIUS (req_id=%lu)", req_id);
@@ -195,28 +191,16 @@ int ppp_chap_process_packet(struct pppoe_session *session, const uint8_t *packet
         YLOG_INFO("CHAP: User='%s'", name);
 
         /* Send to RADIUS via lockless DPDK interface */
-        extern uint64_t radius_lockless_auth_chap(uint16_t session_id,
-                                const char *username,
-                                uint8_t chap_id,
-                                const uint8_t *chap_challenge,
-                                uint8_t chap_challenge_len,
-                                const uint8_t *chap_response,
-                                uint8_t chap_response_len,
-                                const struct rte_ether_addr *client_mac,
-                                uint16_t vlan_id,
-                                uint32_t ifindex);
+        extern uint64_t radius_lockless_auth_chap(
+            uint16_t session_id, const char *username, uint8_t chap_id,
+            const uint8_t *chap_challenge, uint8_t chap_challenge_len, const uint8_t *chap_response,
+            uint8_t chap_response_len, const struct rte_ether_addr *client_mac, uint16_t vlan_id,
+            uint32_t ifindex);
 
         uint64_t req_id = radius_lockless_auth_chap(
-            session->session_id,
-            name,
-            chap->identifier,
-            session->chap_challenge,
-            session->chap_challenge_len,
-            chap_password,
-            1 + val_size,
-            &session->client_mac,
-            session->vlan_id,
-            session->iface ? session->iface->ifindex : 0);
+            session->session_id, name, chap->identifier, session->chap_challenge,
+            session->chap_challenge_len, chap_password, 1 + val_size, &session->client_mac,
+            session->vlan_id, session->iface ? session->iface->ifindex : 0);
 
         if (req_id > 0) {
             YLOG_INFO("CHAP: Auth submitted to lockless RADIUS (req_id=%lu)", req_id);
@@ -244,28 +228,25 @@ int ppp_chap_process_packet(struct pppoe_session *session, const uint8_t *packet
 /* --- ppp_auth_start Implementation --- */
 /**
  * Start PPP authentication after LCP opens
- * For CHAP: Server sends challenge
- * For PAP: Server waits for client Auth-Request
+ *
+ * RFC 1661 Correct Flow:
+ * 1. LCP opens (link established)
+ * 2. NAS (us) initiates CHAP by sending Challenge
+ * 3. Client responds with CHAP Response
+ * 4. NAS verifies credentials via RADIUS
+ *
+ * Since LCP doesn't negotiate Auth-Protocol, we always use CHAP.
  */
 void ppp_auth_start(struct pppoe_session *session)
 {
-    YLOG_INFO("PPP Auth: Starting authentication (protocol=0x%04x)", session->auth_protocol);
-    fprintf(stderr, "[AUTH DEBUG] ppp_auth_start: auth_protocol=0x%04x (PAP=0xC023 CHAP=0xC223)\n",
-            session->auth_protocol);
+    YLOG_INFO("PPP Auth: Starting authentication after LCP OPENED");
+    fprintf(stderr, "[AUTH DEBUG] ppp_auth_start: Sending CHAP Challenge (NAS-initiated)\n");
     fflush(stderr);
 
-    if (session->auth_protocol == PPP_PROTO_CHAP) {
-        /* CHAP: Server initiates by sending challenge */
-        YLOG_INFO("PPP Auth: Sending CHAP challenge");
-        ppp_chap_send_challenge(session);
-    } else if (session->auth_protocol == PPP_PROTO_PAP) {
-        /* PAP: Client initiates - server waits for Auth-Request */
-        YLOG_INFO("PPP Auth: Waiting for PAP Auth-Request from client");
-        /* No action needed - ppp_pap_process_packet handles incoming PAP */
-    } else {
-        /* No auth negotiated - skip to IPCP (shouldn't happen in production) */
-        YLOG_WARNING("PPP Auth: No auth protocol negotiated, skipping to IPCP");
-        extern void ppp_ipcp_open(struct pppoe_session * session);
-        ppp_ipcp_open(session);
-    }
+    /* NAS always initiates CHAP after LCP opens
+     * This is the correct PPP/RADIUS flow for vBNG
+     */
+    session->auth_protocol = PPP_PROTO_CHAP;
+    YLOG_INFO("PPP Auth: Sending CHAP-MD5 Challenge");
+    ppp_chap_send_challenge(session);
 }
